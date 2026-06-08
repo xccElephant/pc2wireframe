@@ -1,0 +1,5 @@
+__pycache__/
+data/test/
+data/train/
+artifacts/
+pc2wireframe_baseline/

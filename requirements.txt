@@ -1,0 +1,30 @@
+# --------- python --------- #
+numpy
+matplotlib
+pandas
+scipy
+ipykernel
+
+# --------- pytorch --------- #
+pytorch-lightning
+jsonargparse[signatures]
+torchmetrics
+
+# --------- loggers --------- #
+wandb
+
+# --------- custom --------- #
+scikit-image
+imageio
+plotly
+opencv-python
+trimesh
+einops
+
+# --------- misc --------- #
+tqdm
+rich
+pyrootutils
+python-dotenv
+debugpy
+ninja
