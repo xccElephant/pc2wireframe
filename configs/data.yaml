@@ -1,0 +1,36 @@
+data:
+  class_path: src.data.WireframeDataModule
+  init_args:
+    # ----- paths (relative to project root) -----
+    data_root: data
+    train_edge_subdir: train/sample_edge
+    train_pointcloud_subdir: train/sample_pointcloud
+    predict_pointcloud_subdir: test/sample_pointcloud
+    split_path: data/split.json
+    recursive_glob: false
+
+    # ----- train/val split (test/ has no GT edges, so val is carved from train) -----
+    # Build once with: python scripts/make_split.py
+    # use_val: true  -> train on saved "train" list, validate on "val".
+    # use_val: false -> train on ALL data (train + val), no validation loader.
+    use_val: true
+    auto_build_split: true
+    train_ratio: 0.9
+    split_seed: 42
+
+    # ----- graph / point-cloud format -----
+    vertex_merge_tol: 0.0001
+    max_vertices: 4096
+    max_edges: 4096
+    num_edge_points: 32
+    pc_num_points: 4096
+    min_edges: 1
+    max_load_retries: 64
+
+    # ----- data loader -----
+    shuffle: true
+    num_workers: 8
+    batch_size: 16
+    pin_memory: true
+    prefetch_factor: 2
+    persistent_workers: true
