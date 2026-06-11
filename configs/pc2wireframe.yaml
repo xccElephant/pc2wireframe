@@ -1,0 +1,120 @@
+# Stage 3/3 -- train the point-cloud -> wireframe reconstruction model.
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe.yaml
+#
+# The point-cloud encoder (PTv3 + latent compressor) is the ONLY trainable part.
+# The wireframe VAE (loaded frozen from stage 2) and the curve VAE (frozen from
+# stage 1) are reused as fixed decoders / teacher. Set both ckpt paths below.
+seed_everything: 3407
+
+model:
+  class_path: src.module.PC2WireframeModule
+  init_args:
+    # ----- point-cloud encoder: PTv3 backbone + latent-compressor head -----
+    pc_encoder:
+      in_channels: 3          # 3 = xyz, 6 = xyz + normals
+      grid_size: 0.01         # PTv3 voxel size (data is normalized to ~[-1,1])
+      cls_mode: false         # false = dense decoder features (better localized)
+      enc_depths:    [2, 2, 2, 6, 2]
+      enc_channels:  [32, 64, 128, 256, 512]
+      enc_num_head:  [2, 4, 8, 16, 32]
+      enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+      dec_depths:    [2, 2, 2, 2]
+      dec_channels:  [64, 64, 128, 256]
+      dec_num_head:  [4, 4, 8, 16]
+      dec_patch_size: [1024, 1024, 1024, 1024]
+      stride:        [2, 2, 2, 2]
+      enable_flash: true
+      # latent MUST match the wireframe VAE below; 64 * 64 = 4096 floats.
+      latent_num: 64
+      latent_dim: 64
+      compressor_heads: 8
+      variational: true
+
+    # ----- frozen wireframe VAE -- MUST match the stage-2 architecture -----
+    wireframe_vae:
+      latent_channels: 64
+      wireframe_latent_num: 64
+      max_col_diff: 6
+      max_row_diff: 32
+      max_curves_num: 128
+      attn_encoder_depth: 4
+      attn_decoder_self_depth: 12
+      attn_decoder_cross_depth: 2
+      attn_dim: 768
+      num_heads: 12
+      curve_latent_embed_dim: 256
+      use_mlp_predict: true
+      use_latent_pos_emb: true
+      input_is_curve_latent: true
+
+    # ----- frozen curve VAE -- MUST match the stage-1 architecture -----
+    curve_vae:
+      in_channels: 3
+      out_channels: 3
+      latent_channels: 3
+      down_block_types: ["DownBlock1D", "DownBlock1D"]
+      up_block_types: ["UpBlock1D", "UpBlock1D"]
+      block_out_channels: [128, 256]
+      layers_per_block: 2
+      act_fn: silu
+      norm_num_groups: 32
+      sample_points_num: 16
+
+    # ----- frozen decoder warm-start (set these to your stage-2 / stage-1 ckpts) -----
+    wireframe_vae_ckpt: null   # stage-2 best checkpoint
+    curve_vae_ckpt: null       # stage-1 best checkpoint
+
+    # ----- loss weights -----
+    latent_recon_weight: 1.0   # PC latent -> frozen teacher latent regression
+    kl_weight: 1.0e-4          # KL on the PC-encoder latent
+    decode_through_weight: 1.0 # decode PC latent (frozen) + supervise heads
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score (val/score) -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+    eval_num_per_edge: 32
+
+    # ----- optimization -----
+    lr: 1.5e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 1
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: stage3_pc2wireframe
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

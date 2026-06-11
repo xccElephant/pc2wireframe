@@ -1,0 +1,67 @@
+# Stage 1/3 -- train the per-curve neural parametric VAE (AutoencoderKL1D).
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/curve_vae.yaml
+#
+# The curve VAE autoencodes canonicalised GT curves (endpoints pinned to
+# [-1,0,0]/[1,0,0]). Its checkpoint is the input to stages 2 and 3, where it is
+# loaded frozen to produce the 12-d per-curve latent targets / decode curves.
+seed_everything: 3407
+
+model:
+  class_path: src.module.CurveVAEModule
+  init_args:
+    curve_vae:
+      in_channels: 3
+      out_channels: 3
+      latent_channels: 3        # 3 channels x 4 positions = 12-d curve latent
+      down_block_types: ["DownBlock1D", "DownBlock1D"]
+      up_block_types: ["UpBlock1D", "UpBlock1D"]
+      block_out_channels: [128, 256]
+      layers_per_block: 2
+      act_fn: silu
+      norm_num_groups: 32
+      # 16 / 2**2 down blocks = 4 latent positions; 3 channels x 4 = 12-d latent,
+      # matching the wireframe VAE's hardcoded curve-latent width. AICAD 32-point
+      # curves are sampled to 16 inside the encoder (decode can query any length).
+      sample_points_num: 16
+
+    # ----- optimization -----
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 1
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: stage1_curve_vae
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        # Lower reconstruction loss is better.
+        filename: epoch={epoch:03d}-val_loss={val/loss:.4f}
+        monitor: val/loss
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: min
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step
