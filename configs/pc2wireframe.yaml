@@ -37,7 +37,7 @@ model:
       wireframe_latent_num: 64
       max_col_diff: 6
       max_row_diff: 32
-      max_curves_num: 128
+      max_curves_num: 512
       attn_encoder_depth: 4
       attn_decoder_self_depth: 12
       attn_decoder_cross_depth: 2
@@ -95,7 +95,8 @@ trainer:
   num_nodes: 1
   strategy: auto
   precision: 32-true
-  gradient_clip_val: 1.0
+  # Gradient clipping is handled by the LightningModule (model.grad_clip) via
+  # configure_gradient_clipping; do not also set it here (would be redundant).
   accumulate_grad_batches: 1
   log_every_n_steps: 50
   logger:

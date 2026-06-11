@@ -34,7 +34,7 @@ def normalized_curves_from_batch(batch: dict[str, Any]) -> torch.Tensor | None:
     """
     import numpy as np
 
-    from .clr_wire.geometry import normalize_curves
+    from .vae.geometry import normalize_curves
 
     ep = batch.get("edge_points")
     if ep is None or ep.shape[0] == 0:
@@ -94,7 +94,7 @@ class ClrPackingMixin:
         """
         import numpy as np
 
-        from .clr_wire.geometry import normalize_curves
+        from .vae.geometry import normalize_curves
         from . import wireframe_ops as wops
 
         device = batch["point_cloud"].device
@@ -229,7 +229,7 @@ class ClrPackingMixin:
         from einops import rearrange
 
         from . import wireframe_ops as wops
-        from .clr_wire.recon_utils import denorm_curves
+        from .vae.recon_utils import denorm_curves
 
         cls = preds["cls"].detach().cpu().numpy()
         num_curves = cls.argmax(axis=-1) + 1

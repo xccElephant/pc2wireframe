@@ -1,14 +1,15 @@
-"""Vendored CLR-Wire VAE stack (curve VAE + wireframe VAE).
+"""VAE stack: per-curve VAE (``vae_curve``) + wireframe VAE (``vae_wireframe``).
 
-Source: https://github.com/qixuema/CLR-Wire (SIGGRAPH 2025). Only the VAE
-modules required to (a) encode a wireframe into the fixed-length latent and
-(b) decode that latent back into curves + topology are vendored here. The
-flow-matching / diffusion stage is intentionally left out -- in this project
-the point-cloud encoder replaces the generative prior over the latent.
+The **curve VAE** (``AutoencoderKL1D``) is a custom pure-PyTorch attention/token
+VAE (see ``vae_curve.py``) with no diffusers / x_transformers dependency.
 
-Imports are lazy because the VAE relies on ``x_transformers``, ``diffusers``,
-``beartype`` and ``torchtyping`` which may not be installed during early
-scaffolding.
+The **wireframe VAE** (``AutoencoderKLWireframe``) is still derived from CLR-Wire
+(https://github.com/qixuema/CLR-Wire, SIGGRAPH 2025) and depends on
+``diffusers`` / ``x_transformers``; only the VAE pieces are kept (the
+flow-matching / diffusion prior is replaced by the point-cloud encoder).
+
+Imports are lazy so that pulling in the (light) curve VAE does not drag in the
+wireframe VAE's heavy dependencies.
 """
 from __future__ import annotations
 

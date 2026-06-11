@@ -66,7 +66,7 @@ def _default_wireframe_vae() -> dict[str, Any]:
         wireframe_latent_num=64,
         max_col_diff=6,
         max_row_diff=32,
-        max_curves_num=128,
+        max_curves_num=512,
         attn_encoder_depth=4,
         attn_decoder_self_depth=12,
         attn_decoder_cross_depth=2,
@@ -207,6 +207,26 @@ class _BaseModule(pl.LightningModule):
             "lr_scheduler": {"scheduler": sched, "interval": "step"},
         }
 
+    def configure_gradient_clipping(
+        self,
+        optimizer,
+        gradient_clip_val=None,
+        gradient_clip_algorithm=None,
+    ):
+        """Clip grads by global norm using the module's ``grad_clip`` hparam.
+
+        This is the single source of truth for clipping; the trainer configs
+        therefore leave ``gradient_clip_val`` unset. A ``grad_clip <= 0``
+        disables clipping.
+        """
+        clip = float(getattr(self.hparams, "grad_clip", 0.0) or 0.0)
+        if clip > 0.0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=clip,
+                gradient_clip_algorithm="norm",
+            )
+
 
 # ----------------------------------------------------------------------
 # stage 1: curve VAE
@@ -227,7 +247,7 @@ class CurveVAEModule(_BaseModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-        from .models.clr_wire import AutoencoderKL1D
+        from .models.vae import AutoencoderKL1D
 
         self.curve_vae = AutoencoderKL1D(**(curve_vae or _default_curve_vae()))
 

@@ -40,7 +40,7 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
     ) -> None:
         super().__init__()
         # Deferred heavy imports (diffusers / x_transformers).
-        from .clr_wire import AutoencoderKL1D, AutoencoderKLWireframe
+        from .vae import AutoencoderKL1D, AutoencoderKLWireframe
 
         self.wireframe_vae = AutoencoderKLWireframe(**wireframe_vae)
         self.curve_vae = AutoencoderKL1D(**(curve_vae or {}))
