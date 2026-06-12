@@ -8,8 +8,9 @@ intrinsic shape.
   * **Encoder** -- ``L`` learnable latent queries attend (self + cross) to the
     Fourier-embedded (+ tangent) curve points via a ``nn.TransformerDecoder``;
     a head emits ``2 * latent_channels`` (mean/logvar) per token, reshaped to
-    ``(B, latent_channels, L)`` to keep the ``(b c l)`` latent layout and the
-    12-d wireframe-VAE contract (``latent_channels * L``).
+    ``(B, 2 * latent_channels, L)`` (split into mean/logvar by ``GaussianLatent``)
+    to keep the ``(b c l)`` latent layout and the 12-d wireframe-VAE contract
+    (``latent_channels * L``).
   * **Decoder** -- the ``L`` latent tokens self-attend (``nn.TransformerEncoder``);
     parametric ``t`` queries then cross-attend to them (``nn.TransformerDecoder``)
     and an MLP predicts a residual on top of the linear baseline ``[-1..1,0,0]``.
@@ -271,7 +272,9 @@ class AutoencoderKL1D(nn.Module):
         gt_samples = interpolate_1d(t, data)  # (B, 3, P) from full-res curve
         curves = rearrange(data, "b c n -> b n c")
         lengths = calculate_polyline_lengths(curves).clamp(min=2.0, max=math.pi * 10)
-        weights = torch.log(lengths + 0.2)  # down-weight long polylines
+        # weight grows with arclength, so longer / more curved polylines get a
+        # larger reconstruction weight than near-straight ones.
+        weights = torch.log(lengths + 0.2)
 
         per_curve = F.mse_loss(dec, gt_samples, reduction="none").mean(dim=[1, 2])
         recon_loss = (per_curve * weights).mean()

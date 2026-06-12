@@ -94,8 +94,6 @@ class ClrPackingMixin:
             ``xs``         ``(B, max_curves, 6 + 2*curve_latent_dim)``
                            = [endpoints(6) | curve mu(D) | curve std(D)]
             ``flag_diffs`` ``(B, max_curves, 3)`` = [valid | col_diff | row_diff]
-            ``edge_order`` list of per-sample int64 tensors mapping canonical
-                           edge index -> original edge index (for aux losses).
         """
         import numpy as np
 
@@ -119,7 +117,6 @@ class ClrPackingMixin:
         # curve-VAE encode pass, with bookkeeping back to (sample, slot).
         all_norm_curves: list[np.ndarray] = []
         slot_index: list[tuple[int, int]] = []
-        edge_order: list[torch.Tensor] = []
 
         for s in range(b):
             v0, v1 = vptr[s], vptr[s + 1]
@@ -131,7 +128,6 @@ class ClrPackingMixin:
             eidx_s = (edge_index[:, e0:e1] - v0).T  # (E, 2)
             epts_s = edge_points[e0:e1]             # (E, U, 3)
             if ne == 0:
-                edge_order.append(torch.zeros(0, dtype=torch.long))
                 continue
             eidx_s = eidx_s[:ne]
             epts_s = epts_s[:ne]
@@ -165,7 +161,6 @@ class ClrPackingMixin:
             for k in range(ne):
                 slot_index.append((s, k))
             all_norm_curves.append(norm)
-            edge_order.append(torch.from_numpy(order.astype(np.int64)))
 
         # one curve-VAE encode pass for the whole batch
         curve_mu = np.zeros((b, max_c, d), dtype=np.float32)
@@ -183,7 +178,7 @@ class ClrPackingMixin:
         xs = np.concatenate([segments, curve_mu, curve_std], axis=-1)  # (B, C, 6+2D)
         xs_t = torch.from_numpy(xs).to(device=device, dtype=torch.float32)
         flag_diffs_t = torch.from_numpy(flag_diffs).to(device=device, dtype=torch.long)
-        return {"xs": xs_t, "flag_diffs": flag_diffs_t, "edge_order": edge_order}
+        return {"xs": xs_t, "flag_diffs": flag_diffs_t}
 
     # ------------------------------------------------------------------
     def decode_curves(

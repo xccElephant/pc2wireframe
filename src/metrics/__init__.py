@@ -9,8 +9,9 @@ is not published. This package provides principled, configurable proxies:
   * final score = ``0.3*ccd_score + 0.4*TA + 0.3*vpe_score`` (higher = better),
     where geometric errors are mapped to ``(0, 1]`` via ``exp(-d / tau)``.
 
-See :mod:`src.metrics.functional` for the numpy core and
-:class:`src.metrics.wireframe_metrics.WireframeScore` for the epoch aggregator.
+See :mod:`src.metrics.functional` for the (PyTorch3D-backed) functional core
+and :class:`src.metrics.wireframe_metrics.WireframeScore` for the epoch
+aggregator.
 Calibrate ``tau`` / ``match_thresh`` against the official leaderboard.
 """
 from .functional import (
