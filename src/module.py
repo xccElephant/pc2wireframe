@@ -81,16 +81,13 @@ def _default_wireframe_vae() -> dict[str, Any]:
 
 def _default_curve_vae() -> dict[str, Any]:
     return dict(
-        in_channels=3,
-        out_channels=3,
         latent_channels=3,
+        sample_points_num=16,
+        # length of down_block_types + last block_out_channels set latent_len
+        # (16 / 2**2 = 4) and d_model (256); 3 channels x 4 = 12-d latent.
         down_block_types=("DownBlock1D", "DownBlock1D"),
-        up_block_types=("UpBlock1D", "UpBlock1D"),
         block_out_channels=(128, 256),
         layers_per_block=2,
-        act_fn="silu",
-        norm_num_groups=32,
-        sample_points_num=16,
     )
 
 
@@ -255,8 +252,16 @@ class CurveVAEModule(_BaseModule):
         curves = normalized_curves_from_batch(batch)  # (Esum, U, 3) or None
         if curves is None or curves.shape[0] == 0:
             return None
+        # Validation uses a fixed t grid (and the posterior mode) so val/loss is
+        # comparable across epochs; training samples t / the posterior.
+        t = None
+        if stage != "train":
+            p = self.curve_vae.sample_points_num
+            t = torch.linspace(0.0, 1.0, p, device=curves.device)
+            t = t.unsqueeze(0).expand(curves.shape[0], -1)
         loss, parts = self.curve_vae(
             curves,
+            t=t,
             sample_posterior=(stage == "train"),
             return_loss=True,
         )

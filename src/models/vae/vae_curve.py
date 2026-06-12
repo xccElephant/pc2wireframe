@@ -19,16 +19,14 @@ Absorbed CLR-Wire perks: tangent input features, continuous-``t`` decoding
 reconstruction loss. Kept baseline strengths: token latent, line-residual prior
 and an explicit endpoint anchor.
 
-The public surface mirrors the old CLR-Wire ``AutoencoderKL1D`` so it stays
-drop-in for ``packing.py`` / ``module.py``: ``encode(x).latent_dist`` (with
-``.mode() / .std / .sample()``), ``decode(z, t).sample``,
-``forward(..., return_loss=True) -> (loss, parts)``, ``.config.latent_channels``
-and ``.sample_points_num``.
+Public surface used by ``packing.py`` / ``module.py``: ``encode(x)`` returns the
+``GaussianLatent`` posterior (``.mode() / .std / .sample()``), ``decode(z, t)``
+returns the curve tensor, ``forward(..., return_loss=True) -> (loss, parts)``,
+plus ``.config.latent_channels`` and ``.sample_points_num``.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -81,27 +79,6 @@ class GaussianLatent:
         """Per-sample KL to ``N(0, I)``, summed over latent dims ``(B,)``."""
         return 0.5 * torch.sum(
             self.mean.pow(2) + self.var - 1.0 - self.logvar, dim=[1, 2])
-
-
-@dataclass
-class EncoderOutput:
-    latent_dist: GaussianLatent
-
-
-@dataclass
-class DecoderOutput:
-    sample: torch.Tensor
-
-
-def _resolve_dims(
-    block_out_channels: Tuple[int, ...],
-    down_block_types: Tuple[str, ...],
-    sample_points_num: int,
-) -> Tuple[int, int]:
-    """``(d_model, latent_len)``; latent_len mirrors the old conv downsampling."""
-    d_model = int(block_out_channels[-1])
-    latent_len = max(1, sample_points_num // (2 ** len(down_block_types)))
-    return d_model, latent_len
 
 
 # ----------------------------------------------------------------------
@@ -212,32 +189,29 @@ class AutoencoderKL1D(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 3,
-        out_channels: int = 3,
+        latent_channels: int = 4,
+        sample_points_num: int = 64,
+        # ``down_block_types`` (its length) and ``block_out_channels`` (its last
+        # entry) are kept only to derive ``latent_len`` and ``d_model`` so the
+        # 12-d latent contract / configs stay stable; no conv blocks are built.
         down_block_types: Tuple[str, ...] = ("DownBlock1D",),
-        up_block_types: Tuple[str, ...] = ("UpBlock1D",),
         block_out_channels: Tuple[int, ...] = (64,),
         layers_per_block: int = 2,
-        act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_points_num: int = 64,
         kl_weight: float = 1e-6,
         num_fourier_bands: int = 6,
         use_tangent: bool = True,
+        **kwargs,  # tolerate legacy CLR-Wire keys (in_channels, act_fn, ...)
     ):
         super().__init__()
-        d_model, latent_len = _resolve_dims(
-            block_out_channels, down_block_types, sample_points_num)
+        d_model = int(block_out_channels[-1])
+        latent_len = max(1, sample_points_num // (2 ** len(down_block_types)))
         self.latent_len = latent_len
         self.sample_points_num = sample_points_num
         self.kl_weight = kl_weight
         # ``packing.py`` reads ``curve_vae.config.latent_channels``.
         self.config = SimpleNamespace(
-            in_channels=in_channels, out_channels=out_channels,
             latent_channels=latent_channels, sample_points_num=sample_points_num,
             down_block_types=tuple(down_block_types),
-            up_block_types=tuple(up_block_types),
             block_out_channels=tuple(block_out_channels),
             layers_per_block=layers_per_block, kl_weight=kl_weight,
             num_fourier_bands=num_fourier_bands, use_tangent=use_tangent,
@@ -254,17 +228,11 @@ class AutoencoderKL1D(nn.Module):
             num_fourier_bands=num_fourier_bands)
 
     # ------------------------------------------------------------------
-    def encode(self, x: torch.Tensor, return_dict: bool = True):
-        posterior = GaussianLatent(self.encoder(x))
-        if not return_dict:
-            return (posterior,)
-        return EncoderOutput(latent_dist=posterior)
+    def encode(self, x: torch.Tensor) -> GaussianLatent:
+        return GaussianLatent(self.encoder(x))
 
-    def decode(self, z: torch.Tensor, t: torch.Tensor, return_dict: bool = True):
-        dec = self.decoder(z, t)
-        if not return_dict:
-            return (dec,)
-        return DecoderOutput(sample=dec)
+    def decode(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z, t)
 
     def _sample_t(self, bs: int, device: torch.device) -> torch.Tensor:
         """Random sorted ``t`` with the endpoints pinned to ``{0, 1}``."""
@@ -279,15 +247,13 @@ class AutoencoderKL1D(nn.Module):
         data: torch.Tensor,
         t: Optional[torch.Tensor] = None,
         sample_posterior: bool = False,
-        return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
         return_loss: bool = False,
-        **kwargs,
     ):
         data = rearrange(data, "b n c -> b c n")  # (B, 3, U) for the encoder
         bs = data.shape[0]
 
-        posterior = self.encode(data).latent_dist
+        posterior = self.encode(data)
         z = posterior.sample(generator) if sample_posterior else posterior.mode()
 
         if t is None:
@@ -296,105 +262,28 @@ class AutoencoderKL1D(nn.Module):
             assert t.shape[1] == self.sample_points_num, (
                 "t must have sample_points_num columns")
 
-        dec = self.decode(z, t).sample  # (B, 3, P)
+        dec = self.decode(z, t)  # (B, 3, P)
+        if not return_loss:
+            return dec
 
-        if not return_dict:
-            return (dec,)
+        kl_loss = posterior.kl().mean()
 
-        if return_loss:
-            kl_loss = posterior.kl().mean()
+        gt_samples = interpolate_1d(t, data)  # (B, 3, P) from full-res curve
+        curves = rearrange(data, "b c n -> b n c")
+        lengths = calculate_polyline_lengths(curves).clamp(min=2.0, max=math.pi * 10)
+        weights = torch.log(lengths + 0.2)  # down-weight long polylines
 
-            gt_samples = interpolate_1d(t, data)  # (B, 3, P) from full-res curve
+        per_curve = F.mse_loss(dec, gt_samples, reduction="none").mean(dim=[1, 2])
+        recon_loss = (per_curve * weights).mean()
+        endpoint_loss = F.l1_loss(dec[:, :, [0, -1]], gt_samples[:, :, [0, -1]])
+        recon_loss = recon_loss + 0.5 * endpoint_loss
 
-            curves = rearrange(data, "b c n -> b n c")
-            lengths = calculate_polyline_lengths(curves).clamp(min=2.0, max=math.pi * 10)
-            weights = torch.log(lengths + 0.2)  # down-weight long polylines
-
-            per_curve = F.mse_loss(dec, gt_samples, reduction="none").mean(dim=[1, 2])
-            recon_loss = (per_curve * weights).mean()
-            endpoint_loss = F.l1_loss(dec[:, :, [0, -1]], gt_samples[:, :, [0, -1]])
-            recon_loss = recon_loss + 0.5 * endpoint_loss
-
-            loss = recon_loss + self.kl_weight * kl_loss
-            return loss, dict(recon_loss=recon_loss, kl_loss=kl_loss)
-
-        return DecoderOutput(sample=dec)
-
-
-class AutoencoderKL1DFastEncode(nn.Module):
-    """Encoder-only variant (kept for the wireframe VAE / inference)."""
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        down_block_types: Tuple[str, ...] = ("DownBlock1D",),
-        block_out_channels: Tuple[int, ...] = (64,),
-        layers_per_block: int = 2,
-        act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_points_num: int = 16,
-        num_fourier_bands: int = 6,
-        use_tangent: bool = True,
-        **kwargs,
-    ):
-        super().__init__()
-        d_model, latent_len = _resolve_dims(
-            block_out_channels, down_block_types, sample_points_num)
-        self.config = SimpleNamespace(
-            latent_channels=latent_channels, sample_points_num=sample_points_num)
-        self.encoder = CurveEncoder(
-            d_model=d_model, latent_channels=latent_channels,
-            latent_tokens=latent_len, sample_points_num=sample_points_num,
-            num_layers=layers_per_block, num_fourier_bands=num_fourier_bands,
-            use_tangent=use_tangent)
-
-    def encode(self, x: torch.Tensor, return_dict: bool = True):
-        posterior = GaussianLatent(self.encoder(x))
-        if not return_dict:
-            return (posterior,)
-        return EncoderOutput(latent_dist=posterior)
-
-    def forward(self, data: torch.Tensor, return_std: bool = False, **kwargs):
-        data = rearrange(data, "b n c -> b c n")
-        posterior = self.encode(data).latent_dist
-        mu = posterior.mode()
-        if return_std:
-            return mu, posterior.std
-        return mu
-
-
-class AutoencoderKL1DFastDecode(nn.Module):
-    """Decoder-only variant (kept for inference)."""
-
-    def __init__(
-        self,
-        out_channels: int = 3,
-        up_block_types: Tuple[str, ...] = ("UpBlock1D",),
-        down_block_types: Tuple[str, ...] = ("DownBlock1D",),
-        block_out_channels: Tuple[int, ...] = (64,),
-        layers_per_block: int = 2,
-        act_fn: str = "silu",
-        latent_channels: int = 4,
-        norm_num_groups: int = 32,
-        sample_points_num: int = 16,
-        num_fourier_bands: int = 6,
-        **kwargs,
-    ):
-        super().__init__()
-        d_model, latent_len = _resolve_dims(
-            block_out_channels, down_block_types, sample_points_num)
-        self.sample_points_num = sample_points_num
-        self.decoder = CurveDecoder(
-            d_model=d_model, latent_channels=latent_channels,
-            latent_tokens=latent_len, num_layers=layers_per_block,
-            num_fourier_bands=num_fourier_bands)
-
-    def forward(self, z: torch.Tensor, t: torch.Tensor = None, return_dict: bool = True):
-        if t is None:
-            bs = z.shape[0]
-            t = torch.linspace(0, 1, self.sample_points_num, device=z.device).repeat(bs, 1)
-        dec = self.decoder(z, t)
-        if not return_dict:
-            return (dec,)
-        return DecoderOutput(sample=dec)
+        loss = recon_loss + self.kl_weight * kl_loss
+        return loss, dict(
+            recon_loss=recon_loss,
+            kl_loss=kl_loss,
+            # diagnostics for choosing kl_weight: how big / spread the latent is
+            # (a near-zero KL lets these drift arbitrarily).
+            latent_abs=posterior.mean.abs().mean().detach(),
+            latent_std=posterior.std.mean().detach(),
+        )

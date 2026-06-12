@@ -386,16 +386,26 @@ class WireframeGraphDataset(Dataset):
                 ],
                 axis=1,
             ).astype(np.float32)
+            # Per-curve canonical normalization (endpoints -> [-1,0,0]/[1,0,0]),
+            # precomputed here in the dataloader workers so the curve-VAE step
+            # avoids a per-batch CPU<->GPU round trip. See packing.py.
+            from ..models.vae.geometry import normalize_curves
+
+            edge_points_norm = normalize_curves(
+                edge_points_arr.astype(np.float64)).astype(np.float32)
         else:
             edge_index_arr = np.zeros((0, 2), dtype=np.int64)
             edge_points_arr = np.zeros(
                 (0, fmt.num_edge_points, 3), dtype=np.float32)
             edge_endpoints = np.zeros((0, 6), dtype=np.float32)
+            edge_points_norm = np.zeros(
+                (0, fmt.num_edge_points, 3), dtype=np.float32)
 
         return {
             "vertices": vertices_arr,
             "edge_index": edge_index_arr,
             "edge_points": edge_points_arr,
+            "edge_points_norm": edge_points_norm,
             "edge_endpoints": edge_endpoints,
             "num_vertices": nv,
             "num_edges": ne,
@@ -515,6 +525,7 @@ def collate_wireframe_graphs(
         vertex_ptr:     (B + 1,)               int64  CSR offsets, cumsum(nv)
         edge_index:     (2, Esum)              int64  GLOBAL vertex ids
         edge_points:    (Esum, U, 3)           float32
+        edge_points_norm:(Esum, U, 3)          float32  canonicalized curves
         edge_endpoints: (Esum, 6)              float32
         edge_batch:     (Esum,)                int64  sample id per edge
         edge_ptr:       (B + 1,)               int64  CSR offsets, cumsum(ne)
@@ -539,6 +550,7 @@ def collate_wireframe_graphs(
 
     vertices = torch.cat([s["vertices"] for s in samples], dim=0)
     edge_points = torch.cat([s["edge_points"] for s in samples], dim=0)
+    edge_points_norm = torch.cat([s["edge_points_norm"] for s in samples], dim=0)
     edge_endpoints = torch.cat([s["edge_endpoints"] for s in samples], dim=0)
 
     arange = torch.arange(batch_size, dtype=torch.long)
@@ -569,6 +581,7 @@ def collate_wireframe_graphs(
         "vertex_ptr": vertex_ptr,
         "edge_index": edge_index,
         "edge_points": edge_points,
+        "edge_points_norm": edge_points_norm,
         "edge_endpoints": edge_endpoints,
         "edge_batch": edge_batch,
         "edge_ptr": edge_ptr,

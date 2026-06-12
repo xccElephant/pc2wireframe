@@ -1,36 +1,31 @@
 """VAE stack: per-curve VAE (``vae_curve``) + wireframe VAE (``vae_wireframe``).
 
-The **curve VAE** (``AutoencoderKL1D``) is a custom pure-PyTorch attention/token
-VAE (see ``vae_curve.py``) with no diffusers / x_transformers dependency.
+Both VAEs are now custom **pure-PyTorch** attention/token models with no
+``diffusers`` / ``x_transformers`` dependency:
 
-The **wireframe VAE** (``AutoencoderKLWireframe``) is still derived from CLR-Wire
-(https://github.com/qixuema/CLR-Wire, SIGGRAPH 2025) and depends on
-``diffusers`` / ``x_transformers``; only the VAE pieces are kept (the
-flow-matching / diffusion prior is replaced by the point-cloud encoder).
+  * **curve VAE** (``AutoencoderKL1D``) -- encodes a canonicalised curve into a
+    small token latent and decodes it at arbitrary parametric ``t`` (see
+    ``vae_curve.py``).
+  * **wireframe VAE** (``AutoencoderKLWireframe``) -- set-to-set attention VAE
+    over a set of curves (endpoints + differential adjacency + curve latent),
+    derived from CLR-Wire (https://github.com/qixuema/CLR-Wire, SIGGRAPH 2025)
+    but reimplemented with native ``nn.Transformer`` blocks (see
+    ``vae_wireframe.py``).
 
-Imports are lazy so that pulling in the (light) curve VAE does not drag in the
-wireframe VAE's heavy dependencies.
+Imports stay lazy so pulling in one VAE does not import the other.
 """
 from __future__ import annotations
 
 __all__ = [
     "AutoencoderKLWireframe",
-    "AutoencoderKLWireframeFastEncode",
-    "AutoencoderKLWireframeFastDecode",
     "AutoencoderKL1D",
-    "AutoencoderKL1DFastEncode",
-    "AutoencoderKL1DFastDecode",
 ]
 
 _WIREFRAME = {
     "AutoencoderKLWireframe",
-    "AutoencoderKLWireframeFastEncode",
-    "AutoencoderKLWireframeFastDecode",
 }
 _CURVE = {
     "AutoencoderKL1D",
-    "AutoencoderKL1DFastEncode",
-    "AutoencoderKL1DFastDecode",
 }
 
 

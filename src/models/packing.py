@@ -26,12 +26,17 @@ CURVE_LATENT_DIM = 12
 
 
 def normalized_curves_from_batch(batch: dict[str, Any]) -> torch.Tensor | None:
-    """Normalise every curve in a packed batch to the CLR-Wire canonical frame.
+    """Per-curve canonical curves ``(Esum, U, 3)`` (endpoints -> [-1,0,0]/[1,0,0]).
 
-    Returns a ``(Esum, U, 3)`` float32 tensor of curves whose endpoints are
-    pinned to ``[-1,0,0]`` / ``[1,0,0]`` (the curve-VAE training target), or
-    ``None`` if the batch contains no edges.
+    The collate fn precomputes ``edge_points_norm`` in the dataloader workers,
+    so the common path is a zero-copy read of that tensor (already on device).
+    Falls back to normalising ``edge_points`` on the fly for batches that lack
+    the precomputed key. Returns ``None`` if the batch contains no edges.
     """
+    ep_norm = batch.get("edge_points_norm")
+    if ep_norm is not None:
+        return ep_norm if ep_norm.shape[0] > 0 else None
+
     import numpy as np
 
     from .vae.geometry import normalize_curves
@@ -71,7 +76,7 @@ class ClrPackingMixin:
         target_len = int(self.curve_vae.sample_points_num)
         if x.shape[-1] != target_len:
             x = F.interpolate(x, size=target_len, mode="linear", align_corners=True)
-        posterior = self.curve_vae.encode(x).latent_dist
+        posterior = self.curve_vae.encode(x)
         # Flatten channel-major ("e c l -> e (c l)"); decode_curves inverts this.
         mu = rearrange(posterior.mode(), "e c l -> e (c l)")
         std = rearrange(posterior.std, "e c l -> e (c l)")
@@ -202,7 +207,7 @@ class ClrPackingMixin:
         z = rearrange(curve_latent, "b n (c l) -> (b n) c l", c=ch)  # (B*N, ch, L)
         t = torch.linspace(0.0, 1.0, num_points, device=curve_latent.device)
         t = t.unsqueeze(0).expand(z.shape[0], -1)
-        dec = self.curve_vae.decode(z, t).sample  # (B*N, 3, num_points)
+        dec = self.curve_vae.decode(z, t)  # (B*N, 3, num_points)
         if pin_endpoints:
             dec[:, :, 0] = torch.tensor([-1.0, 0.0, 0.0], device=dec.device)
             dec[:, :, -1] = torch.tensor([1.0, 0.0, 0.0], device=dec.device)

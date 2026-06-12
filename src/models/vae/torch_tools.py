@@ -1,16 +1,6 @@
 import torch
-import torch.nn.functional as F
-from einops import repeat, rearrange
+from einops import repeat
 from torchtyping import TensorType
-from torch.nn import Module
-
-def fmt(v):
-    if torch.is_tensor(v) and v.dim() == 0:
-        v = v.item()
-    if isinstance(v, (float, int)):
-        return f"{v:.3f}"
-    else:
-        return str(v)
 
 
 def interpolate_1d(
@@ -82,43 +72,3 @@ def calculate_polyline_lengths(points: TensorType['b', 'n', 'c', float]) -> Tens
     polyline_lengths = distances.sum(dim=1)
 
     return polyline_lengths
-
-def sample_edge_points(batch_edge_points, num_points=32):
-    # example: (batch_size, 256, 3) -> (batch_size, 32, 3)
-
-    t = torch.linspace(0, 1, num_points).to(batch_edge_points.device)
-    bs = batch_edge_points.shape[0]
-    t = repeat(t, 'n -> b n', b=bs)
-    
-    batch_edge_points = rearrange(batch_edge_points, 'b n c -> b c n')
-    batch_edge_points = interpolate_1d(t, batch_edge_points)
-    batch_edge_points = rearrange(batch_edge_points, 'b c n -> b n c')
-    
-    return batch_edge_points
-
-def point_seq_tangent(
-    point_seq: torch.Tensor, 
-    channel_dim: int = -1,
-    seq_dim: int = -2,
-    eps: float = 1e-12
-) -> torch.Tensor:
-    """
-    compute the tangent vectors of the point sequence
-    """
-    # use the difference of the points to compute the tangent vectors
-    tangent = point_seq.diff(dim=seq_dim)
-
-    # use the last tangent vector to complete the last point
-    last_tangent = tangent.select(seq_dim, -1).unsqueeze(seq_dim)
-    
-    tangent = torch.cat([tangent, last_tangent], dim=seq_dim)
-    tangent = F.normalize(tangent, dim=channel_dim, eps=eps)
-
-    return tangent
-
-def set_module_requires_grad_(
-    module: Module,
-    requires_grad: bool
-):
-    for param in module.parameters():
-        param.requires_grad = requires_grad

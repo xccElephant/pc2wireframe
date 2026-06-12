@@ -39,7 +39,6 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
         curve_vae: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
-        # Deferred heavy imports (diffusers / x_transformers).
         from .vae import AutoencoderKL1D, AutoencoderKLWireframe
 
         self.wireframe_vae = AutoencoderKLWireframe(**wireframe_vae)
@@ -73,9 +72,9 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
 
     # ------------------------------------------------------------------
     def encode_target(self, xs: torch.Tensor, flag_diffs: torch.Tensor):
-        """Encode a GT wireframe to the CLR-Wire posterior (teacher / VAE eval).
+        """Encode a GT wireframe to the wireframe-VAE posterior (teacher / eval).
 
-        Returns the ``DiagonalGaussianDistribution``; ``posterior.mode()`` is
+        Returns the ``GaussianLatent``; ``posterior.mode()`` is
         ``(B, latent_channels, latent_num)`` (``b d n``).
 
         ``xs`` may be the full ``6 + 2*curve_latent_dim`` packing; only the
@@ -83,10 +82,9 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
         matching the wireframe VAE's own ``forward``.
         """
         enc_width = 6 + self.curve_latent_dim
-        out = self.wireframe_vae.encode(
+        return self.wireframe_vae.encode(
             xs=xs[..., :enc_width], flag_diffs=flag_diffs
         )
-        return out.latent_dist
 
     def decode_latent(self, z_bnd: torch.Tensor) -> dict[str, torch.Tensor]:
         """Decode a latent ``(B, latent_num, latent_dim)`` -> prediction heads.
@@ -98,7 +96,7 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
         from einops import rearrange
 
         z_bdn = rearrange(z_bnd, "b n d -> b d n")
-        dec = self.wireframe_vae.decode(z=z_bdn).sample
+        dec = self.wireframe_vae.decode(z=z_bdn)
         if self.wireframe_vae.use_mlp_predict:
             cls, segments, diffs, curve_latent = self.wireframe_vae.mlp_predict(dec)
         else:

@@ -11,19 +11,13 @@ model:
   class_path: src.module.CurveVAEModule
   init_args:
     curve_vae:
-      in_channels: 3
-      out_channels: 3
-      latent_channels: 3        # 3 channels x 4 positions = 12-d curve latent
+      latent_channels: 3              # 3 channels x 4 latent positions = 12-d
+      sample_points_num: 16           # encoder length; decode can query any length
+      # The attention VAE has no conv blocks: len(down_block_types) only sets the
+      # latent length (16 / 2**2 = 4) and block_out_channels[-1] sets d_model.
       down_block_types: ["DownBlock1D", "DownBlock1D"]
-      up_block_types: ["UpBlock1D", "UpBlock1D"]
       block_out_channels: [128, 256]
-      layers_per_block: 2
-      act_fn: silu
-      norm_num_groups: 32
-      # 16 / 2**2 down blocks = 4 latent positions; 3 channels x 4 = 12-d latent,
-      # matching the wireframe VAE's hardcoded curve-latent width. AICAD 32-point
-      # curves are sampled to 16 inside the encoder (decode can query any length).
-      sample_points_num: 16
+      layers_per_block: 2             # transformer layers in encoder/decoder
 
     # ----- optimization -----
     lr: 1.0e-4
@@ -37,7 +31,7 @@ trainer:
   max_epochs: 100
   check_val_every_n_epoch: 1
   accelerator: gpu
-  devices: 1
+  devices: 1                    # single GPU; use configs/curve_vae_ddp.yaml for 8x A800 DDP
   num_nodes: 1
   strategy: auto
   precision: 32-true
