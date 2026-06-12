@@ -29,8 +29,8 @@ model:
     grad_clip: 1.0
 
 trainer:
-  max_epochs: 100
-  check_val_every_n_epoch: 1
+  max_epochs: 50
+  check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/curve_vae.yaml
   num_nodes: 1

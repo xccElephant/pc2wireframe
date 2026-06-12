@@ -86,7 +86,7 @@ model:
 
 trainer:
   max_epochs: 200
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/pc2wireframe.yaml
   num_nodes: 1

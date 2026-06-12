@@ -84,7 +84,7 @@ model:
 
 trainer:
   max_epochs: 200
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 1                    # single GPU; use configs/pc2wireframe_ddp.yaml for 8x A800 DDP
   num_nodes: 1
