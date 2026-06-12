@@ -66,7 +66,7 @@ def _default_wireframe_vae() -> dict[str, Any]:
         wireframe_latent_num=64,
         max_col_diff=6,
         max_row_diff=32,
-        max_curves_num=512,
+        max_curves_num=1024,
         attn_encoder_depth=4,
         attn_decoder_self_depth=12,
         attn_decoder_cross_depth=2,
@@ -364,7 +364,7 @@ class WireframeVAEModule(_BaseModule):
     def on_validation_epoch_end(self) -> None:
         res = self.val_metrics.compute()
         self.log_dict(
-            {f"val/{k}": v for k, v in res.items()},
+            {f"val/{k}": v for k, v in res.items() if k != "score"},
             prog_bar=False, sync_dist=False,
         )
         self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
@@ -529,7 +529,7 @@ class PC2WireframeModule(_BaseModule):
     def on_validation_epoch_end(self) -> None:
         res = self.val_metrics.compute()
         self.log_dict(
-            {f"val/{k}": v for k, v in res.items()},
+            {f"val/{k}": v for k, v in res.items() if k != "score"},
             prog_bar=False, sync_dist=False,
         )
         self.log("val/score", res["score"], prog_bar=True, sync_dist=False)

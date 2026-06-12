@@ -38,7 +38,7 @@ model:
       wireframe_latent_num: 64
       max_col_diff: 6
       max_row_diff: 32
-      max_curves_num: 512
+      max_curves_num: 1024          # MUST match the stage-2 wireframe VAE
       attn_encoder_depth: 4
       attn_decoder_self_depth: 12
       attn_decoder_cross_depth: 2

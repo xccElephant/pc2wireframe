@@ -21,7 +21,11 @@ data:
     # ----- graph / point-cloud format -----
     vertex_merge_tol: 0.0001
     max_vertices: 4096
-    max_edges: 4096
+    # Samples with >max_edges edges are SKIPPED (not truncated). Keep this in
+    # sync with the wireframe VAE's max_curves_num (1024): the 64x64 latent can't
+    # represent more curves than that, so the ~16% long tail (>1024 edges) is
+    # dropped rather than fed in truncated/corrupted.
+    max_edges: 1024
     num_edge_points: 32
     pc_num_points: 4096
     min_edges: 1
