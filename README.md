@@ -14,25 +14,22 @@
 | Stage 2 | **Wireframe VAE** (`AutoencoderKLWireframe`) | 把"一组曲线（端点 + 差分邻接拓扑 + 曲线 latent）"编码成定长 `64×64` latent 再解码；曲线形状用**冻结的 Stage-1 Curve VAE** 编码 | `configs/wireframe_vae.yaml` |
 | Stage 3 | **PC2Wireframe** (PTv3 + Latent Compressor) | 点云预测 `64×64` latent，对齐 Stage-2 teacher posterior 并 decode-through 监督；**两个 VAE 全程冻结** | `configs/pc2wireframe.yaml` |
 
-### Pipeline (AI生成)
+## Pipeline (AI生成)
 
 ![pipeline](assets/pipeline.png)
 
-### 推理数据流
 
-```mermaid
-flowchart LR
-    PC[点云] --> PCE["PC Encoder<br/>PTv3 + Latent Compressor"]
-    PCE --> Z["wireframe latent<br/>64 × 64"]
-    Z --> WD["Wireframe Decoder<br/>AutoencoderKLWireframe (冻结)"]
-    WD --> CNT[曲线数]
-    WD --> EP[端点坐标]
-    WD --> TOP["拓扑<br/>col/row diff"]
-    WD --> CLAT["每条曲线 latent<br/>12-d"]
-    CLAT --> CVD["Curve Decoder<br/>AutoencoderKL1D (冻结)"]
-    CVD --> CRV[每条 3D 曲线]
-    CNT --> WF[Wireframe]
-    EP --> WF
-    TOP --> WF
-    CRV --> WF
-```
+## Curve VAE (50 Epoch)
+
+![recon_spread](assets/recon_spread.png)
+
+![recon_worst](assets/recon_worst.png)
+
+## Wireframe VAE
+
+TODO......
+
+
+## PC2Wireframe
+
+TODO......
