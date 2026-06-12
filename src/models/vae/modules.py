@@ -5,8 +5,6 @@ Trimmed from the original CLR-Wire ``modules.py``: the ``diffusers`` /
 permutator / squeeze-excite code) were removed. What remains is exactly what the
 wireframe VAE uses:
 
-  * :class:`SelfAttention` / :class:`CrossAttention` -- native ``nn.Transformer``
-    self / cross attention stacks (replace ``x_transformers.AttentionLayers``).
   * :func:`MLP` -- the small prediction-head MLP.
   * :class:`PointEmbed` (+ :class:`MPConv`) -- magnitude-preserving Fourier point
     embedding for the segment endpoints.
@@ -19,45 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
-
-# ====================================================================
-# attention (native nn.Transformer; replaces x_transformers)
-# ====================================================================
-class SelfAttention(nn.Module):
-    """Pre-norm Transformer-encoder self-attention stack (``batch_first``)."""
-
-    def __init__(self, dim: int, heads: int, depth: int, dropout: float = 0.0):
-        super().__init__()
-        layer = nn.TransformerEncoderLayer(
-            dim, heads, dim_feedforward=dim * 2, dropout=dropout,
-            activation="gelu", batch_first=True, norm_first=True)
-        self.net = nn.TransformerEncoder(layer, depth)
-
-    def forward(self, x, mask=None):
-        # ``mask`` True == keep (x_transformers convention); nn wants True == ignore.
-        kpm = (~mask) if mask is not None else None
-        return self.net(x, src_key_padding_mask=kpm)
-
-
-class CrossAttention(nn.Module):
-    """Query tokens attend to a ``context`` (pre-norm Transformer decoder).
-
-    ``nn.TransformerDecoderLayer`` also self-attends the query tokens before the
-    cross-attention, which is harmless (and usually helpful) here.
-    """
-
-    def __init__(self, dim: int, heads: int, depth: int, dropout: float = 0.0):
-        super().__init__()
-        layer = nn.TransformerDecoderLayer(
-            dim, heads, dim_feedforward=dim * 2, dropout=dropout,
-            activation="gelu", batch_first=True, norm_first=True)
-        self.net = nn.TransformerDecoder(layer, depth)
-
-    def forward(self, x, context, context_mask=None):
-        # ``context_mask`` True == keep; nn wants True == ignore.
-        mem_kpm = (~context_mask) if context_mask is not None else None
-        return self.net(tgt=x, memory=context, memory_key_padding_mask=mem_kpm)
 
 
 # ====================================================================

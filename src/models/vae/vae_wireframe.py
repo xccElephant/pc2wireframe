@@ -16,7 +16,7 @@ The diffusers ``ConfigMixin``/``ModelMixin`` wrappers and the
 ``DiagonalGaussianDistribution`` / ``AutoencoderKLOutput`` / ``DecoderOutput``
 containers were replaced by a plain ``nn.Module`` and the lightweight
 ``GaussianLatent`` shared with the curve VAE. Attention uses native
-``nn.Transformer`` blocks (see ``modules.SelfAttention`` / ``CrossAttention``).
+``nn.TransformerEncoder`` / ``nn.TransformerDecoder`` blocks.
 
 Public surface used by ``packing.py`` / ``pc2wireframe.py`` / ``module.py``:
 ``encode(xs, flag_diffs) -> GaussianLatent`` (``.mode()`` is ``(B, C, N)``),
@@ -32,30 +32,8 @@ import torch.nn as nn
 from torch.nn import Module
 from einops import rearrange, repeat, pack
 
-from .modules import MLP, PointEmbed, FocalLoss, ce_loss, SelfAttention, CrossAttention
+from .modules import MLP, PointEmbed, FocalLoss, ce_loss
 from .vae_curve import GaussianLatent
-
-
-class EmbeddingLayerFactory:
-    def __init__(
-        self,
-        point_embed_dim: int,
-        max_col_diff: int,
-        col_diff_embed_dim: int,
-        max_row_diff: int,
-        row_diff_embed_dim: int,
-    ):
-        self.point_embed_dim = point_embed_dim
-        self.max_col_diff = max_col_diff
-        self.col_diff_embed_dim = col_diff_embed_dim
-        self.max_row_diff = max_row_diff
-        self.row_diff_embed_dim = row_diff_embed_dim
-
-    def create_embeddings(self):
-        point_embed = PointEmbed(dim=self.point_embed_dim)
-        col_diff_embed = nn.Embedding(self.max_col_diff, self.col_diff_embed_dim)
-        row_diff_embed = nn.Embedding(self.max_row_diff, self.row_diff_embed_dim)
-        return point_embed, col_diff_embed, row_diff_embed
 
 
 class Encoder1D(Module):
@@ -80,15 +58,9 @@ class Encoder1D(Module):
         self.max_curves_num = max_curves_num
         self.wireframe_latent_num = wireframe_latent_num
 
-        embedding_factory = EmbeddingLayerFactory(
-            point_embed_dim=coor_embed_dim * 3,
-            max_col_diff=max_col_diff,
-            col_diff_embed_dim=col_diff_embed_dim,
-            max_row_diff=max_row_diff,
-            row_diff_embed_dim=row_diff_embed_dim,
-        )
-        (self.point_embed, self.col_diff_embed,
-         self.row_diff_embed) = embedding_factory.create_embeddings()
+        self.point_embed = PointEmbed(dim=coor_embed_dim * 3)
+        self.col_diff_embed = nn.Embedding(max_col_diff, col_diff_embed_dim)
+        self.row_diff_embed = nn.Embedding(max_row_diff, row_diff_embed_dim)
 
         attn_dim = attn_kwargs['dim']
 
@@ -101,7 +73,12 @@ class Encoder1D(Module):
                     + row_diff_embed_dim + curve_latent_embed_dim)
         self.attn_project_in = nn.Linear(init_dim, attn_dim)
 
-        self.cross_attn = CrossAttention(**attn_kwargs)
+        # query tokens self-attend then cross-attend to the curve tokens.
+        self.cross_attn = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                attn_dim, attn_kwargs['heads'], dim_feedforward=attn_dim * 2,
+                dropout=0.0, activation="gelu", batch_first=True, norm_first=True),
+            attn_kwargs['depth'])
 
         out_channels = 2 * out_channels if double_z else out_channels
         self.project_out = nn.Linear(attn_dim, out_channels)
@@ -133,10 +110,10 @@ class Encoder1D(Module):
         wire_embed = self.pos_emb + wire_embed
 
         enc_query = repeat(self.enc_learnable_queries, 'n d -> b n d', b=bs)
-        # valid curves only (True == keep); pad slots are masked out.
-        context_keep = rearrange(flag >= 0.5, 'b n c -> b (n c)')
+        # pad slots ignored; nn wants True == ignore, so invert the keep mask.
+        context_pad = rearrange(flag < 0.5, 'b n c -> b (n c)')
         wireframe_latent_embed = self.cross_attn(
-            enc_query, wire_embed, context_mask=context_keep)
+            tgt=enc_query, memory=wire_embed, memory_key_padding_mask=context_pad)
         return self.project_out(wireframe_latent_embed)
 
 
@@ -163,10 +140,17 @@ class Decoder1D(Module):
         self.dec_learnable_query = nn.Parameter(
             torch.randn(1 + max_curves_num, attn_dim))
 
-        self.self_attn = SelfAttention(
-            dim=attn_dim, heads=attn_kwargs['heads'], depth=attn_kwargs['self_depth'])
-        self.cross_attn = CrossAttention(
-            dim=attn_dim, heads=attn_kwargs['heads'], depth=attn_kwargs['cross_depth'])
+        heads = attn_kwargs['heads']
+        self.self_attn = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                attn_dim, heads, dim_feedforward=attn_dim * 2, dropout=0.0,
+                activation="gelu", batch_first=True, norm_first=True),
+            attn_kwargs['self_depth'])
+        self.cross_attn = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                attn_dim, heads, dim_feedforward=attn_dim * 2, dropout=0.0,
+                activation="gelu", batch_first=True, norm_first=True),
+            attn_kwargs['cross_depth'])
         self.proj_out = nn.Linear(attn_dim, attn_dim)
 
     def forward(self, zs):
@@ -177,7 +161,7 @@ class Decoder1D(Module):
 
         wireframe_latent = self.self_attn(wireframe_latent)
         query_embed = repeat(self.dec_learnable_query, 'n d -> b n d', b=bs)
-        query_embed = self.cross_attn(query_embed, wireframe_latent)
+        query_embed = self.cross_attn(tgt=query_embed, memory=wireframe_latent)
         return self.proj_out(query_embed)
 
 
