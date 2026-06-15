@@ -6,7 +6,7 @@ Two ``nn.Module`` containers, sharing the packing / reconstruction logic in
 ``ClrWireframeBase`` -- the (always-present) CLR-Wire wireframe VAE + curve VAE.
     Used directly by **stage 2** (train the wireframe VAE with the curve VAE
     frozen). Exposes ``encode_target`` / ``decode_latent`` plus the inherited
-    ``graph_to_clr_inputs`` / ``reconstruct``.
+    ``graph_to_node_inputs`` / ``reconstruct_graph``.
 
 ``PC2WireframeModel`` -- ``ClrWireframeBase`` + a point-cloud encoder.
     Used by **stage 3** (train point cloud -> latent with both VAEs frozen)::
@@ -26,7 +26,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .packing import CURVE_LATENT_DIM, ClrPackingMixin
+from .packing import ClrPackingMixin
 from .pc_encoder import PCEncoder
 
 
@@ -50,63 +50,52 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
         self, wireframe_vae: dict[str, Any], curve_vae: dict[str, Any] | None
     ) -> None:
         """Cache the config needed by the packing / reconstruction code."""
-        self.max_curves_num = int(wireframe_vae.get("max_curves_num", 128))
-        self.max_col_diff = int(wireframe_vae.get("max_col_diff", 6))
-        self.max_row_diff = int(wireframe_vae.get("max_row_diff", 32))
-        # CLR-Wire per-curve latent = latent_channels x downsampled_len.
+        self.max_curves_num = int(wireframe_vae.get("max_curves_num", 1024))
+        self.max_nodes = int(wireframe_vae.get("max_nodes", 768))
+        # per-curve latent = latent_channels x downsampled_len.
         cv = curve_vae or {}
         cv_lat = int(cv.get("latent_channels", 3))
-        cv_pts = int(cv.get("sample_points_num", 16))
-        n_down = len(cv.get("down_block_types", ("DownBlock1D", "DownBlock1D")))
+        cv_pts = int(cv.get("sample_points_num", 32))
+        n_down = len(cv.get(
+            "down_block_types", ("DownBlock1D", "DownBlock1D", "DownBlock1D")))
         self.curve_latent_len = max(1, cv_pts // (2 ** n_down))
         self.curve_latent_dim = cv_lat * self.curve_latent_len
-        # Keep the curve VAE configured so latent_channels * downsampled_len == 12
-        # (e.g. latent_channels=3, sample_points_num=16, 2 down blocks -> 3*4).
-        if self.curve_latent_dim != CURVE_LATENT_DIM:
+        # The wireframe VAE's curve head out_dim must match this.
+        vae_curve_dim = int(wireframe_vae.get("curve_latent_dim", self.curve_latent_dim))
+        if self.curve_latent_dim != vae_curve_dim:
             raise ValueError(
-                f"curve_latent_dim={self.curve_latent_dim} but the CLR-Wire "
-                f"wireframe VAE expects {CURVE_LATENT_DIM}. Adjust curve_vae "
-                f"(latent_channels * (sample_points_num / 2**n_down) == "
-                f"{CURVE_LATENT_DIM})."
+                f"curve_latent_dim mismatch: curve VAE produces "
+                f"{self.curve_latent_dim} but wireframe VAE expects "
+                f"{vae_curve_dim}. Set wireframe_vae.curve_latent_dim = "
+                f"latent_channels * (sample_points_num / 2**n_down)."
             )
 
     # ------------------------------------------------------------------
-    def encode_target(self, xs: torch.Tensor, flag_diffs: torch.Tensor):
+    def encode_target(self, targets: dict[str, torch.Tensor]):
         """Encode a GT wireframe to the wireframe-VAE posterior (teacher / eval).
 
-        Returns the ``GaussianLatent``; ``posterior.mode()`` is
-        ``(B, latent_channels, latent_num)`` (``b d n``).
-
-        ``xs`` may be the full ``6 + 2*curve_latent_dim`` packing; only the
-        ``6 + curve_latent_dim`` (endpoints + curve mu) slice feeds the encoder,
-        matching the wireframe VAE's own ``forward``.
+        ``targets`` is the dict returned by ``graph_to_node_inputs``. Returns the
+        ``GaussianLatent``; ``posterior.mode()`` is ``(B, latent_channels,
+        latent_num)`` (``b d n``).
         """
-        enc_width = 6 + self.curve_latent_dim
         return self.wireframe_vae.encode(
-            xs=xs[..., :enc_width], flag_diffs=flag_diffs
+            node_coords=targets["node_coords"],
+            node_mask=targets["node_mask"],
+            edge_pairs=targets["edge_pairs"],
+            edge_mask=targets["edge_mask"],
+            edge_feat=targets["edge_mu"],
         )
 
     def decode_latent(self, z_bnd: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Decode a latent ``(B, latent_num, latent_dim)`` -> prediction heads.
+        """Decode a latent ``(B, latent_num, latent_dim)`` -> decoder dict.
 
-        Returns a dict with ``cls`` (curve-count logits), ``segments``
-        (per-curve endpoint coords), ``diffs`` (col/row diff logits) and
-        ``curve_latent`` (per-curve curve-VAE latent).
+        Returns ``{node_tokens, coord, exist_logit}`` (adjacency / curve latent
+        are produced lazily by the wireframe VAE heads from ``node_tokens``).
         """
         from einops import rearrange
 
         z_bdn = rearrange(z_bnd, "b n d -> b d n")
-        dec = self.wireframe_vae.decode(z=z_bdn)
-        if self.wireframe_vae.use_mlp_predict:
-            cls, segments, diffs, curve_latent = self.wireframe_vae.mlp_predict(dec)
-        else:
-            cls, segments, diffs, curve_latent = self.wireframe_vae.linear_predict(dec)
-        return {
-            "cls": cls,
-            "segments": segments,
-            "diffs": diffs,
-            "curve_latent": curve_latent,
-        }
+        return self.wireframe_vae.decode(z=z_bdn)
 
 
 class PC2WireframeModel(ClrWireframeBase):

@@ -15,9 +15,9 @@ so GT and decode are directly comparable without any denormalisation.
 Example::
 
     python scripts/eval_curve_vae.py \
-        --ckpt logs/pc2wireframe/f09xd826/checkpoints/epoch=044-val_loss=0.0150.ckpt \
+        --ckpt logs/pc2wireframe/28iuxman/checkpoints/epoch=049-val_loss=0.0055.ckpt \
         --data-config configs/data.yaml \
-        --out-dir logs/pc2wireframe/f09xd826/curve_vae_eval
+        --out-dir logs/pc2wireframe/28iuxman/curve_vae_eval
 """
 from __future__ import annotations
 
@@ -47,8 +47,8 @@ from src.module import CurveVAEModule  # noqa: E402
 
 # ----------------------------------------------------------------------
 def _default_ckpt() -> str:
-    """Pick the best (lowest val_loss) checkpoint under the default log dir."""
-    pat = str(root / "logs/pc2wireframe/*/checkpoints/epoch=*val_loss=*.ckpt")
+    """Pick the best (lowest val_loss) checkpoint under the latest model's log dir."""
+    pat = str(root / "logs/pc2wireframe/adpdhtsg/checkpoints/epoch=*val_loss=*.ckpt")
     cands = glob.glob(pat)
     if not cands:
         raise SystemExit(

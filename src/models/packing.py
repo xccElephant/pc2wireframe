@@ -1,15 +1,18 @@
-"""Shared CLR-Wire packing / reconstruction utilities for staged training.
+"""Graph packing / reconstruction utilities for the wireframe VAE.
 
-These turn the dataloader's packed-graph batches into the CLR-Wire wireframe
-VAE inputs ``(xs, flag_diffs)`` and turn decoder predictions back into explicit
-wireframes. They are shared by the staged-training models:
+These turn the dataloader's packed-graph batches into the graph wireframe VAE
+inputs (a node-level GT: node coords + oriented edge pairs + frozen curve-VAE
+latents) and turn decoder predictions back into explicit wireframes.
 
+Edge orientation is fixed by a deterministic **coordinate-lexicographic** rule
+(the endpoint with the smaller ``(x, y, z)`` tuple is the canonical "start").
+The same rule is used both when encoding the GT curve latent and when
+denormalising a decoded curve onto its endpoints, so the curve VAE always sees
+a consistent orientation.
+
+Shared by the staged-training models:
   * :class:`~src.models.pc2wireframe.ClrWireframeBase` (stage 2, wireframe VAE)
   * :class:`~src.models.pc2wireframe.PC2WireframeModel` (stage 3, reconstruction)
-
-The methods live in a mixin so both models share one implementation; the host
-must provide ``curve_vae`` plus the cached ``max_*`` / ``curve_latent_*``
-config attributes (see ``ClrWireframeBase._init_clr_config``).
 
 ``normalized_curves_from_batch`` is a config-free helper used by stage 1 (the
 curve-VAE-only training) and needs no host state.
@@ -18,10 +21,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 
-# The vendored CLR-Wire wireframe VAE hardcodes a 12-d per-curve latent
-# (``predict_curve_latent`` out_dim=12; loss slices ``[:12]`` / ``[12:]``).
+# Per-curve latent dim = curve_vae.latent_channels * downsampled_len
+# (default 3 * (32 / 2**3) = 12). Hosts derive ``curve_latent_dim`` from the
+# curve VAE config; this is only the expected default.
 CURVE_LATENT_DIM = 12
 
 
@@ -37,8 +42,6 @@ def normalized_curves_from_batch(batch: dict[str, Any]) -> torch.Tensor | None:
     if ep_norm is not None:
         return ep_norm if ep_norm.shape[0] > 0 else None
 
-    import numpy as np
-
     from .vae.geometry import normalize_curves
 
     ep = batch.get("edge_points")
@@ -50,11 +53,27 @@ def normalized_curves_from_batch(batch: dict[str, Any]) -> torch.Tensor | None:
     return torch.from_numpy(norm).to(device)
 
 
-class ClrPackingMixin:
-    """Packing / reconstruction methods shared by the CLR-Wire models.
+def coord_orient_swap(ca: np.ndarray, cb: np.ndarray) -> np.ndarray:
+    """Return ``True`` where ``ca`` is lexicographically greater than ``cb``.
 
-    Requires the host to define: ``curve_vae``, ``max_curves_num``,
-    ``max_col_diff``, ``max_row_diff``, ``curve_latent_dim`` and
+    Used to orient each edge so the smaller-coordinate endpoint is first
+    (a deterministic, geometry-only rule recoverable at reconstruction time).
+    """
+    ca = np.asarray(ca)
+    cb = np.asarray(cb)
+    greater = np.zeros(ca.shape[0], dtype=bool)
+    equal = np.ones(ca.shape[0], dtype=bool)
+    for k in range(3):
+        greater |= equal & (ca[:, k] > cb[:, k])
+        equal &= ca[:, k] == cb[:, k]
+    return greater
+
+
+class ClrPackingMixin:
+    """Packing / reconstruction methods shared by the wireframe models.
+
+    Requires the host to define: ``curve_vae``, ``wireframe_vae``,
+    ``max_nodes``, ``max_curves_num``, ``curve_latent_dim`` and
     ``curve_latent_len``.
     """
 
@@ -65,9 +84,8 @@ class ClrPackingMixin:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode canonical curves ``(E, U, 3)`` -> ``(mu, std)`` each ``(E, D)``.
 
-        ``D = curve_latent_dim`` (default 12 = 3 channels x 4 positions). The
-        curve VAE is always frozen when this is called (stage 2 / 3), hence the
-        ``no_grad``.
+        ``D = curve_latent_dim``. The curve VAE is always frozen when this is
+        called (stage 2 / 3), hence the ``no_grad``.
         """
         import torch.nn.functional as F
         from einops import rearrange
@@ -77,32 +95,30 @@ class ClrPackingMixin:
         if x.shape[-1] != target_len:
             x = F.interpolate(x, size=target_len, mode="linear", align_corners=True)
         posterior = self.curve_vae.encode(x)
-        # Flatten channel-major ("e c l -> e (c l)"); decode_curves inverts this.
         mu = rearrange(posterior.mode(), "e c l -> e (c l)")
         std = rearrange(posterior.std, "e c l -> e (c l)")
         return mu, std
 
     # ------------------------------------------------------------------
-    def graph_to_clr_inputs(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Pack a packed-graph batch into CLR-Wire ``(xs, flag_diffs)``.
+    def graph_to_node_inputs(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Pack a packed-graph batch into node-level VAE inputs.
 
-        Mirrors CLR-Wire ``WireframeDataset.__getitem__`` + ``compute_diffs``,
-        but starts from this project's packed-graph collate (native-size graphs
-        concatenated with CSR pointers) instead of pre-canonicalised ``.npz``.
+        Returns a dict with (``N = max_nodes``, ``E = max_curves_num``,
+        ``D = curve_latent_dim``):
 
-        Returns a dict with:
-            ``xs``         ``(B, max_curves, 6 + 2*curve_latent_dim)``
-                           = [endpoints(6) | curve mu(D) | curve std(D)]
-            ``flag_diffs`` ``(B, max_curves, 3)`` = [valid | col_diff | row_diff]
+            ``node_coords`` ``(B, N, 3)``   vertex coordinates (padded)
+            ``node_mask``   ``(B, N)``      bool, first ``nv`` valid
+            ``edge_pairs``  ``(B, E, 2)``   coord-oriented node-slot indices
+            ``edge_mask``   ``(B, E)``      bool, first ``ne`` valid
+            ``edge_mu``     ``(B, E, D)``   frozen curve-VAE latent mean
+            ``edge_std``    ``(B, E, D)``   frozen curve-VAE latent std
         """
-        import numpy as np
-
         from .vae.geometry import normalize_curves
-        from . import wireframe_ops as wops
 
         device = batch["point_cloud"].device
         b = int(batch["num_graphs"])
-        max_c = self.max_curves_num
+        N = self.max_nodes
+        E = self.max_curves_num
         d = self.curve_latent_dim
 
         vertices = batch["vertices"].detach().cpu().numpy()
@@ -111,60 +127,53 @@ class ClrPackingMixin:
         vptr = batch["vertex_ptr"].tolist()
         eptr = batch["edge_ptr"].tolist()
 
-        segments = np.zeros((b, max_c, 6), dtype=np.float32)
-        flag_diffs = np.zeros((b, max_c, 3), dtype=np.int64)
-        # Collect oriented+normalized curves across the whole batch for one
-        # curve-VAE encode pass, with bookkeeping back to (sample, slot).
+        node_coords = np.zeros((b, N, 3), dtype=np.float32)
+        node_mask = np.zeros((b, N), dtype=bool)
+        edge_pairs = np.zeros((b, E, 2), dtype=np.int64)
+        edge_mask = np.zeros((b, E), dtype=bool)
+
         all_norm_curves: list[np.ndarray] = []
         slot_index: list[tuple[int, int]] = []
 
         for s in range(b):
             v0, v1 = vptr[s], vptr[s + 1]
             e0, e1 = eptr[s], eptr[s + 1]
-            nv = v1 - v0
-            ne = min(e1 - e0, max_c)
-            verts_s = vertices[v0:v1]
-            # local edge ids in [0, nv)
-            eidx_s = (edge_index[:, e0:e1] - v0).T  # (E, 2)
-            epts_s = edge_points[e0:e1]             # (E, U, 3)
+            nv = min(v1 - v0, N)
+            ne = min(e1 - e0, E)
+            verts_s = vertices[v0:v1][:nv]
+            node_coords[s, :nv] = verts_s
+            node_mask[s, :nv] = True
             if ne == 0:
                 continue
-            eidx_s = eidx_s[:ne]
-            epts_s = epts_s[:ne]
 
-            can = wops.canonicalize(
-                nv, eidx_s,
-                max_col_diff=self.max_col_diff,
-                max_row_diff=self.max_row_diff,
-            )
-            order = can["order"]
-            adj = can["adj"]            # (ne, 2) new ids, oriented+sorted
-            diffs = can["diffs"]        # (ne, 2)
+            eidx_s = (edge_index[:, e0:e1] - v0).T[:ne]  # (ne, 2) local ids
+            epts_s = edge_points[e0:e1][:ne]             # (ne, U, 3)
+            # drop edges that reference a clipped-away vertex
+            keep = (eidx_s[:, 0] < nv) & (eidx_s[:, 1] < nv)
+            eidx_s = eidx_s[keep]
+            epts_s = epts_s[keep]
+            ne = eidx_s.shape[0]
+            if ne == 0:
+                continue
 
-            relabelled = can["perm"][eidx_s]
-            swap = relabelled[:, 0] > relabelled[:, 1]
+            ca = verts_s[eidx_s[:, 0]]
+            cb = verts_s[eidx_s[:, 1]]
+            swap = coord_orient_swap(ca, cb)
 
-            # oriented endpoint coords (first=min-id vertex), then edge-sorted
-            coords_pair = verts_s[eidx_s]            # (ne, 2, 3) old order
-            coords_pair[swap] = coords_pair[swap][:, ::-1]
-            seg = coords_pair.reshape(ne, 6)[order]
-            segments[s, :ne] = seg
+            oriented_idx = eidx_s.copy()
+            oriented_idx[swap] = oriented_idx[swap][:, ::-1]
+            edge_pairs[s, :ne] = oriented_idx
+            edge_mask[s, :ne] = True
 
-            flag_diffs[s, :ne, 0] = 1
-            flag_diffs[s, :ne, 1:] = diffs
-
-            # oriented + reordered curve polylines, normalized to canonical frame
             epts_oriented = epts_s.copy()
             epts_oriented[swap] = epts_oriented[swap][:, ::-1]
-            epts_oriented = epts_oriented[order]
             norm = normalize_curves(epts_oriented.astype(np.float64)).astype(np.float32)
             for k in range(ne):
                 slot_index.append((s, k))
             all_norm_curves.append(norm)
 
-        # one curve-VAE encode pass for the whole batch
-        curve_mu = np.zeros((b, max_c, d), dtype=np.float32)
-        curve_std = np.zeros((b, max_c, d), dtype=np.float32)
+        curve_mu = np.zeros((b, E, d), dtype=np.float32)
+        curve_std = np.zeros((b, E, d), dtype=np.float32)
         if all_norm_curves:
             stacked = np.concatenate(all_norm_curves, axis=0)  # (sumE, U, 3)
             stacked_t = torch.from_numpy(stacked).to(device=device, dtype=torch.float32)
@@ -175,10 +184,15 @@ class ClrPackingMixin:
                 curve_mu[s, k] = mu[j]
                 curve_std[s, k] = std[j]
 
-        xs = np.concatenate([segments, curve_mu, curve_std], axis=-1)  # (B, C, 6+2D)
-        xs_t = torch.from_numpy(xs).to(device=device, dtype=torch.float32)
-        flag_diffs_t = torch.from_numpy(flag_diffs).to(device=device, dtype=torch.long)
-        return {"xs": xs_t, "flag_diffs": flag_diffs_t}
+        to = lambda a, dt: torch.from_numpy(a).to(device=device, dtype=dt)
+        return {
+            "node_coords": to(node_coords, torch.float32),
+            "node_mask": to(node_mask, torch.bool),
+            "edge_pairs": to(edge_pairs, torch.long),
+            "edge_mask": to(edge_mask, torch.bool),
+            "edge_mu": to(curve_mu, torch.float32),
+            "edge_std": to(curve_std, torch.float32),
+        }
 
     # ------------------------------------------------------------------
     def decode_curves(
@@ -189,16 +203,14 @@ class ClrPackingMixin:
     ) -> torch.Tensor:
         """Decode per-curve latents ``(B, N, D)`` -> curves ``(B, N, num_points, 3)``.
 
-        Mirrors CLR-Wire ``sample.py``: reshape to the curve-VAE latent layout,
-        query uniform ``t in [0, 1]`` and (optionally) pin the canonical
-        endpoints to ``[-1,0,0]`` / ``[1,0,0]``.
+        Reshapes to the curve-VAE latent layout, queries uniform ``t in [0, 1]``
+        and (optionally) pins the canonical endpoints to ``[-1,0,0]`` /
+        ``[1,0,0]``.
         """
         from einops import rearrange
 
         bsz = curve_latent.shape[0]
         ch = self.curve_vae.config.latent_channels
-        # Inverse of encode_curve_latent's ``reshape(E, ch*L)`` (channel-major),
-        # i.e. flat layout is "(c l)". Keep encode/decode self-consistent.
         z = rearrange(curve_latent, "b n (c l) -> (b n) c l", c=ch)  # (B*N, ch, L)
         t = torch.linspace(0.0, 1.0, num_points, device=curve_latent.device)
         t = t.unsqueeze(0).expand(z.shape[0], -1)
@@ -211,71 +223,96 @@ class ClrPackingMixin:
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def reconstruct(
+    def reconstruct_graph(
         self,
-        preds: dict[str, torch.Tensor],
+        dec: dict[str, torch.Tensor],
+        *,
+        exist_thresh: float = 0.5,
+        edge_thresh: float = 0.5,
         recon_curves: bool = True,
         num_points: int = 32,
     ) -> list[dict[str, Any]]:
-        """Decoder predictions -> explicit wireframes (one dict per sample).
+        """Decoder dict -> explicit wireframes (one dict per sample).
 
-        Mirrors CLR-Wire ``sample/reconstruction.py``:
-          * ``argmax(cls) + 1`` -> number of curves;
-          * ``argmax`` col/row diffs (+1 for row) -> cumsum -> adjacency;
-          * average shared-vertex endpoints (``refine_segment_coords_by_adj``);
-          * optionally decode + denormalise curves onto the endpoints.
+          * ``sigmoid(exist) > exist_thresh``        -> alive vertices;
+          * ``sigmoid(adjacency) > edge_thresh`` (upper triangle of the alive
+            sub-block) -> edges;
+          * per-edge curve latent (from the two endpoint node tokens, ordered
+            by the coordinate rule) -> decode + denormalise onto the endpoints.
         """
-        import numpy as np
         from einops import rearrange
 
-        from . import wireframe_ops as wops
         from .vae.recon_utils import denorm_curves
 
-        cls = preds["cls"].detach().cpu().numpy()
-        num_curves = cls.argmax(axis=-1) + 1
-        segments = preds["segments"].detach().cpu().numpy()
-        diffs = preds["diffs"].detach().cpu().numpy()
-        col = diffs[..., : self.max_col_diff].argmax(axis=-1)
-        row = diffs[..., self.max_col_diff :].argmax(axis=-1) + 1
-        adj_all = wops.diffs_to_adjacency(col, row)  # (B, C, 2)
+        coord = dec["coord"]
+        exist_logit = dec["exist_logit"]
+        node_tokens = dec["node_tokens"]
+        adj_logits = self.wireframe_vae.predict_adjacency(node_tokens)
 
-        dec_curves = None
-        if recon_curves:
-            dec_curves = self.decode_curves(
-                preds["curve_latent"], num_points=num_points
-            ).detach().cpu().numpy()  # (B, C, num_points, 3)
+        coord_np = coord.detach().cpu().numpy()
+        exist_p = torch.sigmoid(exist_logit).detach().cpu().numpy()
+        adj_p = torch.sigmoid(adj_logits).detach().cpu().numpy()
 
+        b = coord.shape[0]
         out: list[dict[str, Any]] = []
-        b = cls.shape[0]
         for s in range(b):
-            nc = int(num_curves[s])
-            adj_s = adj_all[s, :nc]
-            seg_s = wops.refine_segment_coords_by_adj(adj_s, segments[s, :nc])
+            alive = np.nonzero(exist_p[s] > exist_thresh)[0]
+            if alive.shape[0] == 0:
+                out.append({
+                    "vertices": np.zeros((0, 3), dtype=np.float32),
+                    "edge_index": np.zeros((0, 2), dtype=np.int64),
+                    "num_vertices": 0, "num_edges": 0,
+                })
+                continue
 
-            node_ids = np.unique(adj_s)
-            remap = {int(o): i for i, o in enumerate(node_ids)}
-            verts = np.zeros((len(node_ids), 3), dtype=np.float32)
-            for i, (a, bb) in enumerate(adj_s):
-                verts[remap[int(a)]] = seg_s[i, :3]
-                verts[remap[int(bb)]] = seg_s[i, 3:]
-            edge_index = np.array(
-                [[remap[int(a)], remap[int(bb)]] for a, bb in adj_s],
-                dtype=np.int64,
-            ).reshape(-1, 2)
+            verts = coord_np[s, alive].astype(np.float32)
+            sub = adj_p[s][np.ix_(alive, alive)]
+            iu, ju = np.triu_indices(alive.shape[0], k=1)
+            sel = sub[iu, ju] > edge_thresh
+            li, lj = iu[sel], ju[sel]  # local (alive-space) endpoints
+
+            if li.shape[0] == 0:
+                out.append({
+                    "vertices": verts,
+                    "edge_index": np.zeros((0, 2), dtype=np.int64),
+                    "num_vertices": int(alive.shape[0]), "num_edges": 0,
+                })
+                continue
+
+            # orient each edge by the coordinate rule (smaller coord first)
+            ca, cb = verts[li], verts[lj]
+            swap = coord_orient_swap(ca, cb)
+            a_local = np.where(swap, lj, li)
+            b_local = np.where(swap, li, lj)
+            edge_index = np.stack([a_local, b_local], axis=-1).astype(np.int64)
 
             sample_out: dict[str, Any] = {
                 "vertices": verts,
                 "edge_index": edge_index,
-                "edge_endpoints": seg_s.astype(np.float32),
-                "num_vertices": len(node_ids),
-                "num_edges": nc,
+                "num_vertices": int(alive.shape[0]),
+                "num_edges": int(edge_index.shape[0]),
             }
-            if dec_curves is not None and nc > 0:
-                corners = rearrange(seg_s, "n (c d) -> n c d", c=2)
-                curves = denorm_curves(dec_curves[s, :nc], corners)
-                sample_out["edge_points"] = curves
+
+            if recon_curves:
+                qa = torch.as_tensor(alive[a_local], device=coord.device).long()
+                qb = torch.as_tensor(alive[b_local], device=coord.device).long()
+                pairs = torch.stack([qa, qb], dim=-1).unsqueeze(0)  # (1, m, 2)
+                curve_lat = self.wireframe_vae.predict_curve(
+                    node_tokens[s:s + 1], pairs)  # (1, m, D)
+                dec_curves = self.decode_curves(
+                    curve_lat, num_points=num_points).detach().cpu().numpy()[0]
+                corners = np.stack(
+                    [verts[a_local], verts[b_local]], axis=1)  # (m, 2, 3)
+                curves = denorm_curves(dec_curves, corners)
+                if curves is not None:
+                    sample_out["edge_points"] = curves
             out.append(sample_out)
         return out
 
 
-__all__ = ["CURVE_LATENT_DIM", "ClrPackingMixin", "normalized_curves_from_batch"]
+__all__ = [
+    "CURVE_LATENT_DIM",
+    "ClrPackingMixin",
+    "coord_orient_swap",
+    "normalized_curves_from_batch",
+]

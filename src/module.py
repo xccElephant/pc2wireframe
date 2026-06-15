@@ -64,29 +64,27 @@ def _default_wireframe_vae() -> dict[str, Any]:
     return dict(
         latent_channels=64,
         wireframe_latent_num=64,
-        max_col_diff=6,
-        max_row_diff=32,
+        max_nodes=768,
         max_curves_num=1024,
+        curve_latent_dim=12,
         attn_encoder_depth=4,
         attn_decoder_self_depth=12,
         attn_decoder_cross_depth=2,
         attn_dim=768,
         num_heads=12,
-        curve_latent_embed_dim=256,
-        use_mlp_predict=True,
+        adj_dim=128,
         use_latent_pos_emb=True,
-        input_is_curve_latent=True,
     )
 
 
 def _default_curve_vae() -> dict[str, Any]:
     return dict(
         latent_channels=3,
-        sample_points_num=16,
+        sample_points_num=32,
         # length of down_block_types + last block_out_channels set latent_len
-        # (16 / 2**2 = 4) and d_model (256); 3 channels x 4 = 12-d latent.
-        down_block_types=("DownBlock1D", "DownBlock1D"),
-        block_out_channels=(128, 256),
+        # (32 / 2**3 = 4) and d_model (256); 3 channels x 4 = 12-d latent.
+        down_block_types=("DownBlock1D", "DownBlock1D", "DownBlock1D"),
+        block_out_channels=(128, 256, 256),
         layers_per_block=2,
     )
 
@@ -331,10 +329,14 @@ class WireframeVAEModule(_BaseModule):
         return [self.model.curve_vae]
 
     def _vae_step(self, batch, stage):
-        clr = self.model.graph_to_clr_inputs(batch)
+        targets = self.model.graph_to_node_inputs(batch)
         loss, parts = self.model.wireframe_vae(
-            xs=clr["xs"],
-            flag_diffs=clr["flag_diffs"],
+            node_coords=targets["node_coords"],
+            node_mask=targets["node_mask"],
+            edge_pairs=targets["edge_pairs"],
+            edge_mask=targets["edge_mask"],
+            edge_mu=targets["edge_mu"],
+            edge_std=targets["edge_std"],
             sample_posterior=(stage == "train"),
             return_loss=True,
         )
@@ -342,7 +344,7 @@ class WireframeVAEModule(_BaseModule):
         self.log(f"{stage}/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
         for key, value in parts.items():
             self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
-        return loss, clr
+        return loss, targets
 
     def training_step(self, batch, batch_idx):
         loss, _ = self._vae_step(batch, "train")
@@ -351,13 +353,13 @@ class WireframeVAEModule(_BaseModule):
     def validation_step(self, batch, batch_idx):
         from einops import rearrange
 
-        _, clr = self._vae_step(batch, "val")
+        _, targets = self._vae_step(batch, "val")
         # Reconstruction quality of the VAE itself: encode GT -> decode -> score.
-        posterior = self.model.encode_target(clr["xs"], clr["flag_diffs"])
+        posterior = self.model.encode_target(targets)
         z = rearrange(posterior.mode(), "b d n -> b n d")
-        preds = self.model.decode_latent(z)
-        preds_wf = self.model.reconstruct(
-            preds, recon_curves=True, num_points=self.hparams.eval_num_per_edge
+        dec = self.model.decode_latent(z)
+        preds_wf = self.model.reconstruct_graph(
+            dec, recon_curves=True, num_points=self.hparams.eval_num_per_edge
         )
         self.val_metrics.update(preds_wf, _gt_wireframes(batch))
 
@@ -455,15 +457,14 @@ class PC2WireframeModule(_BaseModule):
         from einops import rearrange
 
         vae = self.model.wireframe_vae
-        clr = self.model.graph_to_clr_inputs(batch)
-        xs, flag_diffs = clr["xs"], clr["flag_diffs"]
+        targets = self.model.graph_to_node_inputs(batch)
 
         losses: dict[str, torch.Tensor] = {}
-        total = xs.new_zeros(())
+        total = out["mu"].new_zeros(())
 
         # 1) latent regression toward the frozen teacher posterior mean.
         with torch.no_grad():
-            posterior = self.model.encode_target(xs=xs, flag_diffs=flag_diffs)
+            posterior = self.model.encode_target(targets)
             teacher_mu = rearrange(posterior.mode(), "b d n -> b n d")
         latent_recon = F.smooth_l1_loss(out["mu"], teacher_mu)
         losses["latent_recon"] = latent_recon
@@ -476,22 +477,17 @@ class PC2WireframeModule(_BaseModule):
             losses["kl"] = kl
             total = total + self.hparams.kl_weight * kl
 
-        # 2) decode-through: supervise the (frozen) decode of the PC latent.
-        xs_mask = flag_diffs[..., 0] > 0.5
-        (cls_ce, seg_mse, col_ce, row_ce, curve_mse) = vae.loss(
-            gt_segment_coords=xs[..., :6],
-            gt_flag_diffs=flag_diffs,
-            gt_curve_latent=xs[..., 6:],
-            xs_mask=xs_mask,
-            preds=out["preds"],
-        )
+        # 2) decode-through: supervise the (frozen) decode of the PC latent
+        # against the GT graph (matched node / existence / adjacency / curve).
+        parts = vae.compute_losses(out["preds"], targets)
         decode_through = (
-            vae.cls_loss_weight * cls_ce
-            + vae.segment_loss_weight * seg_mse
-            + vae.col_diff_loss_weight * col_ce
-            + vae.row_diff_loss_weight * row_ce
-            + vae.curve_latent_loss_weight * curve_mse
+            vae.coord_loss_weight * parts["coord_loss"]
+            + vae.exist_loss_weight * parts["exist_loss"]
+            + vae.adj_loss_weight * parts["adj_loss"]
+            + vae.curve_latent_loss_weight * parts["curve_latent_loss"]
         )
+        for k, v in parts.items():
+            losses[k] = v
         losses["decode_through"] = decode_through
         total = total + self.hparams.decode_through_weight * decode_through
 
@@ -519,7 +515,7 @@ class PC2WireframeModule(_BaseModule):
 
     def validation_step(self, batch, batch_idx):
         out, _ = self._step(batch, "val")
-        preds_wf = self.model.reconstruct(
+        preds_wf = self.model.reconstruct_graph(
             out["preds"],
             recon_curves=True,
             num_points=self.hparams.eval_num_per_edge,
@@ -538,7 +534,7 @@ class PC2WireframeModule(_BaseModule):
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """Per-shape latent + decoded wireframe for submission."""
         out = self.model(batch["point_cloud"], sample=False)
-        wireframes = self.model.reconstruct(out["preds"], recon_curves=True)
+        wireframes = self.model.reconstruct_graph(out["preds"], recon_curves=True)
         return {
             "shape_id": batch.get("shape_id"),
             "z": out["z"],

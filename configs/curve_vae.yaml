@@ -12,11 +12,11 @@ model:
   init_args:
     curve_vae:
       latent_channels: 3              # 3 channels x 4 latent positions = 12-d
-      sample_points_num: 16           # encoder length; decode can query any length
+      sample_points_num: 32           # encoder length; decode can query any length
       # The attention VAE has no conv blocks: len(down_block_types) only sets the
-      # latent length (16 / 2**2 = 4) and block_out_channels[-1] sets d_model.
-      down_block_types: ["DownBlock1D", "DownBlock1D"]
-      block_out_channels: [128, 256]
+      # latent length (32 / 2**3 = 4) and block_out_channels[-1] sets d_model.
+      down_block_types: ["DownBlock1D", "DownBlock1D", "DownBlock1D"]
+      block_out_channels: [128, 256, 256]
       layers_per_block: 2             # transformer layers in encoder/decoder
 
     # ----- optimization -----

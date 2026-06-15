@@ -20,7 +20,10 @@ data:
 
     # ----- graph / point-cloud format -----
     vertex_merge_tol: 0.0001
-    max_vertices: 4096
+    # Samples with >max_vertices vertices are SKIPPED (not truncated), to match
+    # the wireframe VAE's max_nodes (768): the node-query decoder can't represent
+    # more vertices than that. ~1% of edges<=1024 samples exceed 768 vertices.
+    max_vertices: 768
     # Samples with >max_edges edges are SKIPPED (not truncated). Keep this in
     # sync with the wireframe VAE's max_curves_num (1024): the 64x64 latent can't
     # represent more curves than that, so the ~16% long tail (>1024 edges) is
