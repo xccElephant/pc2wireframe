@@ -71,14 +71,19 @@ class WireframeScore(Metric):
         """
         import math
 
+        # A degenerate (e.g. empty) prediction yields a non-finite chamfer; record
+        # it as a clearly-bad distance instead of 0.0, so the raw ccd/vpe metrics
+        # are not mistaken for a perfect reconstruction. (The exp(-d/tau) *score*
+        # already maps non-finite -> 0, so the final score is unaffected.)
+        bad = 1.0e2
         device = self.device
         for pred, gt in zip(preds, targets):
             ccd = curve_chamfer_distance(pred, gt, self.num_per_edge, device)
             vpe = vertex_position_error(pred, gt, device)
             ta = topology_accuracy(pred, gt, self.match_thresh, device)
 
-            self.ccd_sum += ccd if math.isfinite(ccd) else 0.0
-            self.vpe_sum += vpe if math.isfinite(vpe) else 0.0
+            self.ccd_sum += ccd if math.isfinite(ccd) else bad
+            self.vpe_sum += vpe if math.isfinite(vpe) else bad
             self.ta_sum += float(ta)
             self.ccd_score_sum += distance_to_score(ccd, self.ccd_tau)
             self.vpe_score_sum += distance_to_score(vpe, self.vpe_tau)

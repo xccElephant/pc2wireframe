@@ -84,6 +84,9 @@ class GraphEncoder(nn.Module):
                 activation="gelu", batch_first=True, norm_first=True),
             depth)
 
+        # norm_first transformers leave an un-normalised residual stream; a final
+        # LayerNorm keeps the latent moments (hence logvar / std) from drifting.
+        self.out_norm = nn.LayerNorm(attn_dim)
         oc = 2 * out_channels if double_z else out_channels
         self.project_out = nn.Linear(attn_dim, oc)
 
@@ -110,7 +113,7 @@ class GraphEncoder(nn.Module):
 
         q = repeat(self.latent_queries, "m d -> b m d", b=b)
         h = self.cross_attn(tgt=q, memory=tokens, memory_key_padding_mask=pad)
-        return self.project_out(h)  # (b, M, 2C)
+        return self.project_out(self.out_norm(h))  # (b, M, 2C)
 
 
 class GraphDecoder(nn.Module):
@@ -150,11 +153,17 @@ class GraphDecoder(nn.Module):
                 activation="gelu", batch_first=True, norm_first=True),
             cross_depth)
 
+        # final LayerNorm bounds the node-token magnitudes feeding every head.
+        self.out_norm = nn.LayerNorm(attn_dim)
         self.coord_head = MLP(in_dim=attn_dim, out_dim=3, expansion_factor=1.0)
         self.exist_head = nn.Linear(attn_dim, 1)
-        # symmetric inner-product link-prediction decoder (VGAE-style).
+        # attention-style scaled dot-product link-prediction decoder. A single
+        # projection keeps the score symmetric (a @ a^T); the 1/sqrt(D) scaling
+        # plus the LayerNorm'd node tokens keep the logits well-behaved, and a
+        # learnable temperature lets the model sharpen them.
         self.adj_proj = nn.Linear(attn_dim, adj_dim)
-        self.adj_scale = nn.Parameter(torch.tensor(1.0 / (adj_dim ** 0.5)))
+        self.adj_dim = adj_dim
+        self.adj_temp = nn.Parameter(torch.tensor(1.0))
         self.adj_bias = nn.Parameter(torch.zeros(()))
         # per-edge curve latent from the two endpoint node tokens.
         self.curve_head = MLP(
@@ -169,15 +178,17 @@ class GraphDecoder(nn.Module):
 
         q = repeat(self.node_queries, "n d -> b n d", b=b)
         node_tokens = self.cross_attn(tgt=q, memory=h)  # (b, Nq, d)
+        node_tokens = self.out_norm(node_tokens)
 
-        coord = self.coord_head(node_tokens)             # (b, Nq, 3)
+        coord = torch.tanh(self.coord_head(node_tokens))  # (b, Nq, 3) in (-1, 1)
         exist_logit = self.exist_head(node_tokens).squeeze(-1)  # (b, Nq)
         return {"node_tokens": node_tokens, "coord": coord, "exist_logit": exist_logit}
 
     def predict_adjacency(self, node_tokens):
-        a = self.adj_proj(node_tokens)               # (b, Nq, adj_dim)
-        logits = torch.matmul(a, a.transpose(-1, -2)) * self.adj_scale + self.adj_bias
-        return logits                                # (b, Nq, Nq) symmetric
+        a = self.adj_proj(node_tokens)                       # (b, Nq, adj_dim)
+        scale = self.adj_temp / (self.adj_dim ** 0.5)
+        logits = torch.matmul(a, a.transpose(-1, -2)) * scale + self.adj_bias
+        return logits                                        # (b, Nq, Nq) symmetric
 
     def predict_curve(self, node_tokens, pairs):
         """``pairs`` ``(b, P, 2)`` node-query indices -> curve latent ``(b, P, D)``."""
@@ -202,8 +213,8 @@ class AutoencoderKLWireframe(nn.Module):
         curve_latent_dim: int = 12,
         attn_dim: int = 768,
         num_heads: int = 12,
-        attn_encoder_depth: int = 4,
-        attn_decoder_self_depth: int = 12,
+        attn_encoder_depth: int = 3,
+        attn_decoder_self_depth: int = 3,
         attn_decoder_cross_depth: int = 2,
         adj_dim: int = 128,
         node_embed_hidden: int = 48,
@@ -213,7 +224,11 @@ class AutoencoderKLWireframe(nn.Module):
         adj_loss_weight: float = 1.0,
         curve_latent_loss_weight: float = 1.0,
         kl_loss_weight: float = 2e-4,
-        adj_pos_weight: float = 5.0,
+        # positive-class up-weighting caps for the imbalanced BCE heads
+        # (node existence and adjacency); the actual weight is the per-batch /
+        # per-sample neg/pos ratio, clamped to these caps.
+        exist_pos_weight: float = 10.0,
+        adj_pos_weight: float = 20.0,
         # matching cost
         match_coord_weight: float = 1.0,
         match_exist_weight: float = 0.1,
@@ -251,7 +266,8 @@ class AutoencoderKLWireframe(nn.Module):
         self.kl_loss_weight = kl_loss_weight
         self.match_coord_weight = match_coord_weight
         self.match_exist_weight = match_exist_weight
-        self.register_buffer("adj_pos_weight", torch.tensor(float(adj_pos_weight)))
+        self.exist_pos_weight = float(exist_pos_weight)
+        self.adj_pos_weight = float(adj_pos_weight)
 
     # ------------------------------------------------------------------
     def encode(self, *, node_coords, node_mask, edge_pairs, edge_mask, edge_feat) -> GaussianLatent:
@@ -321,12 +337,11 @@ class AutoencoderKLWireframe(nn.Module):
 
         coord_loss = coord.new_zeros(())
         curve_loss = coord.new_zeros(())
+        adj_loss = coord.new_zeros(())
         n_coord = 0
         n_curve = 0
+        n_adj = 0
         exist_target = torch.zeros(b, nq, device=device)
-        adj_target = torch.zeros(b, nq, nq, device=device)
-
-        triu = torch.triu_indices(nq, nq, offset=1, device=device)
 
         for s in range(b):
             qi, gi = matches[s]
@@ -335,9 +350,11 @@ class AutoencoderKLWireframe(nn.Module):
                 continue
             exist_target[s, qi] = 1.0
 
-            # map GT node id -> matched query id
+            # map GT node id -> matched query id / local matched position
             g2q = torch.full((nv,), -1, dtype=torch.long, device=device)
             g2q[gi] = qi
+            g2local = torch.empty(nv, dtype=torch.long, device=device)
+            g2local[gi] = torch.arange(nv, device=device)
 
             # coord loss on matched pairs
             coord_loss = coord_loss + F.l1_loss(
@@ -345,37 +362,58 @@ class AutoencoderKLWireframe(nn.Module):
             n_coord += nv
 
             ne = int(edge_mask[s].sum().item())
-            if ne == 0:
-                continue
-            ep = edge_pairs[s, :ne]                          # (ne, 2) GT node ids
-            qa = g2q[ep[:, 0]]
-            qb = g2q[ep[:, 1]]
+            ep = edge_pairs[s, :ne] if ne > 0 else None
 
-            # adjacency target in query space (symmetric, no self loops)
-            adj_target[s, qa, qb] = 1.0
-            adj_target[s, qb, qa] = 1.0
+            # adjacency BCE restricted to the matched (existing) nodes only:
+            # this keeps the positive ratio sane and matches inference (edges
+            # are only ever predicted among alive nodes).
+            sub_logit = adj_logits[s].index_select(0, qi).index_select(1, qi)
+            sub_target = torch.zeros(nv, nv, device=device)
+            if ne > 0:
+                la = g2local[ep[:, 0]]
+                lb = g2local[ep[:, 1]]
+                sub_target[la, lb] = 1.0
+                sub_target[lb, la] = 1.0
+            iu = torch.triu_indices(nv, nv, offset=1, device=device)
+            if iu.shape[1] > 0:
+                lg = sub_logit[iu[0], iu[1]]
+                tg = sub_target[iu[0], iu[1]]
+                n_pos = tg.sum()
+                n_neg = tg.numel() - n_pos
+                pw = torch.clamp(
+                    n_neg / torch.clamp(n_pos, min=1.0), 1.0, self.adj_pos_weight)
+                adj_loss = adj_loss + F.binary_cross_entropy_with_logits(
+                    lg, tg, pos_weight=pw, reduction="sum")
+                n_adj += lg.numel()
 
             # curve loss: predict per-edge latent from matched endpoint tokens
-            pairs = torch.stack([qa, qb], dim=-1).unsqueeze(0)  # (1, ne, 2)
-            pred_mu = self.predict_curve(node_tokens[s:s + 1], pairs)[0]  # (ne, D)
-            tgt_mu = edge_mu[s, :ne]
-            if edge_std is not None:
-                std = torch.clamp(edge_std[s, :ne], 0.0, 1.0)
-                w = 1.2 - 0.5 * torch.log(std + 1.7183)
-                curve_loss = curve_loss + (w * (pred_mu - tgt_mu) ** 2).sum()
-            else:
-                curve_loss = curve_loss + ((pred_mu - tgt_mu) ** 2).sum()
-            n_curve += ne * tgt_mu.shape[-1]
+            if ne > 0:
+                qa = g2q[ep[:, 0]]
+                qb = g2q[ep[:, 1]]
+                pairs = torch.stack([qa, qb], dim=-1).unsqueeze(0)  # (1, ne, 2)
+                pred_mu = self.predict_curve(node_tokens[s:s + 1], pairs)[0]
+                tgt_mu = edge_mu[s, :ne]
+                if edge_std is not None:
+                    std = torch.clamp(edge_std[s, :ne], 0.0, 1.0)
+                    w = 1.2 - 0.5 * torch.log(std + 1.7183)
+                    curve_loss = curve_loss + (w * (pred_mu - tgt_mu) ** 2).sum()
+                else:
+                    curve_loss = curve_loss + ((pred_mu - tgt_mu) ** 2).sum()
+                n_curve += ne * tgt_mu.shape[-1]
 
         coord_loss = coord_loss / max(n_coord, 1)
         curve_loss = curve_loss / max(n_curve, 1)
-        exist_loss = F.binary_cross_entropy_with_logits(exist_logit, exist_target)
+        adj_loss = adj_loss / max(n_adj, 1)
 
-        # adjacency BCE over the upper triangle, with positive up-weighting.
-        a_logit = adj_logits[:, triu[0], triu[1]]
-        a_tgt = adj_target[:, triu[0], triu[1]]
-        adj_loss = F.binary_cross_entropy_with_logits(
-            a_logit, a_tgt, pos_weight=self.adj_pos_weight)
+        # node-existence BCE, with the positive class up-weighted by the
+        # (clamped) per-batch neg/pos ratio so the head can't collapse to
+        # "nothing exists".
+        n_pos_e = exist_target.sum()
+        n_neg_e = exist_target.numel() - n_pos_e
+        pw_e = torch.clamp(
+            n_neg_e / torch.clamp(n_pos_e, min=1.0), 1.0, self.exist_pos_weight)
+        exist_loss = F.binary_cross_entropy_with_logits(
+            exist_logit, exist_target, pos_weight=pw_e)
 
         return {
             "coord_loss": coord_loss,

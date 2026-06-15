@@ -39,8 +39,8 @@ model:
       max_nodes: 768                # MUST match the stage-2 wireframe VAE
       max_curves_num: 1024          # MUST match the stage-2 wireframe VAE
       curve_latent_dim: 12          # MUST match the curve VAE: 3 * (32 / 2**3)
-      attn_encoder_depth: 4
-      attn_decoder_self_depth: 12
+      attn_encoder_depth: 3
+      attn_decoder_self_depth: 3
       attn_decoder_cross_depth: 2
       attn_dim: 768
       num_heads: 12
