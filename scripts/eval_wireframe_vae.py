@@ -143,7 +143,7 @@ def run_eval(
     Returns dict with per-shape metrics (numpy arrays of length N) and the raw
     pred / GT wireframes (lists) needed for plotting.
     """
-    inner = model.model  # ClrWireframeBase
+    inner = model.model  # WireframeVAEModel
 
     preds_all: list[dict] = []
     gts_all: list[dict] = []

@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from .metrics import WireframeScore
 from .models.packing import normalized_curves_from_batch
-from .models.pc2wireframe import ClrWireframeBase, PC2WireframeModel
+from .models.pc2wireframe import PC2WireframeModel, WireframeVAEModel
 
 
 # ----------------------------------------------------------------------
@@ -308,7 +308,7 @@ class WireframeVAEModule(_BaseModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.model = ClrWireframeBase(
+        self.model = WireframeVAEModel(
             wireframe_vae=wireframe_vae or _default_wireframe_vae(),
             curve_vae=curve_vae or _default_curve_vae(),
         )
@@ -381,7 +381,7 @@ class PC2WireframeModule(_BaseModule):
 
     Two complementary signals to the (only trainable) point-cloud encoder:
       1. latent regression: pull the predicted latent toward the **frozen**
-         CLR-Wire wireframe-VAE posterior of the GT wireframe (a fixed teacher,
+         wireframe-VAE posterior of the GT wireframe (a fixed teacher,
          no moving target now that the VAE is frozen);
       2. decode-through: decode the predicted latent through the **frozen**
          decoder and supervise the wireframe heads against GT -- gradients flow

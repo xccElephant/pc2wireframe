@@ -1,15 +1,15 @@
 """Latent compressor: cross-attention pooling of encoder tokens into the
 fixed-length, budget-constrained wireframe latent ``Z_W``.
 
-This is the analogue of the baseline's ``LatentCompressor`` and of CLR-Wire's
-Perceiver-style wireframe encoder, but it pools *point-cloud* features instead
+This is the analogue of the baseline's ``LatentCompressor`` and of the wireframe
+VAE's Perceiver-style graph encoder, but it pools *point-cloud* features instead
 of ground-truth wireframe features. ``K = num_tokens`` learnable queries
 cross-attend over the (padded) encoder token set and project to a
 ``latent_dim``-channel distribution, giving a latent of ``num_tokens *
 latent_dim`` floats. The competition hard cap is 4096 float32 values.
 
 Output layout is ``(B, num_tokens, latent_dim)`` -- callers that feed the
-CLR-Wire wireframe decoder should rearrange to ``(B, latent_dim, num_tokens)``
+wireframe VAE decoder should rearrange to ``(B, latent_dim, num_tokens)``
 (the decoder's ``decode(z=...)`` expects ``'b d n'``).
 """
 from __future__ import annotations

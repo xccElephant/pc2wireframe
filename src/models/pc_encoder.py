@@ -1,7 +1,7 @@
 """Point-cloud encoder: PTv3 backbone + latent-compressor head.
 
 Maps a surface point cloud ``(B, N, 3)`` to the fixed-length wireframe latent
-distribution ``Z_W`` that the CLR-Wire wireframe decoder consumes.
+distribution ``Z_W`` that the wireframe VAE decoder consumes.
 
 Pipeline::
 

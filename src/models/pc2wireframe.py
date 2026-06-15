@@ -1,23 +1,23 @@
-"""CLR-Wire wireframe models for staged training.
+"""Wireframe models for staged training.
 
 Two ``nn.Module`` containers, sharing the packing / reconstruction logic in
-:class:`~src.models.packing.ClrPackingMixin`:
+:class:`~src.models.packing.WireframePackingMixin`:
 
-``ClrWireframeBase`` -- the (always-present) CLR-Wire wireframe VAE + curve VAE.
+``WireframeVAEModel`` -- the (always-present) graph wireframe VAE + curve VAE.
     Used directly by **stage 2** (train the wireframe VAE with the curve VAE
     frozen). Exposes ``encode_target`` / ``decode_latent`` plus the inherited
     ``graph_to_node_inputs`` / ``reconstruct_graph``.
 
-``PC2WireframeModel`` -- ``ClrWireframeBase`` + a point-cloud encoder.
+``PC2WireframeModel`` -- ``WireframeVAEModel`` + a point-cloud encoder.
     Used by **stage 3** (train point cloud -> latent with both VAEs frozen)::
 
-        point cloud --PTv3+LatentCompressor--> Z_W --CLR-Wire decoder-->
-            (curve count, endpoints, differential adjacency, curve latents)
-            --CLR-Wire curve decoder--> 3D curves  => wireframe
+        point cloud --PTv3+LatentCompressor--> Z_W --graph wireframe decoder-->
+            (node set: coords + existence, inner-product adjacency, curve latents)
+            --curve decoder--> 3D curves  => wireframe
 
-The point-cloud encoder replaces CLR-Wire's *wireframe* encoder: at inference we
-never see the GT wireframe, so we regress / sample the latent from the point
-cloud, then reuse the (stage-2 pretrained) CLR-Wire decoders.
+The point-cloud encoder replaces the wireframe VAE's *graph* encoder: at
+inference we never see the GT wireframe, so we regress / sample the latent from
+the point cloud, then reuse the (stage-2 pretrained) wireframe / curve decoders.
 """
 from __future__ import annotations
 
@@ -26,12 +26,12 @@ from typing import Any
 import torch
 from torch import nn
 
-from .packing import ClrPackingMixin
+from .packing import WireframePackingMixin
 from .pc_encoder import PCEncoder
 
 
-class ClrWireframeBase(ClrPackingMixin, nn.Module):
-    """CLR-Wire wireframe VAE + curve VAE container (stage 2 model)."""
+class WireframeVAEModel(WireframePackingMixin, nn.Module):
+    """Graph wireframe VAE + curve VAE container (stage 2 model)."""
 
     def __init__(
         self,
@@ -43,10 +43,10 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
 
         self.wireframe_vae = AutoencoderKLWireframe(**wireframe_vae)
         self.curve_vae = AutoencoderKL1D(**(curve_vae or {}))
-        self._init_clr_config(wireframe_vae, curve_vae)
+        self._init_vae_config(wireframe_vae, curve_vae)
 
     # ------------------------------------------------------------------
-    def _init_clr_config(
+    def _init_vae_config(
         self, wireframe_vae: dict[str, Any], curve_vae: dict[str, Any] | None
     ) -> None:
         """Cache the config needed by the packing / reconstruction code."""
@@ -98,8 +98,8 @@ class ClrWireframeBase(ClrPackingMixin, nn.Module):
         return self.wireframe_vae.decode(z=z_bdn)
 
 
-class PC2WireframeModel(ClrWireframeBase):
-    """Point cloud -> latent -> wireframe, reusing the CLR-Wire decoders."""
+class PC2WireframeModel(WireframeVAEModel):
+    """Point cloud -> latent -> wireframe, reusing the frozen VAE decoders."""
 
     def __init__(
         self,
@@ -147,4 +147,4 @@ class PC2WireframeModel(ClrWireframeBase):
         return {"z": z, "mu": mu, "logvar": logvar, "preds": preds}
 
 
-__all__ = ["ClrWireframeBase", "PC2WireframeModel"]
+__all__ = ["WireframeVAEModel", "PC2WireframeModel"]

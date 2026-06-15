@@ -11,7 +11,7 @@ denormalising a decoded curve onto its endpoints, so the curve VAE always sees
 a consistent orientation.
 
 Shared by the staged-training models:
-  * :class:`~src.models.pc2wireframe.ClrWireframeBase` (stage 2, wireframe VAE)
+  * :class:`~src.models.pc2wireframe.WireframeVAEModel` (stage 2, wireframe VAE)
   * :class:`~src.models.pc2wireframe.PC2WireframeModel` (stage 3, reconstruction)
 
 ``normalized_curves_from_batch`` is a config-free helper used by stage 1 (the
@@ -69,7 +69,7 @@ def coord_orient_swap(ca: np.ndarray, cb: np.ndarray) -> np.ndarray:
     return greater
 
 
-class ClrPackingMixin:
+class WireframePackingMixin:
     """Packing / reconstruction methods shared by the wireframe models.
 
     Requires the host to define: ``curve_vae``, ``wireframe_vae``,
@@ -231,6 +231,7 @@ class ClrPackingMixin:
         edge_thresh: float = 0.5,
         recon_curves: bool = True,
         num_points: int = 32,
+        max_edges: int | None = None,
     ) -> list[dict[str, Any]]:
         """Decoder dict -> explicit wireframes (one dict per sample).
 
@@ -239,7 +240,13 @@ class ClrPackingMixin:
             sub-block) -> edges;
           * per-edge curve latent (from the two endpoint node tokens, ordered
             by the coordinate rule) -> decode + denormalise onto the endpoints.
+
+        ``max_edges`` caps the number of decoded edges (highest-probability
+        first); defaults to ``self.max_curves_num`` so an under-trained model
+        cannot blow up validation by predicting a near-complete graph.
         """
+        if max_edges is None:
+            max_edges = self.max_curves_num
         from einops import rearrange
 
         from .vae.recon_utils import denorm_curves
@@ -268,8 +275,13 @@ class ClrPackingMixin:
             verts = coord_np[s, alive].astype(np.float32)
             sub = adj_p[s][np.ix_(alive, alive)]
             iu, ju = np.triu_indices(alive.shape[0], k=1)
-            sel = sub[iu, ju] > edge_thresh
+            probs = sub[iu, ju]
+            sel = probs > edge_thresh
             li, lj = iu[sel], ju[sel]  # local (alive-space) endpoints
+            # cap to the highest-probability edges to bound decode cost / memory.
+            if li.shape[0] > max_edges:
+                keep = np.argsort(probs[sel])[::-1][:max_edges]
+                li, lj = li[keep], lj[keep]
 
             if li.shape[0] == 0:
                 out.append({
@@ -312,7 +324,7 @@ class ClrPackingMixin:
 
 __all__ = [
     "CURVE_LATENT_DIM",
-    "ClrPackingMixin",
+    "WireframePackingMixin",
     "coord_orient_swap",
     "normalized_curves_from_batch",
 ]

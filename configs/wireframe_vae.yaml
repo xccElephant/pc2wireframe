@@ -11,7 +11,7 @@ seed_everything: 3407
 model:
   class_path: src.module.WireframeVAEModule
   init_args:
-    # CLR-Wire wireframe VAE. latent_channels * wireframe_latent_num <= 4096
+    # Graph wireframe VAE. latent_channels * wireframe_latent_num <= 4096
     # and must match the stage-3 PC encoder latent (64 * 64 = 4096).
     wireframe_vae:
       latent_channels: 64
