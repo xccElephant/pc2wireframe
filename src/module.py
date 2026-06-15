@@ -1,21 +1,18 @@
 """LightningModules for the staged PC2Wireframe training.
 
-The pipeline is trained in three independent stages, each with its own config
-(``configs/{curve_vae,wireframe_vae,pc2wireframe}.yaml``) and its own module:
+The pipeline is trained in **two** independent stages, each with its own config
+(``configs/{curve_vae,pc2wireframe}.yaml``) and its own module:
 
   1. :class:`CurveVAEModule` -- train the per-curve neural parametric VAE
      (``AutoencoderKL1D``) on canonicalised GT curves.
-  2. :class:`WireframeVAEModule` -- train the wireframe VAE
-     (``AutoencoderKLWireframe``) as an autoencoder over packed wireframes,
-     with the **curve VAE frozen** (loaded from stage 1) to produce the
-     per-curve latent targets.
-  3. :class:`PC2WireframeModule` -- train the point-cloud encoder
-     (PTv3 + latent compressor) to predict the latent, with the **wireframe
-     VAE frozen** (loaded from stage 2) and the **curve VAE frozen** (stage 1),
-     via latent regression toward the frozen teacher posterior + decode-through
-     supervision of the (frozen) decoder heads.
+  2. :class:`PC2WireframeModule` -- train the end-to-end point-cloud ->
+     wireframe model (PTv3 encoder + latent compressor + transformer wireframe
+     decoder) with the **curve VAE frozen** (loaded from stage 1). The decoder
+     predicts a node set and an edge set directly; supervision is via Hungarian
+     node / edge matching (coordinates, existence with Focal BCE, endpoint
+     distributions, and a matched-edge curve L1 through the frozen curve VAE).
 
-All three share the ``AdamW`` + linear-warmup/cosine-decay schedule in
+Both share the ``AdamW`` + linear-warmup/cosine-decay schedule in
 :class:`_BaseModule` and are driven through ``LightningCLI`` (see
 ``src/main.py``); the model class is selected per-stage via ``class_path``.
 """
@@ -26,11 +23,11 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 
 from .metrics import WireframeScore
-from .models.packing import normalized_curves_from_batch
-from .models.pc2wireframe import PC2WireframeModel, WireframeVAEModel
+from .models.criterion import WireframeCriterion
+from .models.packing import build_targets, normalized_curves_from_batch
+from .models.pc2wireframe import PC2WireframeModel
 
 
 # ----------------------------------------------------------------------
@@ -51,29 +48,25 @@ def _default_pc_encoder() -> dict[str, Any]:
         dec_patch_size=(1024, 1024, 1024, 1024),
         stride=(2, 2, 2, 2),
         enable_flash=True,
-        latent_num=64,
-        latent_dim=64,
+        # 16 * 256 = 4096 floats (competition latent budget).
+        latent_num=16,
+        latent_dim=256,
         compressor_heads=8,
         variational=True,
     )
 
 
-def _default_wireframe_vae() -> dict[str, Any]:
-    # latent_channels * wireframe_latent_num must equal the PC-encoder latent
-    # (and stay <= 4096 floats).
+def _default_decoder() -> dict[str, Any]:
     return dict(
-        latent_channels=64,
-        wireframe_latent_num=64,
-        max_nodes=768,
-        max_curves_num=1024,
-        curve_latent_dim=12,
-        attn_encoder_depth=3,
-        attn_decoder_self_depth=3,
-        attn_decoder_cross_depth=2,
-        attn_dim=768,
-        num_heads=12,
-        adj_dim=128,
-        use_latent_pos_emb=True,
+        num_node_queries=768,    # >= data.yaml max_vertices
+        num_edge_queries=1024,   # >= data.yaml max_edges
+        d_model=512,
+        nhead=8,
+        dim_ff=2048,
+        node_layers=6,
+        edge_layers=4,
+        endpoint_dim=128,
+        dropout=0.1,
     )
 
 
@@ -97,10 +90,10 @@ def _load_submodule(
 ) -> None:
     """Load one submodule's weights out of a (Lightning) checkpoint.
 
-    A previous-stage Lightning checkpoint stores everything under a module
-    path (e.g. ``model.wireframe_vae.*`` or ``curve_vae.*``). We strip the
-    first ``candidate_prefix`` that actually matches keys and load the rest
-    into ``dest`` (non-strict, so extra/missing keys are reported not fatal).
+    A previous-stage Lightning checkpoint stores everything under a module path
+    (e.g. ``model.curve_vae.*`` or ``curve_vae.*``). We strip the first
+    ``candidate_prefix`` that actually matches keys and load the rest into
+    ``dest`` (non-strict, so extra/missing keys are reported not fatal).
     """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = ckpt.get("state_dict", ckpt)
@@ -276,131 +269,46 @@ class CurveVAEModule(_BaseModule):
         self._step(batch, "val")
 
 
-
 # ----------------------------------------------------------------------
-# stage 2: wireframe VAE (curve VAE frozen)
-# ----------------------------------------------------------------------
-class WireframeVAEModule(_BaseModule):
-    """Stage 2 -- train the wireframe VAE; the curve VAE is frozen."""
-
-    def __init__(
-        self,
-        wireframe_vae: dict[str, Any] | None = None,
-        curve_vae: dict[str, Any] | None = None,
-        # ----- frozen curve VAE warm-start (stage-1 ckpt) -----
-        curve_vae_ckpt: str | None = None,
-        # ----- eval metric (CCD / TA / VPE -> weighted final score) -----
-        eval_w_ccd: float = 0.3,
-        eval_w_ta: float = 0.4,
-        eval_w_vpe: float = 0.3,
-        eval_ccd_tau: float = 0.1,
-        eval_vpe_tau: float = 0.1,
-        eval_match_thresh: float = 0.1,
-        eval_num_per_edge: int = 32,
-        # ----- optimization -----
-        lr: float = 1.0e-4,
-        weight_decay: float = 1e-4,
-        betas: tuple[float, float] = (0.9, 0.95),
-        warmup_steps: int = 500,
-        max_steps: int = 100_000,
-        grad_clip: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.model = WireframeVAEModel(
-            wireframe_vae=wireframe_vae or _default_wireframe_vae(),
-            curve_vae=curve_vae or _default_curve_vae(),
-        )
-        if curve_vae_ckpt:
-            _load_submodule(
-                self.model.curve_vae, curve_vae_ckpt,
-                ["curve_vae", "model.curve_vae"],
-            )
-        _freeze(self.model.curve_vae)
-
-        self.val_metrics = WireframeScore(
-            w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
-            ccd_tau=eval_ccd_tau, vpe_tau=eval_vpe_tau,
-            match_thresh=eval_match_thresh, num_per_edge=eval_num_per_edge,
-        )
-
-    def frozen_modules(self):
-        return [self.model.curve_vae]
-
-    def _vae_step(self, batch, stage):
-        targets = self.model.graph_to_node_inputs(batch)
-        loss, parts = self.model.wireframe_vae(
-            node_coords=targets["node_coords"],
-            node_mask=targets["node_mask"],
-            edge_pairs=targets["edge_pairs"],
-            edge_mask=targets["edge_mask"],
-            edge_mu=targets["edge_mu"],
-            edge_std=targets["edge_std"],
-            sample_posterior=(stage == "train"),
-            return_loss=True,
-        )
-        bs = int(batch["num_graphs"])
-        self.log(f"{stage}/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
-        for key, value in parts.items():
-            self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
-        return loss, targets
-
-    def training_step(self, batch, batch_idx):
-        loss, _ = self._vae_step(batch, "train")
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        from einops import rearrange
-
-        _, targets = self._vae_step(batch, "val")
-        # Reconstruction quality of the VAE itself: encode GT -> decode -> score.
-        posterior = self.model.encode_target(targets)
-        z = rearrange(posterior.mode(), "b d n -> b n d")
-        dec = self.model.decode_latent(z)
-        preds_wf = self.model.reconstruct_graph(
-            dec, recon_curves=True, num_points=self.hparams.eval_num_per_edge
-        )
-        self.val_metrics.update(preds_wf, _gt_wireframes(batch))
-
-    def on_validation_epoch_end(self) -> None:
-        res = self.val_metrics.compute()
-        self.log_dict(
-            {f"val/{k}": v for k, v in res.items() if k != "score"},
-            prog_bar=False, sync_dist=False,
-        )
-        self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
-        self.val_metrics.reset()
-
-
-# ----------------------------------------------------------------------
-# stage 3: full reconstruction (wireframe VAE + curve VAE frozen)
+# stage 2: point cloud -> wireframe (curve VAE frozen)
 # ----------------------------------------------------------------------
 class PC2WireframeModule(_BaseModule):
-    """Stage 3 -- train point cloud -> latent; both VAEs are frozen.
+    """Stage 2 -- train the end-to-end point-cloud -> wireframe model.
 
-    Two complementary signals to the (only trainable) point-cloud encoder:
-      1. latent regression: pull the predicted latent toward the **frozen**
-         wireframe-VAE posterior of the GT wireframe (a fixed teacher,
-         no moving target now that the VAE is frozen);
-      2. decode-through: decode the predicted latent through the **frozen**
-         decoder and supervise the wireframe heads against GT -- gradients flow
-         back to the point-cloud encoder only.
+    The PTv3 encoder + latent compressor + wireframe decoder are trained jointly;
+    the curve VAE (loaded frozen from stage 1) only turns the predicted per-edge
+    curve latent into a polyline. Supervision is set-prediction: Hungarian
+    node / edge matching, then matched coordinate / existence / endpoint / curve
+    losses (see :class:`~src.models.criterion.WireframeCriterion`).
     """
 
     def __init__(
         self,
         # ----- model config (nested, fully overridable from YAML) -----
         pc_encoder: dict[str, Any] | None = None,
-        wireframe_vae: dict[str, Any] | None = None,
+        decoder: dict[str, Any] | None = None,
         curve_vae: dict[str, Any] | None = None,
-        # ----- frozen decoder warm-start -----
-        wireframe_vae_ckpt: str | None = None,  # stage-2 ckpt
-        curve_vae_ckpt: str | None = None,      # stage-1 ckpt
+        # ----- frozen curve VAE warm-start (stage-1 ckpt) -----
+        curve_vae_ckpt: str | None = None,
         # ----- loss weights -----
-        latent_recon_weight: float = 1.0,
         kl_weight: float = 1e-4,
-        decode_through_weight: float = 1.0,
+        node_coord_weight: float = 5.0,
+        node_exist_weight: float = 1.0,
+        edge_exist_weight: float = 2.0,
+        endpoint_weight: float = 1.0,
+        curve_weight: float = 2.0,
+        topo_degree_weight: float = 0.5,
+        topo_dedup_weight: float = 0.5,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        match_node_coord: float = 5.0,
+        match_node_exist: float = 1.0,
+        match_edge_exist: float = 0.5,
+        match_edge_topk: int = 64,
+        node_exist_pos_weight: float = 10.0,
+        # ----- inference thresholds (also used for val reconstruction) -----
+        vertex_threshold: float = 0.5,
+        edge_threshold: float = 0.5,
         # ----- eval metric (CCD / TA / VPE -> weighted final score) -----
         eval_w_ccd: float = 0.3,
         eval_w_ta: float = 0.4,
@@ -422,21 +330,33 @@ class PC2WireframeModule(_BaseModule):
 
         self.model = PC2WireframeModel(
             pc_encoder=pc_encoder or _default_pc_encoder(),
-            wireframe_vae=wireframe_vae or _default_wireframe_vae(),
+            decoder=decoder or _default_decoder(),
             curve_vae=curve_vae or _default_curve_vae(),
         )
-        if wireframe_vae_ckpt:
-            _load_submodule(
-                self.model.wireframe_vae, wireframe_vae_ckpt,
-                ["model.wireframe_vae", "wireframe_vae"],
-            )
         if curve_vae_ckpt:
             _load_submodule(
                 self.model.curve_vae, curve_vae_ckpt,
                 ["curve_vae", "model.curve_vae"],
             )
-        _freeze(self.model.wireframe_vae)
         _freeze(self.model.curve_vae)
+
+        self.criterion = WireframeCriterion(
+            node_coord_weight=node_coord_weight,
+            node_exist_weight=node_exist_weight,
+            match_node_coord=match_node_coord,
+            match_node_exist=match_node_exist,
+            node_exist_pos_weight=node_exist_pos_weight,
+            edge_exist_weight=edge_exist_weight,
+            endpoint_weight=endpoint_weight,
+            curve_weight=curve_weight,
+            topo_degree_weight=topo_degree_weight,
+            topo_dedup_weight=topo_dedup_weight,
+            match_edge_exist=match_edge_exist,
+            match_edge_topk=match_edge_topk,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            num_curve_points=eval_num_per_edge,
+        )
 
         self.val_metrics = WireframeScore(
             w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
@@ -445,68 +365,29 @@ class PC2WireframeModule(_BaseModule):
         )
 
     def frozen_modules(self):
-        return [self.model.wireframe_vae, self.model.curve_vae]
+        return [self.model.curve_vae]
 
     # ------------------------------------------------------------------
     def forward(self, point_cloud: torch.Tensor, sample: bool = False):
         return self.model(point_cloud, sample=sample)
 
-    def _compute_losses(
-        self, batch: dict[str, Any], out: dict[str, Any]
-    ) -> dict[str, torch.Tensor]:
-        from einops import rearrange
-
-        vae = self.model.wireframe_vae
-        targets = self.model.graph_to_node_inputs(batch)
-
-        losses: dict[str, torch.Tensor] = {}
-        total = out["mu"].new_zeros(())
-
-        # 1) latent regression toward the frozen teacher posterior mean.
-        with torch.no_grad():
-            posterior = self.model.encode_target(targets)
-            teacher_mu = rearrange(posterior.mode(), "b d n -> b n d")
-        latent_recon = F.smooth_l1_loss(out["mu"], teacher_mu)
-        losses["latent_recon"] = latent_recon
-        total = total + self.hparams.latent_recon_weight * latent_recon
+    def _step(self, batch, stage):
+        point_cloud = batch["point_cloud"]
+        out = self.model(point_cloud, sample=(stage == "train"))
+        targets = build_targets(batch)
+        total, parts = self.criterion(out["preds"], targets, self.model.curve_vae)
 
         # KL on the PC-encoder latent (only when variational).
         if out["logvar"] is not None:
             mu, logvar = out["mu"], out["logvar"]
             kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
-            losses["kl"] = kl
             total = total + self.hparams.kl_weight * kl
+            parts["kl"] = kl.detach()
 
-        # 2) decode-through: supervise the (frozen) decode of the PC latent
-        # against the GT graph (matched node / existence / adjacency / curve).
-        parts = vae.compute_losses(out["preds"], targets)
-        decode_through = (
-            vae.coord_loss_weight * parts["coord_loss"]
-            + vae.exist_loss_weight * parts["exist_loss"]
-            + vae.adj_loss_weight * parts["adj_loss"]
-            + vae.curve_latent_loss_weight * parts["curve_latent_loss"]
-        )
-        for k, v in parts.items():
-            losses[k] = v
-        losses["decode_through"] = decode_through
-        total = total + self.hparams.decode_through_weight * decode_through
-
-        losses["total"] = total
-        return losses
-
-    def _step(self, batch, stage):
-        point_cloud = batch["point_cloud"]
-        out = self.model(point_cloud, sample=(stage == "train"))
-        losses = self._compute_losses(batch, out)
-        total = losses["total"]
-        for key, value in losses.items():
-            self.log(
-                f"{stage}/{key}",
-                value,
-                batch_size=point_cloud.shape[0],
-                sync_dist=True,
-                prog_bar=(key == "total"),
-            )
+        bs = point_cloud.shape[0]
+        self.log(f"{stage}/loss", total, batch_size=bs, prog_bar=True, sync_dist=True)
+        for key, value in parts.items():
+            self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
         return out, total
 
     def training_step(self, batch, batch_idx):
@@ -515,9 +396,10 @@ class PC2WireframeModule(_BaseModule):
 
     def validation_step(self, batch, batch_idx):
         out, _ = self._step(batch, "val")
-        preds_wf = self.model.reconstruct_graph(
+        preds_wf = self.model.reconstruct(
             out["preds"],
-            recon_curves=True,
+            vertex_threshold=self.hparams.vertex_threshold,
+            edge_threshold=self.hparams.edge_threshold,
             num_points=self.hparams.eval_num_per_edge,
         )
         self.val_metrics.update(preds_wf, _gt_wireframes(batch))
@@ -532,14 +414,42 @@ class PC2WireframeModule(_BaseModule):
         self.val_metrics.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        """Per-shape latent + decoded wireframe for submission."""
+        """Per-shape latent + decoded wireframe for submission.
+
+        The model runs in the per-shape *normalized* frame (see the dataset's
+        unit-cube transform); predictions are mapped back to raw CAD coordinates
+        with the stored ``pc_center`` / ``pc_scale`` so the submission is in the
+        original coordinate system.
+        """
         out = self.model(batch["point_cloud"], sample=False)
-        wireframes = self.model.reconstruct_graph(out["preds"], recon_curves=True)
+        wireframes = self.model.reconstruct(
+            out["preds"],
+            vertex_threshold=self.hparams.vertex_threshold,
+            edge_threshold=self.hparams.edge_threshold,
+            num_points=self.hparams.eval_num_per_edge,
+        )
+        if "pc_center" in batch:
+            center = batch["pc_center"].detach().cpu().numpy()
+            scale = batch["pc_scale"].detach().cpu().numpy()
+            for s, wf in enumerate(wireframes):
+                self._denormalize_wireframe(wf, center[s], float(scale[s]))
         return {
             "shape_id": batch.get("shape_id"),
             "z": out["z"],
             "wireframes": wireframes,
         }
 
+    @staticmethod
+    def _denormalize_wireframe(wf: dict[str, Any], center, scale) -> None:
+        """Map a reconstructed wireframe from the normalized frame to raw coords.
 
-__all__ = ["CurveVAEModule", "WireframeVAEModule", "PC2WireframeModule"]
+        Inverse of the dataset unit-cube transform (``x_raw = x_norm * scale +
+        center``), applied in place to vertex coordinates and curve polylines.
+        """
+        if wf.get("vertices") is not None and wf["vertices"].size:
+            wf["vertices"] = wf["vertices"] * scale + center
+        if wf.get("edge_points") is not None and wf["edge_points"].size:
+            wf["edge_points"] = wf["edge_points"] * scale + center
+
+
+__all__ = ["CurveVAEModule", "PC2WireframeModule"]

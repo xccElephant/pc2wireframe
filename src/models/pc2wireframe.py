@@ -1,150 +1,189 @@
-"""Wireframe models for staged training.
+"""End-to-end point-cloud -> wireframe model (the single trained stage).
 
-Two ``nn.Module`` containers, sharing the packing / reconstruction logic in
-:class:`~src.models.packing.WireframePackingMixin`:
+Pipeline::
 
-``WireframeVAEModel`` -- the (always-present) graph wireframe VAE + curve VAE.
-    Used directly by **stage 2** (train the wireframe VAE with the curve VAE
-    frozen). Exposes ``encode_target`` / ``decode_latent`` plus the inherited
-    ``graph_to_node_inputs`` / ``reconstruct_graph``.
+    point cloud (B, N, 3)
+        --PTv3 + LatentCompressor-->  tokenized latent Z  (B, K, D)   # K*D <= 4096
+        --WireframeDecoder-->
+              node set:   per-query (coord, existence)
+              edge set:   per-query (existence, endpoint-A/B distribution,
+                                     curve latent)
+        --frozen curve VAE decoder--> per-edge canonical polyline
+        --denormalise onto predicted endpoints--> wireframe
 
-``PC2WireframeModel`` -- ``WireframeVAEModel`` + a point-cloud encoder.
-    Used by **stage 3** (train point cloud -> latent with both VAEs frozen)::
-
-        point cloud --PTv3+LatentCompressor--> Z_W --graph wireframe decoder-->
-            (node set: coords + existence, inner-product adjacency, curve latents)
-            --curve decoder--> 3D curves  => wireframe
-
-The point-cloud encoder replaces the wireframe VAE's *graph* encoder: at
-inference we never see the GT wireframe, so we regress / sample the latent from
-the point cloud, then reuse the (stage-2 pretrained) wireframe / curve decoders.
+The per-curve ``CurveVAE`` (``AutoencoderKL1D``) is reused **frozen** from
+stage 1: its decoder turns a predicted per-edge curve latent into a residual
+polyline on top of the endpoint-interpolation baseline (canonical frame), which
+is then denormalised onto the predicted vertices. Only the PTv3 encoder, the
+latent compressor and the wireframe decoder are trained.
 """
 from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
-from .packing import WireframePackingMixin
+from .packing import decode_curve_latent
 from .pc_encoder import PCEncoder
+from .wireframe_decoder import WireframeDecoder
 
 
-class WireframeVAEModel(WireframePackingMixin, nn.Module):
-    """Graph wireframe VAE + curve VAE container (stage 2 model)."""
-
-    def __init__(
-        self,
-        wireframe_vae: dict[str, Any],
-        curve_vae: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__()
-        from .vae import AutoencoderKL1D, AutoencoderKLWireframe
-
-        self.wireframe_vae = AutoencoderKLWireframe(**wireframe_vae)
-        self.curve_vae = AutoencoderKL1D(**(curve_vae or {}))
-        self._init_vae_config(wireframe_vae, curve_vae)
-
-    # ------------------------------------------------------------------
-    def _init_vae_config(
-        self, wireframe_vae: dict[str, Any], curve_vae: dict[str, Any] | None
-    ) -> None:
-        """Cache the config needed by the packing / reconstruction code."""
-        self.max_curves_num = int(wireframe_vae.get("max_curves_num", 1024))
-        self.max_nodes = int(wireframe_vae.get("max_nodes", 768))
-        # per-curve latent = latent_channels x downsampled_len.
-        cv = curve_vae or {}
-        cv_lat = int(cv.get("latent_channels", 3))
-        cv_pts = int(cv.get("sample_points_num", 32))
-        n_down = len(cv.get(
-            "down_block_types", ("DownBlock1D", "DownBlock1D", "DownBlock1D")))
-        self.curve_latent_len = max(1, cv_pts // (2 ** n_down))
-        self.curve_latent_dim = cv_lat * self.curve_latent_len
-        # The wireframe VAE's curve head out_dim must match this.
-        vae_curve_dim = int(wireframe_vae.get("curve_latent_dim", self.curve_latent_dim))
-        if self.curve_latent_dim != vae_curve_dim:
-            raise ValueError(
-                f"curve_latent_dim mismatch: curve VAE produces "
-                f"{self.curve_latent_dim} but wireframe VAE expects "
-                f"{vae_curve_dim}. Set wireframe_vae.curve_latent_dim = "
-                f"latent_channels * (sample_points_num / 2**n_down)."
-            )
-
-    # ------------------------------------------------------------------
-    def encode_target(self, targets: dict[str, torch.Tensor]):
-        """Encode a GT wireframe to the wireframe-VAE posterior (teacher / eval).
-
-        ``targets`` is the dict returned by ``graph_to_node_inputs``. Returns the
-        ``GaussianLatent``; ``posterior.mode()`` is ``(B, latent_channels,
-        latent_num)`` (``b d n``).
-        """
-        return self.wireframe_vae.encode(
-            node_coords=targets["node_coords"],
-            node_mask=targets["node_mask"],
-            edge_pairs=targets["edge_pairs"],
-            edge_mask=targets["edge_mask"],
-            edge_feat=targets["edge_mu"],
-        )
-
-    def decode_latent(self, z_bnd: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Decode a latent ``(B, latent_num, latent_dim)`` -> decoder dict.
-
-        Returns ``{node_tokens, coord, exist_logit}`` (adjacency / curve latent
-        are produced lazily by the wireframe VAE heads from ``node_tokens``).
-        """
-        from einops import rearrange
-
-        z_bdn = rearrange(z_bnd, "b n d -> b d n")
-        return self.wireframe_vae.decode(z=z_bdn)
-
-
-class PC2WireframeModel(WireframeVAEModel):
-    """Point cloud -> latent -> wireframe, reusing the frozen VAE decoders."""
+class PC2WireframeModel(nn.Module):
+    """Point cloud -> tokenized latent -> wireframe (node set + edge set)."""
 
     def __init__(
         self,
         pc_encoder: dict[str, Any],
-        wireframe_vae: dict[str, Any],
+        decoder: dict[str, Any] | None = None,
         curve_vae: dict[str, Any] | None = None,
     ) -> None:
-        super().__init__(wireframe_vae=wireframe_vae, curve_vae=curve_vae)
-        self.pc_encoder = PCEncoder(**pc_encoder)
-        self._check_latent_dims(pc_encoder, wireframe_vae)
+        super().__init__()
+        from .vae import AutoencoderKL1D
 
-    @staticmethod
-    def _check_latent_dims(
-        pc_encoder: dict[str, Any], wireframe_vae: dict[str, Any]
-    ) -> None:
-        enc_num = pc_encoder.get("latent_num", 64)
-        enc_dim = pc_encoder.get("latent_dim", 64)
-        vae_num = wireframe_vae.get("wireframe_latent_num", 64)
-        vae_dim = wireframe_vae.get("latent_channels", 16)
-        if (enc_num, enc_dim) != (vae_num, vae_dim):
-            raise ValueError(
-                "Latent shape mismatch between PC encoder and wireframe VAE: "
-                f"encoder=({enc_num}, {enc_dim}) vs "
-                f"vae=({vae_num}, {vae_dim}). They must match so the decoder "
-                f"can consume the predicted latent."
-            )
+        self.pc_encoder = PCEncoder(**pc_encoder)
+        self.curve_vae = AutoencoderKL1D(**(curve_vae or {}))
+
+        # per-edge curve latent size = curve_vae.latent_channels * latent_len.
+        curve_latent_dim = (
+            int(self.curve_vae.config.latent_channels) * int(self.curve_vae.latent_len)
+        )
+        dec_kwargs = dict(decoder or {})
+        dec_kwargs.setdefault("latent_token_dim", int(pc_encoder["latent_dim"]))
+        dec_kwargs.setdefault("num_latent_tokens", int(pc_encoder["latent_num"]))
+        dec_kwargs["curve_latent_dim"] = curve_latent_dim
+        self.decoder = WireframeDecoder(**dec_kwargs)
+        self.curve_latent_dim = curve_latent_dim
 
     # ------------------------------------------------------------------
     def encode_pc(
         self, point_cloud: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Point cloud ``(B, N, 3)`` -> latent ``(mu, logvar)`` in ``b n d``."""
+        """Point cloud ``(B, N, 3)`` -> latent ``(mu, logvar)`` in ``b k d``."""
         return self.pc_encoder(point_cloud)
 
     def forward(
         self, point_cloud: torch.Tensor, sample: bool = False
     ) -> dict[str, Any]:
-        """Full feed-forward: point cloud -> latent -> decoder predictions."""
+        """Point cloud -> latent -> decoder predictions."""
         mu, logvar = self.encode_pc(point_cloud)
         if sample and logvar is not None:
             z = self.pc_encoder.compressor.reparameterize(mu, logvar)
         else:
             z = mu
-        preds = self.decode_latent(z)
+        preds = self.decoder(z)
         return {"z": z, "mu": mu, "logvar": logvar, "preds": preds}
 
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def reconstruct(
+        self,
+        preds: dict[str, torch.Tensor],
+        *,
+        vertex_threshold: float = 0.5,
+        edge_threshold: float = 0.5,
+        num_points: int = 32,
+        max_edges: int | None = None,
+        recon_curves: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Decoder predictions -> explicit wireframes (one dict per sample).
 
-__all__ = ["WireframeVAEModel", "PC2WireframeModel"]
+          * ``sigmoid(node_exist) > vertex_threshold``      -> alive vertices;
+          * ``sigmoid(edge_exist) > edge_threshold``         -> alive edges;
+          * each alive edge's endpoints = ``argmax`` of the two endpoint
+            distributions restricted to the alive vertices;
+          * per-edge curve latent -> frozen curve VAE canonical decode ->
+            denormalise onto the (coordinate-oriented) predicted endpoints.
+        """
+        from .vae.recon_utils import denorm_curves
+
+        coord = preds["coord"]
+        node_exist = torch.sigmoid(preds["node_exist_logit"])
+        edge_exist = torch.sigmoid(preds["edge_exist_logit"])
+        ep_a = preds["ep_a_logits"]
+        ep_b = preds["ep_b_logits"]
+        curve_latent = preds["curve_latent"]
+        b = coord.shape[0]
+        device = coord.device
+        if max_edges is None:
+            max_edges = self.decoder.num_edge_queries
+
+        out: list[dict[str, Any]] = []
+        for s in range(b):
+            alive = (node_exist[s] > vertex_threshold).nonzero(as_tuple=True)[0]
+            if alive.numel() < 2:
+                alive = torch.topk(
+                    node_exist[s], k=min(8, node_exist.shape[1])).indices
+            verts = coord[s, alive]                       # (V, 3)
+            v = alive.numel()
+            # global query id -> local vertex index (only alive queries valid).
+            g2l = torch.full(
+                (node_exist.shape[1],), -1, dtype=torch.long, device=device)
+            g2l[alive] = torch.arange(v, device=device)
+
+            e_keep = (edge_exist[s] > edge_threshold).nonzero(as_tuple=True)[0]
+            if e_keep.numel() == 0:
+                out.append(self._empty(verts))
+                continue
+            if e_keep.numel() > max_edges:
+                top = torch.topk(edge_exist[s, e_keep], k=max_edges).indices
+                e_keep = e_keep[top]
+
+            # endpoints restricted to alive vertices.
+            mask = torch.full((node_exist.shape[1],), float("-inf"), device=device)
+            mask[alive] = 0.0
+            a_q = (ep_a[s, e_keep] + mask).argmax(dim=-1)
+            b_q = (ep_b[s, e_keep] + mask).argmax(dim=-1)
+            la = g2l[a_q]
+            lb = g2l[b_q]
+            ok = (la >= 0) & (lb >= 0) & (la != lb)
+            if not bool(ok.any()):
+                out.append(self._empty(verts))
+                continue
+            e_keep, la, lb = e_keep[ok], la[ok], lb[ok]
+
+            # dedupe undirected pairs (keep first occurrence).
+            lo = torch.minimum(la, lb)
+            hi = torch.maximum(la, lb)
+            key = lo * v + hi
+            _, first = np.unique(key.cpu().numpy(), return_index=True)
+            sel = torch.as_tensor(np.sort(first), device=device)
+            e_keep, la, lb = e_keep[sel], la[sel], lb[sel]
+
+            verts_np = verts.detach().cpu().numpy().astype(np.float32)
+            edge_index = torch.stack([la, lb], dim=-1).cpu().numpy().astype(np.int64)
+            sample_out: dict[str, Any] = {
+                "vertices": verts_np,
+                "edge_index": edge_index,
+                "num_vertices": int(v),
+                "num_edges": int(edge_index.shape[0]),
+            }
+
+            if recon_curves:
+                # canonical curve is in the predicted A -> B (start -> end)
+                # order, so denormalise straight onto the [A, B] endpoints.
+                canon = decode_curve_latent(
+                    self.curve_vae, curve_latent[s, e_keep],
+                    num_points=num_points, pin_endpoints=True,
+                ).detach().cpu().numpy()
+                corners = np.stack(
+                    [verts_np[edge_index[:, 0]], verts_np[edge_index[:, 1]]],
+                    axis=1)
+                curves = denorm_curves(canon, corners)
+                if curves is not None:
+                    sample_out["edge_points"] = curves
+            out.append(sample_out)
+        return out
+
+    @staticmethod
+    def _empty(verts: torch.Tensor) -> dict[str, Any]:
+        return {
+            "vertices": verts.detach().cpu().numpy().astype(np.float32),
+            "edge_index": np.zeros((0, 2), dtype=np.int64),
+            "num_vertices": int(verts.shape[0]),
+            "num_edges": 0,
+        }
+
+
+__all__ = ["PC2WireframeModel"]

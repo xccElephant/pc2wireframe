@@ -1,16 +1,13 @@
 """Latent compressor: cross-attention pooling of encoder tokens into the
-fixed-length, budget-constrained wireframe latent ``Z_W``.
+fixed-length, budget-constrained tokenized latent ``Z``.
 
-This is the analogue of the baseline's ``LatentCompressor`` and of the wireframe
-VAE's Perceiver-style graph encoder, but it pools *point-cloud* features instead
-of ground-truth wireframe features. ``K = num_tokens`` learnable queries
-cross-attend over the (padded) encoder token set and project to a
-``latent_dim``-channel distribution, giving a latent of ``num_tokens *
-latent_dim`` floats. The competition hard cap is 4096 float32 values.
+``K = num_tokens`` learnable queries cross-attend over the (padded) encoder
+token set and project to a ``latent_dim``-channel distribution, giving a latent
+of ``num_tokens * latent_dim`` floats. The competition hard cap is 4096 float32
+values.
 
-Output layout is ``(B, num_tokens, latent_dim)`` -- callers that feed the
-wireframe VAE decoder should rearrange to ``(B, latent_dim, num_tokens)``
-(the decoder's ``decode(z=...)`` expects ``'b d n'``).
+Output layout is ``(B, num_tokens, latent_dim)``, consumed directly as the
+cross-attention memory of the :class:`~src.models.wireframe_decoder.WireframeDecoder`.
 """
 from __future__ import annotations
 
@@ -23,11 +20,11 @@ class LatentCompressor(nn.Module):
 
     Args:
         in_dim: feature dim of the input tokens (e.g. PTv3 output channels).
-        num_tokens: number of latent tokens ``K`` (= ``wireframe_latent_num``).
-        latent_dim: per-token latent channels (= ``latent_channels``).
+        num_tokens: number of latent tokens ``K`` (default 16).
+        latent_dim: per-token latent channels (default 256; 16*256=4096 floats).
         nhead: attention heads for the cross-attention pooling.
         variational: if True, also predict ``logvar`` for a VAE-style latent
-            (KL + reparameterisation). For a deterministic point-cloud -> Z_W
+            (KL + reparameterisation). For a deterministic point-cloud -> latent
             regressor this can be False (predict the mean only).
         dropout: attention dropout.
         latent_budget_max: hard cap on ``num_tokens * latent_dim``.
@@ -38,8 +35,8 @@ class LatentCompressor(nn.Module):
     def __init__(
         self,
         in_dim: int,
-        num_tokens: int = 64,
-        latent_dim: int = 64,
+        num_tokens: int = 16,
+        latent_dim: int = 256,
         nhead: int = 8,
         variational: bool = True,
         dropout: float = 0.0,

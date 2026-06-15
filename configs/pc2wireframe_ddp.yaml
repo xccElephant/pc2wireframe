@@ -1,11 +1,12 @@
-# Stage 3/3 (8x A800 DDP) -- train the point-cloud -> wireframe model.
+# Stage 2/2 (8x A800 DDP) -- train the end-to-end point-cloud -> wireframe model.
 # Run with:
-#   python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe_ddp.yaml
+#   python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe_ddp.yaml \
+#       --model.curve_vae_ckpt <stage1.ckpt>
 #
 # Multi-GPU twin of pc2wireframe.yaml: identical model, DDP trainer + an LR
-# scaled for the larger global batch (data.batch_size * 8). The PC encoder is
-# the ONLY trainable part; the wireframe VAE (stage 2) and curve VAE (stage 1)
-# are frozen -- set both ckpt paths below. Keep in sync with pc2wireframe.yaml.
+# scaled for the larger global batch (data.batch_size * 8). The curve VAE
+# (stage 1) is frozen -- set its ckpt path below. Keep in sync with
+# pc2wireframe.yaml.
 seed_everything: 3407
 
 model:
@@ -26,26 +27,23 @@ model:
       dec_patch_size: [1024, 1024, 1024, 1024]
       stride:        [2, 2, 2, 2]
       enable_flash: true
-      # latent MUST match the wireframe VAE below; 64 * 64 = 4096 floats.
-      latent_num: 64
-      latent_dim: 64
+      # 16 * 256 = 4096 floats (competition latent budget).
+      latent_num: 16
+      latent_dim: 256
       compressor_heads: 8
       variational: true
 
-    # ----- frozen wireframe VAE -- MUST match the stage-2 architecture -----
-    wireframe_vae:
-      latent_channels: 64
-      wireframe_latent_num: 64
-      max_nodes: 768                # MUST match the stage-2 wireframe VAE
-      max_curves_num: 1024          # MUST match the stage-2 wireframe VAE
-      curve_latent_dim: 12          # MUST match the curve VAE: 3 * (32 / 2**3)
-      attn_encoder_depth: 3
-      attn_decoder_self_depth: 3
-      attn_decoder_cross_depth: 2
-      attn_dim: 768
-      num_heads: 12
-      adj_dim: 128
-      use_latent_pos_emb: true
+    # ----- transformer wireframe decoder (node set + edge set) -----
+    decoder:
+      num_node_queries: 768     # >= data.yaml max_vertices
+      num_edge_queries: 1024    # >= data.yaml max_edges
+      d_model: 512
+      nhead: 8
+      dim_ff: 2048
+      node_layers: 6
+      edge_layers: 4
+      endpoint_dim: 128
+      dropout: 0.1
 
     # ----- frozen curve VAE -- MUST match the stage-1 architecture -----
     curve_vae:
@@ -55,14 +53,29 @@ model:
       block_out_channels: [128, 256, 256]
       layers_per_block: 2
 
-    # ----- frozen decoder warm-start (set these to your stage-2 / stage-1 ckpts) -----
-    wireframe_vae_ckpt: null   # stage-2 best checkpoint
-    curve_vae_ckpt: null       # stage-1 best checkpoint
+    # ----- frozen curve VAE warm-start (set to your stage-1 best ckpt) -----
+    curve_vae_ckpt: null
 
     # ----- loss weights -----
-    latent_recon_weight: 1.0   # PC latent -> frozen teacher latent regression
-    kl_weight: 1.0e-4          # KL on the PC-encoder latent
-    decode_through_weight: 1.0 # decode PC latent (frozen) + supervise heads
+    kl_weight: 1.0e-4
+    node_coord_weight: 5.0
+    node_exist_weight: 1.0
+    edge_exist_weight: 2.0
+    endpoint_weight: 1.0
+    curve_weight: 2.0
+    topo_degree_weight: 0.5   # soft per-node degree consistency
+    topo_dedup_weight: 0.5    # soft simple-graph dedup / self-loop penalty
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    match_node_coord: 5.0
+    match_node_exist: 1.0
+    match_edge_exist: 0.5
+    match_edge_topk: 64       # edge match candidates per GT edge (0 = full Ne x ne)
+    node_exist_pos_weight: 10.0
+
+    # ----- inference / val reconstruction thresholds -----
+    vertex_threshold: 0.5
+    edge_threshold: 0.5
 
     # ----- eval metric: CCD / TA / VPE -> weighted final score (val/score) -----
     eval_w_ccd: 0.3
@@ -88,7 +101,7 @@ trainer:
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/pc2wireframe.yaml
   num_nodes: 1
-  # find_unused_parameters: frozen sub-VAEs + conditionally-used heads -> permissive.
+  # find_unused_parameters: frozen curve VAE + conditionally-used heads -> permissive.
   strategy: ddp_find_unused_parameters_true
   sync_batchnorm: false         # models use Layer/GroupNorm, not BatchNorm
   use_distributed_sampler: true # shard the dataset across ranks
@@ -102,7 +115,7 @@ trainer:
     init_args:
       save_dir: logs
       project: pc2wireframe
-      name: stage3_pc2wireframe_ddp
+      name: stage2_pc2wireframe_ddp
       log_model: false
   callbacks:
     - class_path: ModelCheckpoint

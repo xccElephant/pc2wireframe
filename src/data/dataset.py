@@ -50,6 +50,36 @@ _log = logging.getLogger(__name__)
 _PC_COORD_CLIP = 1e4
 
 
+def _unit_cube_transform(
+    points: np.ndarray, margin: float = 0.95
+) -> tuple[np.ndarray, float]:
+    """Per-shape normalization transform to a unit cube.
+
+    Returns ``(center (3,), scale)`` so that ``(x - center) / scale`` maps the
+    point cloud's bounding box into ``[-margin, margin]`` (the longest axis fills
+    it, the others are smaller). The *same* transform is applied to the point
+    cloud and the wireframe vertices / curves so the model is trained and
+    supervised in one normalized frame -- this is what makes the PTv3 grid
+    (``grid_size`` relative to a ~unit extent) and the decoder's ``tanh`` coord
+    head well-conditioned. Raw CAD coordinates can span thousands of units,
+    which overflows PTv3's space-filling-curve depth and breaks coordinate loss.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    lo = pts.min(0)
+    hi = pts.max(0)
+    center = ((lo + hi) * 0.5).astype(np.float32)
+    half = float((hi - lo).max()) * 0.5
+    scale = max(half / max(margin, 1e-6), 1e-6)
+    return center, float(scale)
+
+
+def _apply_unit_cube(
+    points: np.ndarray, center: np.ndarray, scale: float
+) -> np.ndarray:
+    """Apply a unit-cube transform to a ``(..., 3)`` array."""
+    return ((points - center) / scale).astype(np.float32)
+
+
 # ----------------------------------------------------------------------
 # NPZ helpers
 # ----------------------------------------------------------------------
@@ -442,15 +472,31 @@ class WireframeGraphDataset(Dataset):
                     continue
                 if (mv > 0 and nv > mv) or (me > 0 and ne > me):
                     continue
+                # Per-shape normalization: derive one transform from the point
+                # cloud and apply it to the point cloud AND the wireframe
+                # vertices / curves so everything lives in a single ~[-1, 1]
+                # frame (``edge_points_norm`` is already canonical-per-curve and
+                # affine-invariant, so it is left untouched).
+                pc = self._load_point_cloud(edge_path)
+                center, scale = _unit_cube_transform(pc)
+                pc = _apply_unit_cube(pc, center, scale)
                 sample: dict[str, torch.Tensor | str] = {
                     "shape_id": os.path.splitext(
                         os.path.basename(edge_path))[0],
-                    "point_cloud": torch.from_numpy(
-                        self._load_point_cloud(edge_path)),
+                    "point_cloud": torch.from_numpy(pc),
+                    "pc_center": torch.from_numpy(center),
+                    "pc_scale": torch.tensor(scale, dtype=torch.float32),
                 }
                 for key, value in graph.items():
                     if isinstance(value, np.ndarray):
-                        sample[key] = torch.from_numpy(value)
+                        if key in ("vertices", "edge_points"):
+                            value = _apply_unit_cube(value, center, scale)
+                        elif key == "edge_endpoints":
+                            value = _apply_unit_cube(
+                                value.reshape(-1, 2, 3), center, scale
+                            ).reshape(-1, 6)
+                        sample[key] = torch.from_numpy(
+                            np.ascontiguousarray(value))
                     else:
                         sample[key] = torch.tensor(value, dtype=torch.long)
                 return sample
@@ -495,9 +541,13 @@ class PointCloudDataset(Dataset):
         points = _get_npz_array(
             data, ("surface_points", "points", "point_cloud", "pc"))
         pc = _sample_points(points, self.pc_num_points)
+        center, scale = _unit_cube_transform(pc)
+        pc = _apply_unit_cube(pc, center, scale)
         return {
             "shape_id": os.path.splitext(os.path.basename(pc_path))[0],
             "point_cloud": torch.from_numpy(pc),
+            "pc_center": torch.from_numpy(center),
+            "pc_scale": torch.tensor(scale, dtype=torch.float32),
         }
 
 
@@ -543,6 +593,8 @@ def collate_wireframe_graphs(
 
     point_cloud = torch.stack(
         [s["point_cloud"] for s in samples], dim=0)
+    pc_center = torch.stack([s["pc_center"] for s in samples], dim=0)
+    pc_scale = torch.stack([s["pc_scale"] for s in samples], dim=0)
     nv = torch.tensor(
         [int(s["num_vertices"]) for s in samples], dtype=torch.long)
     ne = torch.tensor(
@@ -576,6 +628,8 @@ def collate_wireframe_graphs(
 
     return {
         "point_cloud": point_cloud,
+        "pc_center": pc_center,
+        "pc_scale": pc_scale,
         "vertices": vertices,
         "vertex_batch": vertex_batch,
         "vertex_ptr": vertex_ptr,
@@ -609,7 +663,7 @@ def unbatch_wireframe_graphs(
         v0, v1 = vertex_ptr[b], vertex_ptr[b + 1]
         e0, e1 = edge_ptr[b], edge_ptr[b + 1]
         local_edge_index = (edge_index[:, e0:e1] - v0).t().contiguous()
-        out.append({
+        graph = {
             "shape_id": batch["shape_id"][b],
             "point_cloud": batch["point_cloud"][b],
             "vertices": batch["vertices"][v0:v1],
@@ -618,7 +672,13 @@ def unbatch_wireframe_graphs(
             "edge_endpoints": batch["edge_endpoints"][e0:e1],
             "num_vertices": int(batch["num_vertices"][b]),
             "num_edges": int(batch["num_edges"][b]),
-        })
+        }
+        # Per-shape normalization transform (present for batches built by the
+        # current collate); lets callers map predictions back to raw CAD coords.
+        if "pc_center" in batch:
+            graph["pc_center"] = batch["pc_center"][b]
+            graph["pc_scale"] = batch["pc_scale"][b]
+        out.append(graph)
     return out
 
 

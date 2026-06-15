@@ -9,8 +9,8 @@ intrinsic shape.
     Fourier-embedded (+ tangent) curve points via a ``nn.TransformerDecoder``;
     a head emits ``2 * latent_channels`` (mean/logvar) per token, reshaped to
     ``(B, 2 * latent_channels, L)`` (split into mean/logvar by ``GaussianLatent``)
-    to keep the ``(b c l)`` latent layout and the 12-d wireframe-VAE contract
-    (``latent_channels * L``).
+    to keep the ``(b c l)`` latent layout and the per-edge curve-latent contract
+    (``latent_channels * L``) consumed by the wireframe decoder's curve head.
   * **Decoder** -- the ``L`` latent tokens self-attend (``nn.TransformerEncoder``);
     parametric ``t`` queries then cross-attend to them (``nn.TransformerDecoder``)
     and an MLP predicts a residual on top of the linear baseline ``[-1..1,0,0]``.

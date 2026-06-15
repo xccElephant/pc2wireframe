@@ -1,17 +1,20 @@
 """PC2Wireframe model package.
 
-Lightweight modules (``LatentCompressor``, ``PCEncoder``, ``PC2WireframeModel``)
-are exported eagerly; the heavy vendored stacks (PTv3, VAEs) are imported lazily
-inside those classes so this package can be imported without the full dependency
-set installed.
+Lightweight modules (``LatentCompressor``, ``PCEncoder``, ``WireframeDecoder``,
+``PC2WireframeModel``, ``WireframeCriterion``) are exported eagerly; the heavy
+vendored stacks (PTv3, curve VAE) are imported lazily inside those classes so
+this package can be imported without the full dependency set installed.
 """
+from .criterion import WireframeCriterion
 from .latent_compressor import LatentCompressor
+from .pc2wireframe import PC2WireframeModel
 from .pc_encoder import PCEncoder
-from .pc2wireframe import PC2WireframeModel, WireframeVAEModel
+from .wireframe_decoder import WireframeDecoder
 
 __all__ = [
     "LatentCompressor",
     "PCEncoder",
-    "WireframeVAEModel",
+    "WireframeDecoder",
     "PC2WireframeModel",
+    "WireframeCriterion",
 ]

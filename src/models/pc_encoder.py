@@ -1,7 +1,7 @@
 """Point-cloud encoder: PTv3 backbone + latent-compressor head.
 
-Maps a surface point cloud ``(B, N, 3)`` to the fixed-length wireframe latent
-distribution ``Z_W`` that the wireframe VAE decoder consumes.
+Maps a surface point cloud ``(B, N, 3)`` to the fixed-length tokenized latent
+distribution ``Z`` that the wireframe decoder consumes as cross-attention memory.
 
 Pipeline::
 
@@ -34,8 +34,8 @@ class PCEncoder(nn.Module):
             ``False`` keeps denser, better-localised features (good for
             corners/edges); ``True`` is cheaper.
         enc_*/dec_*: PTv3 stage configs (depths / channels / heads / patch).
-        latent_num: number of latent tokens ``K`` (= ``wireframe_latent_num``).
-        latent_dim: per-token latent channels ``D`` (= ``latent_channels``).
+        latent_num: number of latent tokens ``K`` (default 16).
+        latent_dim: per-token latent channels ``D`` (default 256; 16*256=4096).
         compressor_heads: attention heads in the pooling head.
         variational: VAE-style latent (predict logvar + reparam) if True.
         latent_budget_max: hard float cap on ``latent_num * latent_dim``.
@@ -59,8 +59,8 @@ class PCEncoder(nn.Module):
         stride: tuple[int, ...] = (2, 2, 2, 2),
         enable_flash: bool = True,
         # ----- latent head -----
-        latent_num: int = 64,
-        latent_dim: int = 64,
+        latent_num: int = 16,
+        latent_dim: int = 256,
         compressor_heads: int = 8,
         variational: bool = True,
         latent_budget_max: int | None = None,
