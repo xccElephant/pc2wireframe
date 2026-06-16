@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from .dataset import (
     PointCloudDataset,
     WireframeGraphDataset,
-    collate_wireframe_graphs,
+    collate_rf_batch,
 )
 
 
@@ -54,12 +54,14 @@ class WireframeDataModule(pl.LightningDataModule):
         auto_build_split: bool = True,
         train_ratio: float = 0.9,
         split_seed: int = 42,
-        # ----- graph format -----
+        # ----- graph / RF-target format -----
         vertex_merge_tol: float = 1e-4,
-        max_vertices: int = 384,
-        max_edges: int = 1024,
+        # Caps <= 0 disable oversize skipping (RF-branch default: full data).
+        max_vertices: int = 0,
+        max_edges: int = 0,
         num_edge_points: int = 32,
         pc_num_points: int = 4096,
+        wf_num_points: int = 8192,
         min_edges: int = 1,
         max_load_retries: int = 64,
         # ----- data loader -----
@@ -100,6 +102,7 @@ class WireframeDataModule(pl.LightningDataModule):
             max_edges=self.hparams.max_edges,
             num_edge_points=self.hparams.num_edge_points,
             pc_num_points=self.hparams.pc_num_points,
+            wf_num_points=self.hparams.wf_num_points,
             min_edges=self.hparams.min_edges,
             max_load_retries=self.hparams.max_load_retries,
         )
@@ -145,7 +148,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=self.hparams.shuffle,
             drop_last=True,
-            collate_fn=collate_wireframe_graphs,
+            collate_fn=collate_rf_batch,
             **self._loader_kwargs(),
         )
 
@@ -158,7 +161,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=collate_wireframe_graphs,
+            collate_fn=collate_rf_batch,
             **self._loader_kwargs(),
         )
 

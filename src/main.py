@@ -1,36 +1,26 @@
-"""LightningCLI entry point for the staged PC2Wireframe training.
+"""LightningCLI entry point for the Rectified-Flow PC2Wireframe branch.
 
-Training is split into two independent stages, each selected by its own config
-(the model class is chosen per-stage via ``class_path``)::
+A single trainable model (PTv3 encoder + RF velocity net) and datamodule are
+resolved from ``class_path`` in the configs::
 
-    # stage 1: curve VAE
+    # train (single GPU)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/curve_vae.yaml
+        --config configs/rf.yaml
 
-    # stage 2: point-cloud -> wireframe (curve VAE frozen).
-    # The frozen curve VAE is warm-started from the stage-1 checkpoint via the
-    # ``curve_vae_ckpt`` model arg -- pass it on the CLI (overrides the YAML):
+    # train (8x A800 DDP)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/pc2wireframe.yaml \
-        --model.curve_vae_ckpt <stage1.ckpt>
+        --config configs/rf_ddp.yaml
 
-    # inference / submission (stage 2 checkpoint)
+    # inference / submission
     python -m src.main predict \
         --config configs/data.yaml \
-        --config configs/pc2wireframe.yaml \
-        --ckpt_path <stage2.ckpt>
+        --config configs/rf.yaml \
+        --ckpt_path <rf.ckpt>
 
-Both the model and the datamodule are resolved from ``class_path`` in the
-configs, so a single entry point serves both stages.
-
-Note on checkpoints -- there are two distinct kinds:
-  * ``--model.curve_vae_ckpt`` (or the same key in the YAML): used **once at
-    build time** to initialise + freeze the curve VAE from stage 1. This can
-    also be hard-coded in the stage-2 config.
-  * ``--ckpt_path``: Lightning's own arg to *resume* a run / load weights for
-    ``predict``/``validate`` of the current stage. Do not confuse the two.
+``--ckpt_path`` is Lightning's own arg to resume a run / load weights for
+``predict`` / ``validate``.
 """
 import pyrootutils
 import torch

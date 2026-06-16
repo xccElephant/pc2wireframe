@@ -3,14 +3,13 @@ data:
   init_args:
     # ----- paths (relative to project root) -----
     data_root: data
-    # Cleaned GT wireframes (scripts/clean_wireframe.py); filenames match the
-    # originals so train/sample_pointcloud still resolves by stem.
-    train_edge_subdir: train_clean/sample_edge
+    # RF branch trains on the RAW (uncleaned) wireframes -- the arc-length RF
+    # target tolerates dense / messy edges, so no cleaning step is needed.
+    train_edge_subdir: train/sample_edge
     train_pointcloud_subdir: train/sample_pointcloud
     predict_pointcloud_subdir: test/sample_pointcloud
-    # Own split: split files pin full edge paths, so the cleaned run can't reuse
-    # data/split.json. Auto-built from the cleaned dir on first run.
-    split_path: data/split_clean.json
+    # Split over the raw edge dir; auto-built on first run.
+    split_path: data/split.json
     recursive_glob: false
 
     # ----- train/val split (test/ has no GT edges, so val is carved from train) -----
@@ -22,15 +21,16 @@ data:
     train_ratio: 0.9
     split_seed: 42
 
-    # ----- graph / point-cloud format -----
+    # ----- graph / point-cloud / RF-target format -----
     vertex_merge_tol: 0.0001
-    # Oversize samples are SKIPPED (never truncated). Caps match the decoder
-    # queries (num_node_queries / num_edge_queries) and are tuned to the cleaned
-    # train distribution (data/_clean_report.json).
-    max_vertices: 512
-    max_edges: 1024
+    # Caps disabled (0): RF trains on the full raw distribution, no oversize
+    # skipping (the fixed-size arc-length target absorbs dense samples).
+    max_vertices: 0
+    max_edges: 0
     num_edge_points: 32
     pc_num_points: 4096
+    # RF target point budget N: every sample yields wf_points (8192, 4).
+    wf_num_points: 8192
     min_edges: 1
     max_load_retries: 64
 

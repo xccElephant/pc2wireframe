@@ -9,6 +9,8 @@ ipykernel
 pytorch-lightning
 jsonargparse[signatures]
 torchmetrics
+torchcfm        # ConditionalFlowMatcher (rectified flow training target)
+torchdiffeq     # odeint (deterministic ODE sampling at val / predict)
 # pytorch3d: GPU chamfer / knn for the eval metrics. Install separately
 # (matched to your torch/CUDA build): https://github.com/facebookresearch/pytorch3d
 

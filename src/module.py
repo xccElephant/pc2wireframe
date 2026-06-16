@@ -1,20 +1,22 @@
-"""LightningModules for the staged PC2Wireframe training.
+"""LightningModule for the Rectified-Flow PC2Wireframe branch.
 
-The pipeline is trained in **two** independent stages, each with its own config
-(``configs/{curve_vae,pc2wireframe}.yaml``) and its own module:
+A single trainable model is driven through ``LightningCLI`` (see
+``src/main.py``):
 
-  1. :class:`CurveVAEModule` -- train the per-curve neural parametric VAE
-     (``AutoencoderKL1D``) on canonicalised GT curves.
-  2. :class:`PC2WireframeModule` -- train the end-to-end point-cloud ->
-     wireframe model (PTv3 encoder + latent compressor + transformer wireframe
-     decoder) with the **curve VAE frozen** (loaded from stage 1). The decoder
-     predicts a node set and an edge set directly; supervision is via Hungarian
-     node / edge matching (coordinates, existence with Focal BCE, endpoint
-     distributions, and a matched-edge curve L1 through the frozen curve VAE).
+    point cloud (B, 4096, 3)
+        -> PCEncoder (PTv3 + latent compressor, deterministic z = mu)
+        -> latent z (B, 16, 256)                       (4096-float budget)
+    noise x0 ~ N(0, I) (B, N, 4)
+        -> RFPointSetVelocity (point-set DiT), conditioned on z
+        -> ODE integrate t: 0 -> 1 (torchdiffeq)
+        -> wireframe point set x1_hat (B, N, 4) = (xyz, type)
+        -> traditional reconstruction -> wireframe {vertices, edge_index,
+           edge_points} -> CCD / TA / VPE score
 
-Both share the ``AdamW`` + linear-warmup/cosine-decay schedule in
-:class:`_BaseModule` and are driven through ``LightningCLI`` (see
-``src/main.py``); the model class is selected per-stage via ``class_path``.
+Training is 1-rectified flow: TorchCFM ``ConditionalFlowMatcher(sigma=0)`` gives
+``(t, xt, ut)`` and the network regresses the velocity ``ut`` with an MSE loss.
+Validation samples deterministically from a fixed noise seed so the metric is
+comparable across epochs.
 """
 from __future__ import annotations
 
@@ -23,11 +25,12 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 
 from .metrics import WireframeScore
-from .models.criterion import WireframeCriterion
-from .models.packing import build_targets, normalized_curves_from_batch
-from .models.pc2wireframe import PC2WireframeModel
+from .models.pc_encoder import PCEncoder
+from .models.rf_pointset import RFPointSetVelocity
+from .recon import reconstruct_wireframe
 
 
 # ----------------------------------------------------------------------
@@ -53,111 +56,29 @@ def _default_pc_encoder() -> dict[str, Any]:
         latent_dim=256,
         compressor_heads=8,
         compressor_layers=2,
-        variational=True,
+        # Deterministic latent for the compression setting (z = mu, no KL).
+        variational=False,
     )
 
 
-def _default_decoder() -> dict[str, Any]:
+def _default_rf_net() -> dict[str, Any]:
     return dict(
-        num_node_queries=768,    # >= data.yaml max_vertices
-        num_edge_queries=1024,   # >= data.yaml max_edges
-        d_model=512,
-        nhead=8,
-        dim_ff=2048,
-        node_layers=6,
-        edge_layers=4,
-        endpoint_dim=128,
-        dropout=0.1,
-    )
-
-
-def _default_curve_vae() -> dict[str, Any]:
-    return dict(
-        latent_channels=3,
-        sample_points_num=32,
-        # length of down_block_types + last block_out_channels set latent_len
-        # (32 / 2**3 = 4) and d_model (256); 3 channels x 4 = 12-d latent.
-        down_block_types=("DownBlock1D", "DownBlock1D", "DownBlock1D"),
-        block_out_channels=(128, 256, 256),
-        layers_per_block=2,
+        point_dim=4,
+        cond_dim=256,
+        d_model=384,
+        depth=8,
+        nhead=6,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        grad_checkpoint=False,
     )
 
 
 # ----------------------------------------------------------------------
-# checkpoint / freezing helpers
-# ----------------------------------------------------------------------
-def _load_submodule(
-    dest: torch.nn.Module, ckpt_path: str, candidate_prefixes: list[str]
-) -> None:
-    """Load one submodule's weights out of a (Lightning) checkpoint.
-
-    A previous-stage Lightning checkpoint stores everything under a module path
-    (e.g. ``model.curve_vae.*`` or ``curve_vae.*``). We strip the first
-    ``candidate_prefix`` that actually matches keys and load the rest into
-    ``dest`` (non-strict, so extra/missing keys are reported not fatal).
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = ckpt.get("state_dict", ckpt)
-    best: tuple[str, dict[str, torch.Tensor]] | None = None
-    for pref in candidate_prefixes:
-        p = (pref + ".") if pref else ""
-        sub = {
-            (k[len(p):] if p else k): v
-            for k, v in sd.items()
-            if k.startswith(p)
-        }
-        if sub and (best is None or len(sub) > len(best[1])):
-            best = (pref, sub)
-    if best is None:
-        raise RuntimeError(
-            f"No keys matching prefixes {candidate_prefixes!r} in {ckpt_path!r}"
-        )
-    missing, unexpected = dest.load_state_dict(best[1], strict=False)
-    print(
-        f"[load] {ckpt_path} prefix={best[0]!r} -> {dest.__class__.__name__} "
-        f"(loaded={len(best[1])}, missing={len(missing)}, "
-        f"unexpected={len(unexpected)})"
-    )
-
-
-def _freeze(module: torch.nn.Module) -> None:
-    """Put ``module`` in eval mode and disable grads for all its params."""
-    module.eval()
-    for p in module.parameters():
-        p.requires_grad_(False)
-
-
-def _gt_wireframes(batch: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract per-sample GT wireframes (numpy) for metric computation."""
-    from .data.dataset import unbatch_wireframe_graphs
-
-    graphs = unbatch_wireframe_graphs(batch)
-    out: list[dict[str, Any]] = []
-    for g in graphs:
-        out.append({
-            "vertices": g["vertices"].detach().cpu().numpy(),
-            "edge_index": g["edge_index"].detach().cpu().numpy(),
-            "edge_points": g["edge_points"].detach().cpu().numpy(),
-        })
-    return out
-
-
-# ----------------------------------------------------------------------
-# shared base: optimizer + frozen-module bookkeeping
+# shared base: optimizer + schedule
 # ----------------------------------------------------------------------
 class _BaseModule(pl.LightningModule):
     """AdamW + linear-warmup/cosine-decay, optimising only trainable params."""
-
-    def frozen_modules(self) -> list[torch.nn.Module]:
-        """Submodules that must stay in eval mode even during ``.train()``."""
-        return []
-
-    def train(self, mode: bool = True):  # type: ignore[override]
-        super().train(mode)
-        # Keep frozen sub-VAEs deterministic (no dropout / running-stat drift).
-        for m in self.frozen_modules():
-            m.eval()
-        return self
 
     def configure_optimizers(self):
         decay, no_decay = [], []
@@ -202,12 +123,7 @@ class _BaseModule(pl.LightningModule):
         gradient_clip_val=None,
         gradient_clip_algorithm=None,
     ):
-        """Clip grads by global norm using the module's ``grad_clip`` hparam.
-
-        This is the single source of truth for clipping; the trainer configs
-        therefore leave ``gradient_clip_val`` unset. A ``grad_clip <= 0``
-        disables clipping.
-        """
+        """Clip grads by global norm using the module's ``grad_clip`` hparam."""
         clip = float(getattr(self.hparams, "grad_clip", 0.0) or 0.0)
         if clip > 0.0:
             self.clip_gradients(
@@ -218,99 +134,27 @@ class _BaseModule(pl.LightningModule):
 
 
 # ----------------------------------------------------------------------
-# stage 1: curve VAE
+# Rectified-Flow wireframe module
 # ----------------------------------------------------------------------
-class CurveVAEModule(_BaseModule):
-    """Stage 1 -- train the per-curve VAE (``AutoencoderKL1D``) alone."""
-
-    def __init__(
-        self,
-        curve_vae: dict[str, Any] | None = None,
-        # ----- optimization -----
-        lr: float = 1.0e-4,
-        weight_decay: float = 1e-4,
-        betas: tuple[float, float] = (0.9, 0.95),
-        warmup_steps: int = 500,
-        max_steps: int = 100_000,
-        grad_clip: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-        from .models.vae import AutoencoderKL1D
-
-        self.curve_vae = AutoencoderKL1D(**(curve_vae or _default_curve_vae()))
-
-    def _step(self, batch: dict[str, Any], stage: str):
-        curves = normalized_curves_from_batch(batch)  # (Esum, U, 3) or None
-        if curves is None or curves.shape[0] == 0:
-            return None
-        # Validation uses a fixed t grid (and the posterior mode) so val/loss is
-        # comparable across epochs; training samples t / the posterior.
-        t = None
-        if stage != "train":
-            p = self.curve_vae.sample_points_num
-            t = torch.linspace(0.0, 1.0, p, device=curves.device)
-            t = t.unsqueeze(0).expand(curves.shape[0], -1)
-        loss, parts = self.curve_vae(
-            curves,
-            t=t,
-            sample_posterior=(stage == "train"),
-            return_loss=True,
-        )
-        bs = int(curves.shape[0])
-        self.log(f"{stage}/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
-        for key, value in parts.items():
-            self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self._step(batch, "train")
-
-    def validation_step(self, batch, batch_idx):
-        self._step(batch, "val")
-
-
-# ----------------------------------------------------------------------
-# stage 2: point cloud -> wireframe (curve VAE frozen)
-# ----------------------------------------------------------------------
-class PC2WireframeModule(_BaseModule):
-    """Stage 2 -- train the end-to-end point-cloud -> wireframe model.
-
-    The PTv3 encoder + latent compressor + wireframe decoder are trained jointly;
-    the curve VAE (loaded frozen from stage 1) only turns the predicted per-edge
-    curve latent into a polyline. Supervision is set-prediction: Hungarian
-    node / edge matching, then matched coordinate / existence / endpoint / curve
-    losses (see :class:`~src.models.criterion.WireframeCriterion`).
-    """
+class RFWireframeModule(_BaseModule):
+    """Point cloud -> latent -> Rectified-Flow point set -> wireframe."""
 
     def __init__(
         self,
         # ----- model config (nested, fully overridable from YAML) -----
         pc_encoder: dict[str, Any] | None = None,
-        decoder: dict[str, Any] | None = None,
-        curve_vae: dict[str, Any] | None = None,
-        # ----- frozen curve VAE warm-start (stage-1 ckpt) -----
-        curve_vae_ckpt: str | None = None,
-        # ----- loss weights -----
-        kl_weight: float = 1e-4,
-        node_coord_weight: float = 5.0,
-        node_exist_weight: float = 1.0,
-        edge_exist_weight: float = 2.0,
-        endpoint_weight: float = 1.0,
-        curve_weight: float = 2.0,
-        topo_degree_weight: float = 0.5,
-        topo_dedup_weight: float = 0.5,
-        aux_weight: float = 1.0,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
-        match_node_coord: float = 5.0,
-        match_node_exist: float = 1.0,
-        match_edge_exist: float = 0.5,
-        match_edge_topk: int = 64,
-        node_exist_pos_weight: float = 10.0,
-        # ----- inference thresholds (also used for val reconstruction) -----
-        vertex_threshold: float = 0.5,
-        edge_threshold: float = 0.5,
+        rf_net: dict[str, Any] | None = None,
+        # ----- RF target / flow -----
+        wf_num_points: int = 8192,
+        flow_sigma: float = 0.0,
+        # ----- ODE sampling (validation / prediction) -----
+        ode_steps: int = 50,
+        ode_method: str = "euler",
+        sample_seed: int = 0,
+        # ----- traditional reconstruction -----
+        type_threshold: float = 0.5,
+        merge_radius: float = 0.03,
+        min_votes: int = 3,
         # ----- eval metric (CCD / TA / VPE -> weighted final score) -----
         eval_w_ccd: float = 0.3,
         eval_w_ta: float = 0.4,
@@ -330,36 +174,13 @@ class PC2WireframeModule(_BaseModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.model = PC2WireframeModel(
-            pc_encoder=pc_encoder or _default_pc_encoder(),
-            decoder=decoder or _default_decoder(),
-            curve_vae=curve_vae or _default_curve_vae(),
-        )
-        if curve_vae_ckpt:
-            _load_submodule(
-                self.model.curve_vae, curve_vae_ckpt,
-                ["curve_vae", "model.curve_vae"],
-            )
-        _freeze(self.model.curve_vae)
+        self.encoder = PCEncoder(**(pc_encoder or _default_pc_encoder()))
+        self.net = RFPointSetVelocity(**(rf_net or _default_rf_net()))
+        self.point_dim = int(self.net.point_dim)
 
-        self.criterion = WireframeCriterion(
-            node_coord_weight=node_coord_weight,
-            node_exist_weight=node_exist_weight,
-            match_node_coord=match_node_coord,
-            match_node_exist=match_node_exist,
-            node_exist_pos_weight=node_exist_pos_weight,
-            edge_exist_weight=edge_exist_weight,
-            endpoint_weight=endpoint_weight,
-            curve_weight=curve_weight,
-            topo_degree_weight=topo_degree_weight,
-            topo_dedup_weight=topo_dedup_weight,
-            aux_weight=aux_weight,
-            match_edge_exist=match_edge_exist,
-            match_edge_topk=match_edge_topk,
-            focal_alpha=focal_alpha,
-            focal_gamma=focal_gamma,
-            num_curve_points=eval_num_per_edge,
-        )
+        from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
+
+        self.flow_matcher = ConditionalFlowMatcher(sigma=float(flow_sigma))
 
         self.val_metrics = WireframeScore(
             w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
@@ -367,45 +188,79 @@ class PC2WireframeModule(_BaseModule):
             match_thresh=eval_match_thresh, num_per_edge=eval_num_per_edge,
         )
 
-    def frozen_modules(self):
-        return [self.model.curve_vae]
-
     # ------------------------------------------------------------------
-    def forward(self, point_cloud: torch.Tensor, sample: bool = False):
-        return self.model(point_cloud, sample=sample)
-
-    def _step(self, batch, stage):
-        point_cloud = batch["point_cloud"]
-        out = self.model(point_cloud, sample=(stage == "train"))
-        targets = build_targets(batch)
-        total, parts = self.criterion(out["preds"], targets, self.model.curve_vae)
-
-        # KL on the PC-encoder latent (only when variational).
-        if out["logvar"] is not None:
-            mu, logvar = out["mu"], out["logvar"]
-            kl = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
-            total = total + self.hparams.kl_weight * kl
-            parts["kl"] = kl.detach()
-
-        bs = point_cloud.shape[0]
-        self.log(f"{stage}/loss", total, batch_size=bs, prog_bar=True, sync_dist=True)
-        for key, value in parts.items():
-            self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
-        return out, total
+    def encode(self, point_cloud: torch.Tensor) -> torch.Tensor:
+        """Deterministic latent ``z = mu`` of shape ``(B, K, D)``."""
+        mu, _ = self.encoder(point_cloud)
+        return mu
 
     def training_step(self, batch, batch_idx):
-        _, total = self._step(batch, "train")
-        return total
+        pc = batch["point_cloud"]
+        z = self.encode(pc)
+        x1 = batch["wf_points"]
+        x0 = torch.randn_like(x1)
+        t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
+        v = self.net(t, xt, z)
+        loss = F.mse_loss(v, ut)
+        self.log("train/loss", loss, batch_size=pc.shape[0],
+                 prog_bar=True, sync_dist=True)
+        return loss
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def sample(self, z: torch.Tensor, num_points: int | None = None) -> torch.Tensor:
+        """Deterministic ODE sampling ``x0 -> x1`` conditioned on ``z``.
+
+        Integrates ``dx/dt = net(t, x, z)`` from ``t=0`` to ``t=1`` with a fixed
+        noise seed (so the reconstruction is reproducible across epochs).
+        Returns ``x1_hat (B, N, point_dim)``.
+        """
+        from torchdiffeq import odeint
+
+        b = z.shape[0]
+        n = int(num_points or self.hparams.wf_num_points)
+        gen = torch.Generator(device=z.device)
+        gen.manual_seed(int(self.hparams.sample_seed))
+        x0 = torch.randn(
+            b, n, self.point_dim, device=z.device, dtype=z.dtype, generator=gen)
+
+        def func(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            return self.net(t.reshape(()).expand(b), x, z)
+
+        t_span = torch.linspace(
+            0.0, 1.0, int(self.hparams.ode_steps) + 1, device=z.device, dtype=z.dtype)
+        traj = odeint(func, x0, t_span, method=str(self.hparams.ode_method))
+        return traj[-1]
+
+    def _reconstruct_batch(self, x1_hat: torch.Tensor) -> list[dict[str, Any]]:
+        pts = x1_hat.detach().cpu().numpy()
+        out: list[dict[str, Any]] = []
+        for i in range(pts.shape[0]):
+            out.append(reconstruct_wireframe(
+                pts[i],
+                type_threshold=self.hparams.type_threshold,
+                merge_radius=self.hparams.merge_radius,
+                min_votes=self.hparams.min_votes,
+                num_per_edge=self.hparams.eval_num_per_edge,
+            ))
+        return out
+
+    @staticmethod
+    def _gt_to_numpy(gt_wireframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for g in gt_wireframes:
+            out.append({
+                "vertices": g["vertices"].detach().cpu().numpy(),
+                "edge_index": g["edge_index"].detach().cpu().numpy(),
+                "edge_points": g["edge_points"].detach().cpu().numpy(),
+            })
+        return out
 
     def validation_step(self, batch, batch_idx):
-        out, _ = self._step(batch, "val")
-        preds_wf = self.model.reconstruct(
-            out["preds"],
-            vertex_threshold=self.hparams.vertex_threshold,
-            edge_threshold=self.hparams.edge_threshold,
-            num_points=self.hparams.eval_num_per_edge,
-        )
-        self.val_metrics.update(preds_wf, _gt_wireframes(batch))
+        z = self.encode(batch["point_cloud"])
+        x1_hat = self.sample(z)
+        preds = self._reconstruct_batch(x1_hat)
+        self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
 
     def on_validation_epoch_end(self) -> None:
         res = self.val_metrics.compute()
@@ -419,18 +274,12 @@ class PC2WireframeModule(_BaseModule):
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """Per-shape latent + decoded wireframe for submission.
 
-        The model runs in the per-shape *normalized* frame (see the dataset's
-        unit-cube transform); predictions are mapped back to raw CAD coordinates
-        with the stored ``pc_center`` / ``pc_scale`` so the submission is in the
-        original coordinate system.
+        Predictions live in the per-shape *normalized* frame; they are mapped
+        back to raw CAD coordinates with the stored ``pc_center`` / ``pc_scale``.
         """
-        out = self.model(batch["point_cloud"], sample=False)
-        wireframes = self.model.reconstruct(
-            out["preds"],
-            vertex_threshold=self.hparams.vertex_threshold,
-            edge_threshold=self.hparams.edge_threshold,
-            num_points=self.hparams.eval_num_per_edge,
-        )
+        z = self.encode(batch["point_cloud"])
+        x1_hat = self.sample(z)
+        wireframes = self._reconstruct_batch(x1_hat)
         if "pc_center" in batch:
             center = batch["pc_center"].detach().cpu().numpy()
             scale = batch["pc_scale"].detach().cpu().numpy()
@@ -438,21 +287,17 @@ class PC2WireframeModule(_BaseModule):
                 self._denormalize_wireframe(wf, center[s], float(scale[s]))
         return {
             "shape_id": batch.get("shape_id"),
-            "z": out["z"],
+            "z": z,
             "wireframes": wireframes,
         }
 
     @staticmethod
     def _denormalize_wireframe(wf: dict[str, Any], center, scale) -> None:
-        """Map a reconstructed wireframe from the normalized frame to raw coords.
-
-        Inverse of the dataset unit-cube transform (``x_raw = x_norm * scale +
-        center``), applied in place to vertex coordinates and curve polylines.
-        """
+        """Inverse of the dataset unit-cube transform (in place)."""
         if wf.get("vertices") is not None and wf["vertices"].size:
             wf["vertices"] = wf["vertices"] * scale + center
         if wf.get("edge_points") is not None and wf["edge_points"].size:
             wf["edge_points"] = wf["edge_points"] * scale + center
 
 
-__all__ = ["CurveVAEModule", "PC2WireframeModule"]
+__all__ = ["RFWireframeModule"]

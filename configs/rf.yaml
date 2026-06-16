@@ -1,0 +1,110 @@
+# Rectified-Flow PC2Wireframe -- single-stage, single trainable model.
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/rf.yaml
+#
+# point cloud -> PCEncoder (PTv3 + latent compressor, deterministic z = mu)
+# -> RFPointSetVelocity (point-set DiT) -> ODE-sampled point set (xyz, type)
+# -> traditional reconstruction -> wireframe. For 8x A800 DDP use rf_ddp.yaml.
+seed_everything: 3407
+
+model:
+  class_path: src.module.RFWireframeModule
+  init_args:
+    # ----- point-cloud encoder: PTv3 backbone + latent-compressor head -----
+    pc_encoder:
+      in_channels: 3          # 3 = xyz, 6 = xyz + normals
+      grid_size: 0.01         # PTv3 voxel size (data is normalized to ~[-1,1])
+      cls_mode: false         # false = dense decoder features (better localized)
+      enc_depths:    [2, 2, 2, 6, 2]
+      enc_channels:  [32, 64, 128, 256, 512]
+      enc_num_head:  [2, 4, 8, 16, 32]
+      enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+      dec_depths:    [2, 2, 2, 2]
+      dec_channels:  [64, 64, 128, 256]
+      dec_num_head:  [4, 4, 8, 16]
+      dec_patch_size: [1024, 1024, 1024, 1024]
+      stride:        [2, 2, 2, 2]
+      enable_flash: true
+      # 16 * 256 = 4096 floats (competition latent budget).
+      latent_num: 16
+      latent_dim: 256
+      compressor_heads: 8
+      compressor_layers: 2
+      variational: false        # deterministic latent (z = mu, no KL)
+
+    # ----- RF velocity network (point-set DiT) -----
+    rf_net:
+      point_dim: 4              # (x, y, z, type)
+      cond_dim: 256             # = pc_encoder.latent_dim
+      d_model: 384
+      depth: 8
+      nhead: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      # Flash/mem-efficient attention keeps 8192-point self-attn at O(N) memory;
+      # flip this on if you raise depth / d_model / batch_size and hit OOM.
+      grad_checkpoint: false
+
+    # ----- RF target / flow -----
+    wf_num_points: 8192         # MUST match data.wf_num_points
+    flow_sigma: 0.0             # 1-rectified flow (TorchCFM sigma=0)
+
+    # ----- ODE sampling (validation / prediction) -----
+    ode_steps: 50
+    ode_method: euler           # fixed-step torchdiffeq solver
+    sample_seed: 0              # fixed x0 seed -> deterministic reconstruction
+
+    # ----- traditional reconstruction -----
+    type_threshold: 0.5         # type >= thr -> vertex point
+    merge_radius: 0.03          # vertex-point cluster merge radius
+    min_votes: 3                # min nearest-two votes for an edge
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score (val/score) -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+    eval_num_per_edge: 32
+
+    # ----- optimization -----
+    lr: 1.5e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1                    # single GPU; use configs/rf_ddp.yaml for 8x A800 DDP
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  # Gradient clipping is handled by the LightningModule (model.grad_clip) via
+  # configure_gradient_clipping; do not also set it here (would be redundant).
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: rf_wireframe
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

@@ -9,7 +9,8 @@ distribution, giving a latent of ``num_tokens * latent_dim`` floats. The
 competition hard cap is 4096 float32 values.
 
 Output layout is ``(B, num_tokens, latent_dim)``, consumed directly as the
-cross-attention memory of the :class:`~src.models.wireframe_decoder.WireframeDecoder`.
+conditioning latent of the RF velocity network
+(:class:`~src.models.rf_pointset.RFPointSetVelocity`).
 """
 from __future__ import annotations
 
