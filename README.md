@@ -20,13 +20,13 @@
 
 | 模块 | 作用 |
 | --- | --- |
-| **PCEncoder** (`PTv3` + `LatentCompressor`) | 点云 `(B,4096,3)` → 确定性 latent `z (B,16,256)`(`variational=false`,`z=mu`,无 KL)。`16×256=4096` floats 正好是比赛 latent 预算上限。 |
+| **PCEncoder** (`PTv3` + `LatentCompressor`) | **原始变长点云**(打包成 `coord (ΣN,3)` + `offset (B,)`,PTv3 原生格式,不再下采样到固定点数) → 确定性 latent `z (B,16,256)`(`variational=false`,`z=mu`,无 KL)。`16×256=4096` floats 正好是比赛 latent 预算上限。 |
 | **RFPointSetVelocity** (点集 DiT) | 以 `z` 为条件的置换等变速度场:对 `8192` 个点做全局 self-attention + 对 16 个 latent token 的 cross-attention,时间步用正弦嵌入 + AdaLN-Zero 注入。注意力走 `scaled_dot_product_attention`(Flash / memory-efficient),`8192` 点自注意力显存 `O(N)` 而非 `O(N²)`,可选 gradient checkpointing。 |
 | **传统重建** (`src/recon/traditional.py`) | RF 采样出的点集 `(N,4)` → wireframe:顶点 = 对 `type≈1` 的点做半径合并聚类;边 = "最近两顶点投票";边曲线 = 其支撑点按投影排序后重采样。纯确定性,无学习。 |
 
 ```mermaid
 flowchart LR
-  PC["point cloud (B,4096,3)"] --> ENC["PCEncoder PTv3 + LatentCompressor"]
+  PC["raw point cloud (coord ΣN×3, offset B)"] --> ENC["PCEncoder PTv3 + LatentCompressor"]
   ENC --> Z["latent z (B,16,256) = 4096 floats"]
   X0["noise x0 ~ N(0,I) (B,N,4)"] --> VEL
   Z --> VEL["RF velocity net (point-set DiT)"]

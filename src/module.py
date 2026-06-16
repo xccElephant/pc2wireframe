@@ -3,7 +3,7 @@
 A single trainable model is driven through ``LightningCLI`` (see
 ``src/main.py``):
 
-    point cloud (B, 4096, 3)
+    packed point cloud (coord (P_sum, 3), offset (B,))   (native, variable size)
         -> PCEncoder (PTv3 + latent compressor, deterministic z = mu)
         -> latent z (B, 16, 256)                       (4096-float budget)
     noise x0 ~ N(0, I) (B, N, 4)
@@ -189,20 +189,23 @@ class RFWireframeModule(_BaseModule):
         )
 
     # ------------------------------------------------------------------
-    def encode(self, point_cloud: torch.Tensor) -> torch.Tensor:
-        """Deterministic latent ``z = mu`` of shape ``(B, K, D)``."""
-        mu, _ = self.encoder(point_cloud)
+    def encode(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Deterministic latent ``z = mu`` of shape ``(B, K, D)``.
+
+        Consumes the packed point cloud ``batch["point_cloud"] (P_sum, 3)`` +
+        ``batch["pc_offset"] (B,)``.
+        """
+        mu, _ = self.encoder(batch["point_cloud"], batch["pc_offset"])
         return mu
 
     def training_step(self, batch, batch_idx):
-        pc = batch["point_cloud"]
-        z = self.encode(pc)
+        z = self.encode(batch)
         x1 = batch["wf_points"]
         x0 = torch.randn_like(x1)
         t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
         v = self.net(t, xt, z)
         loss = F.mse_loss(v, ut)
-        self.log("train/loss", loss, batch_size=pc.shape[0],
+        self.log("train/loss", loss, batch_size=z.shape[0],
                  prog_bar=True, sync_dist=True)
         return loss
 
@@ -257,7 +260,7 @@ class RFWireframeModule(_BaseModule):
         return out
 
     def validation_step(self, batch, batch_idx):
-        z = self.encode(batch["point_cloud"])
+        z = self.encode(batch)
         x1_hat = self.sample(z)
         preds = self._reconstruct_batch(x1_hat)
         self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
@@ -277,7 +280,7 @@ class RFWireframeModule(_BaseModule):
         Predictions live in the per-shape *normalized* frame; they are mapped
         back to raw CAD coordinates with the stored ``pc_center`` / ``pc_scale``.
         """
-        z = self.encode(batch["point_cloud"])
+        z = self.encode(batch)
         x1_hat = self.sample(z)
         wireframes = self._reconstruct_batch(x1_hat)
         if "pc_center" in batch:

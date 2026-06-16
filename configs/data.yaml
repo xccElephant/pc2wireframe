@@ -28,7 +28,10 @@ data:
     max_vertices: 0
     max_edges: 0
     num_edge_points: 32
-    pc_num_points: 4096
+    # Input point cloud is kept at its NATIVE size and packed for PTv3
+    # (coord + offset); 0 = keep all points (no detail loss). Set a positive
+    # value only as a memory safety cap (random subsample above it).
+    max_pc_points: 0
     # RF target point budget N: every sample yields wf_points (8192, 4).
     wf_num_points: 8192
     min_edges: 1
