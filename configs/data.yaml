@@ -3,10 +3,14 @@ data:
   init_args:
     # ----- paths (relative to project root) -----
     data_root: data
-    train_edge_subdir: train/sample_edge
+    # Cleaned GT wireframes (scripts/clean_wireframe.py); filenames match the
+    # originals so train/sample_pointcloud still resolves by stem.
+    train_edge_subdir: train_clean/sample_edge
     train_pointcloud_subdir: train/sample_pointcloud
     predict_pointcloud_subdir: test/sample_pointcloud
-    split_path: data/split.json
+    # Own split: split files pin full edge paths, so the cleaned run can't reuse
+    # data/split.json. Auto-built from the cleaned dir on first run.
+    split_path: data/split_clean.json
     recursive_glob: false
 
     # ----- train/val split (test/ has no GT edges, so val is carved from train) -----
@@ -20,15 +24,10 @@ data:
 
     # ----- graph / point-cloud format -----
     vertex_merge_tol: 0.0001
-    # Samples with >max_vertices vertices are SKIPPED (not truncated). Keep in
-    # sync with the decoder's num_node_queries (768): Hungarian node matching
-    # needs at least as many queries as GT vertices. ~1% of edges<=1024 samples
-    # exceed 768 vertices.
-    max_vertices: 768
-    # Samples with >max_edges edges are SKIPPED (not truncated). Keep in sync
-    # with the decoder's num_edge_queries (1024): edge matching needs at least
-    # as many edge queries as GT edges, so the ~16% long tail (>1024 edges) is
-    # dropped rather than fed in truncated/corrupted.
+    # Oversize samples are SKIPPED (never truncated). Caps match the decoder
+    # queries (num_node_queries / num_edge_queries) and are tuned to the cleaned
+    # train distribution (data/_clean_report.json).
+    max_vertices: 512
     max_edges: 1024
     num_edge_points: 32
     pc_num_points: 4096

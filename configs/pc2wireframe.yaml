@@ -35,7 +35,7 @@ model:
 
     # ----- transformer wireframe decoder (node set + edge set) -----
     decoder:
-      num_node_queries: 768     # >= data.yaml max_vertices
+      num_node_queries: 512     # >= data.yaml max_vertices
       num_edge_queries: 1024    # >= data.yaml max_edges
       d_model: 512
       nhead: 8

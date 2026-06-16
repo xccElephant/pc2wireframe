@@ -1,0 +1,53 @@
+{
+  "config": {
+    "weld_rel": 0.005,
+    "weld_abs": 0.0,
+    "dedup": true,
+    "dedup_geom_rel": 0.005,
+    "dissolve": true,
+    "max_turn_deg": 15.0,
+    "num_edge_points": 32,
+    "min_edge_len_rel": 0.0
+  },
+  "num_files": 24348,
+  "num_ok": 24348,
+  "num_failed": 0,
+  "edges_raw_p50_75_90_95_99_max": [
+    254.0,
+    663.0,
+    1653.3,
+    2759.6,
+    10381.0,
+    57722.0
+  ],
+  "edges_clean_p50_75_90_95_99_max": [
+    205.0,
+    449.0,
+    906.3,
+    1317.6,
+    2683.6,
+    23552.0
+  ],
+  "verts_raw_p50_75_90_95_99_max": [
+    162.0,
+    420.0,
+    1066.3,
+    1811.6,
+    7121.2,
+    47835.0
+  ],
+  "verts_clean_p50_75_90_95_99_max": [
+    122.0,
+    256.0,
+    492.0,
+    719.6,
+    1389.2,
+    11612.0
+  ],
+  "mean_edge_reduction": 0.204,
+  "frac_raw_over_1024": 0.171,
+  "frac_clean_over_1024": 0.08,
+  "frac_raw_over_384": 0.382,
+  "frac_clean_over_384": 0.292,
+  "failures": []
+}

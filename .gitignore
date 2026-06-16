@@ -1,6 +1,7 @@
 __pycache__/
 data/test/
 data/train/
+data/train_clean/
 artifacts/
 pc2wireframe_baseline/
 logs/
