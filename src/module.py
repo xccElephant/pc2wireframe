@@ -371,12 +371,12 @@ class PC2WireframeModule(_BaseModule):
         return [self.model.curve_vae]
 
     # ------------------------------------------------------------------
-    def forward(self, point_cloud: torch.Tensor, sample: bool = False):
-        return self.model(point_cloud, sample=sample)
+    def forward(self, coord: torch.Tensor, offset: torch.Tensor, sample: bool = False):
+        return self.model(coord, offset, sample=sample)
 
     def _step(self, batch, stage):
-        point_cloud = batch["point_cloud"]
-        out = self.model(point_cloud, sample=(stage == "train"))
+        out = self.model(
+            batch["point_cloud"], batch["pc_offset"], sample=(stage == "train"))
         targets = build_targets(batch)
         total, parts = self.criterion(out["preds"], targets, self.model.curve_vae)
 
@@ -387,7 +387,7 @@ class PC2WireframeModule(_BaseModule):
             total = total + self.hparams.kl_weight * kl
             parts["kl"] = kl.detach()
 
-        bs = point_cloud.shape[0]
+        bs = int(batch["pc_offset"].shape[0])
         self.log(f"{stage}/loss", total, batch_size=bs, prog_bar=True, sync_dist=True)
         for key, value in parts.items():
             self.log(f"{stage}/{key}", value, batch_size=bs, sync_dist=True)
@@ -424,7 +424,7 @@ class PC2WireframeModule(_BaseModule):
         with the stored ``pc_center`` / ``pc_scale`` so the submission is in the
         original coordinate system.
         """
-        out = self.model(batch["point_cloud"], sample=False)
+        out = self.model(batch["point_cloud"], batch["pc_offset"], sample=False)
         wireframes = self.model.reconstruct(
             out["preds"],
             vertex_threshold=self.hparams.vertex_threshold,

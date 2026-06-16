@@ -16,7 +16,7 @@ Two dataset flavours are provided:
     Each sample (``__getitem__``) yields *variable-length* tensors::
 
         shape_id:       str
-        point_cloud:    (pc_num_points, 3)   float32   (fixed size)
+        point_cloud:    (Ni, 3)              float32   (variable size)
         vertices:       (Vi, 3)              float32
         edge_index:     (Ei, 2)              int64     (LOCAL vertex ids)
         edge_points:    (Ei, U, 3)           float32
@@ -28,8 +28,9 @@ Two dataset flavours are provided:
 ``PointCloudDataset``
     Used for prediction / submission. The test split ships only point clouds
     (no ground-truth edges), so this dataset loads ``surface_points`` and
-    returns ``{shape_id, point_cloud}`` for inference. Point clouds are fixed
-    size, so this split uses the default (stacking) collate.
+    returns ``{shape_id, point_cloud}`` for inference. Point clouds are
+    variable size, so this split uses :func:`collate_point_clouds` to pack
+    them into the PTv3 coord + offset layout.
 """
 from __future__ import annotations
 
@@ -126,12 +127,20 @@ def _resample_polyline(points: np.ndarray, num_points: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
-def _sample_points(points: np.ndarray, num_points: int) -> np.ndarray:
-    """Randomly (re)sample a point cloud to exactly ``num_points`` points."""
+def _clean_point_cloud(points: np.ndarray, max_points: int = 0) -> np.ndarray:
+    """Clean a *variable-size* point cloud (no resampling to a fixed count).
+
+    Drops NaN/Inf and out-of-range outlier coordinates and keeps the surface
+    points at their native count -- PTv3 consumes a variable-length point cloud
+    via the packed ``coord``/``offset`` format, so there is no need to subsample
+    to a fixed size (which would throw away geometric detail). When
+    ``max_points > 0`` and the cloud is larger, it is randomly subsampled (no
+    replacement) only as a memory safety cap. Returns ``(M, 3)`` float32.
+    """
     points = np.asarray(points, dtype=np.float64)
     points = np.nan_to_num(points, nan=0.0, posinf=0.0, neginf=0.0)
     if points.ndim != 2 or points.shape[0] == 0:
-        return np.zeros((num_points, 3), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32)
     points = points[:, :3]
     finite_mask = (
         np.isfinite(points).all(axis=1)
@@ -139,11 +148,12 @@ def _sample_points(points: np.ndarray, num_points: int) -> np.ndarray:
     )
     points = points[finite_mask]
     if points.shape[0] == 0:
-        return np.zeros((num_points, 3), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32)
     points = np.clip(points, -_PC_COORD_CLIP, _PC_COORD_CLIP).astype(np.float32)
-    replace = points.shape[0] < num_points
-    idx = np.random.choice(points.shape[0], size=num_points, replace=replace)
-    return points[idx]
+    if max_points and points.shape[0] > int(max_points):
+        idx = np.random.choice(points.shape[0], size=int(max_points), replace=False)
+        points = points[idx]
+    return points
 
 
 # ----------------------------------------------------------------------
@@ -164,7 +174,9 @@ class GraphFormat:
     max_vertices: int = 384
     max_edges: int = 1024
     num_edge_points: int = 32
-    pc_num_points: int = 4096
+    # Input point cloud is kept at its NATIVE size (packed for PTv3 via
+    # coord + offset); ``max_pc_points`` only caps it (0 = keep all points).
+    max_pc_points: int = 0
 
 
 def list_npz(directory: str, recursive: bool = False) -> list[str]:
@@ -315,7 +327,7 @@ class WireframeGraphDataset(Dataset):
         max_vertices: int = 384,
         max_edges: int = 1024,
         num_edge_points: int = 32,
-        pc_num_points: int = 4096,
+        max_pc_points: int = 0,
         min_edges: int = 1,
         max_load_retries: int = 64,
     ) -> None:
@@ -325,7 +337,7 @@ class WireframeGraphDataset(Dataset):
             max_vertices=max_vertices,
             max_edges=max_edges,
             num_edge_points=num_edge_points,
-            pc_num_points=pc_num_points,
+            max_pc_points=max_pc_points,
         )
         self.split = split
         self.pointcloud_dirs = [
@@ -445,11 +457,12 @@ class WireframeGraphDataset(Dataset):
         stem = os.path.splitext(os.path.basename(edge_path))[0]
         pc_path = _find_pointcloud_path(stem, self.pointcloud_dirs)
         if pc_path is None:
-            return np.zeros((self.format.pc_num_points, 3), dtype=np.float32)
+            raise FileNotFoundError(
+                f"No matching point cloud for {stem!r}")
         data = _load_npz_dict(pc_path)
         points = _get_npz_array(
             data, ("surface_points", "points", "point_cloud", "pc"))
-        return _sample_points(points, self.format.pc_num_points)
+        return _clean_point_cloud(points, self.format.max_pc_points)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         n_files = len(self.files)
@@ -478,6 +491,8 @@ class WireframeGraphDataset(Dataset):
                 # frame (``edge_points_norm`` is already canonical-per-curve and
                 # affine-invariant, so it is left untouched).
                 pc = self._load_point_cloud(edge_path)
+                if pc.shape[0] < 1:
+                    continue
                 center, scale = _unit_cube_transform(pc)
                 pc = _apply_unit_cube(pc, center, scale)
                 sample: dict[str, torch.Tensor | str] = {
@@ -522,11 +537,11 @@ class PointCloudDataset(Dataset):
         self,
         *,
         pointcloud_dir: str,
-        pc_num_points: int = 4096,
+        max_pc_points: int = 0,
         recursive_glob: bool = False,
     ) -> None:
         super().__init__()
-        self.pc_num_points = int(pc_num_points)
+        self.max_pc_points = int(max_pc_points)
         self.files = list_npz(pointcloud_dir, recursive=recursive_glob)
         if not self.files:
             raise RuntimeError(
@@ -540,7 +555,7 @@ class PointCloudDataset(Dataset):
         data = _load_npz_dict(pc_path)
         points = _get_npz_array(
             data, ("surface_points", "points", "point_cloud", "pc"))
-        pc = _sample_points(points, self.pc_num_points)
+        pc = _clean_point_cloud(points, self.max_pc_points)
         center, scale = _unit_cube_transform(pc)
         pc = _apply_unit_cube(pc, center, scale)
         return {
@@ -564,12 +579,15 @@ def collate_wireframe_graphs(
     dimension (exactly like ``torch_geometric.data.Batch``). Membership is
     recovered through batch-assignment vectors (``vertex_batch`` /
     ``edge_batch``) and CSR-style pointers (``vertex_ptr`` / ``edge_ptr``).
-    Point clouds are fixed size so they are simply stacked.
+    Point clouds are *variable size* (native surface points) and are packed
+    into PTv3's ``coord`` / ``offset`` layout: all points are concatenated and
+    ``pc_offset`` (cumulative per-sample counts) records sample boundaries.
 
     Returned dict (``B`` = batch size, ``Vsum`` = sum of per-sample vertices,
     ``Esum`` = sum of per-sample edges, ``U`` = points per curve)::
 
-        point_cloud:    (B, pc_num_points, 3)  float32   (stacked)
+        point_cloud:    (P_sum, 3)             float32   (packed)
+        pc_offset:      (B,)                   int64  cumsum of per-sample N
         vertices:       (Vsum, 3)              float32   (concatenated)
         vertex_batch:   (Vsum,)                int64  sample id per vertex
         vertex_ptr:     (B + 1,)               int64  CSR offsets, cumsum(nv)
@@ -591,8 +609,11 @@ def collate_wireframe_graphs(
     batch_size = len(samples)
     num_edge_points = int(samples[0]["edge_points"].shape[1])
 
-    point_cloud = torch.stack(
-        [s["point_cloud"] for s in samples], dim=0)
+    # Variable-size point clouds packed into PTv3's coord + offset layout.
+    point_cloud = torch.cat([s["point_cloud"] for s in samples], dim=0)
+    pc_lengths = torch.tensor(
+        [int(s["point_cloud"].shape[0]) for s in samples], dtype=torch.long)
+    pc_offset = torch.cumsum(pc_lengths, dim=0)
     pc_center = torch.stack([s["pc_center"] for s in samples], dim=0)
     pc_scale = torch.stack([s["pc_scale"] for s in samples], dim=0)
     nv = torch.tensor(
@@ -628,6 +649,7 @@ def collate_wireframe_graphs(
 
     return {
         "point_cloud": point_cloud,
+        "pc_offset": pc_offset,
         "pc_center": pc_center,
         "pc_scale": pc_scale,
         "vertices": vertices,
@@ -646,6 +668,29 @@ def collate_wireframe_graphs(
     }
 
 
+def collate_point_clouds(
+    samples: list[dict[str, torch.Tensor | str]],
+) -> dict[str, torch.Tensor | list[str] | int]:
+    """Pack point-cloud-only samples (prediction split) for PTv3.
+
+    The point clouds are variable size, so they are concatenated into a packed
+    ``point_cloud (P_sum, 3)`` with a cumulative ``pc_offset (B,)`` (same layout
+    as :func:`collate_wireframe_graphs`); ``pc_center`` / ``pc_scale`` stack.
+    """
+    point_cloud = torch.cat([s["point_cloud"] for s in samples], dim=0)
+    pc_lengths = torch.tensor(
+        [int(s["point_cloud"].shape[0]) for s in samples], dtype=torch.long)
+    pc_offset = torch.cumsum(pc_lengths, dim=0)
+    return {
+        "shape_id": [str(s["shape_id"]) for s in samples],
+        "point_cloud": point_cloud,
+        "pc_offset": pc_offset,
+        "pc_center": torch.stack([s["pc_center"] for s in samples], dim=0),
+        "pc_scale": torch.stack([s["pc_scale"] for s in samples], dim=0),
+        "num_graphs": len(samples),
+    }
+
+
 def unbatch_wireframe_graphs(
     batch: dict[str, torch.Tensor | list[str] | int],
 ) -> list[dict[str, torch.Tensor | str]]:
@@ -658,14 +703,21 @@ def unbatch_wireframe_graphs(
     vertex_ptr = batch["vertex_ptr"].tolist()
     edge_ptr = batch["edge_ptr"].tolist()
     edge_index = batch["edge_index"]
+    # Packed point cloud: slice each sample via the cumulative ``pc_offset``.
+    pc_ptr = [0] + batch["pc_offset"].tolist() if "pc_offset" in batch else None
     out: list[dict[str, torch.Tensor | str]] = []
     for b in range(int(batch["num_graphs"])):
         v0, v1 = vertex_ptr[b], vertex_ptr[b + 1]
         e0, e1 = edge_ptr[b], edge_ptr[b + 1]
         local_edge_index = (edge_index[:, e0:e1] - v0).t().contiguous()
+        point_cloud = (
+            batch["point_cloud"][pc_ptr[b]:pc_ptr[b + 1]]
+            if pc_ptr is not None
+            else batch["point_cloud"][b]
+        )
         graph = {
             "shape_id": batch["shape_id"][b],
-            "point_cloud": batch["point_cloud"][b],
+            "point_cloud": point_cloud,
             "vertices": batch["vertices"][v0:v1],
             "edge_index": local_edge_index,
             "edge_points": batch["edge_points"][e0:e1],
@@ -687,6 +739,7 @@ __all__ = [
     "WireframeGraphDataset",
     "PointCloudDataset",
     "collate_wireframe_graphs",
+    "collate_point_clouds",
     "unbatch_wireframe_graphs",
     "list_npz",
     "make_split",

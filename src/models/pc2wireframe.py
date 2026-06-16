@@ -58,16 +58,17 @@ class PC2WireframeModel(nn.Module):
 
     # ------------------------------------------------------------------
     def encode_pc(
-        self, point_cloud: torch.Tensor
+        self, coord: torch.Tensor, offset: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Point cloud ``(B, N, 3)`` -> latent ``(mu, logvar)`` in ``b k d``."""
-        return self.pc_encoder(point_cloud)
+        """Packed point cloud (``coord (P_sum,3)``, ``offset (B,)``) ->
+        latent ``(mu, logvar)`` in ``b k d``."""
+        return self.pc_encoder(coord, offset)
 
     def forward(
-        self, point_cloud: torch.Tensor, sample: bool = False
+        self, coord: torch.Tensor, offset: torch.Tensor, sample: bool = False
     ) -> dict[str, Any]:
-        """Point cloud -> latent -> decoder predictions."""
-        mu, logvar = self.encode_pc(point_cloud)
+        """Packed point cloud -> latent -> decoder predictions."""
+        mu, logvar = self.encode_pc(coord, offset)
         if sample and logvar is not None:
             z = self.pc_encoder.compressor.reparameterize(mu, logvar)
         else:

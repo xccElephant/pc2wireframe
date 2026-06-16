@@ -30,7 +30,8 @@ data:
     max_vertices: 512
     max_edges: 1024
     num_edge_points: 32
-    pc_num_points: 4096
+    # Input point cloud is variable size (packed for PTv3); 0 = keep all points.
+    max_pc_points: 0
     min_edges: 1
     max_load_retries: 64
 

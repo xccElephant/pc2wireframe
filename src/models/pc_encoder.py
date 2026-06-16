@@ -1,11 +1,12 @@
 """Point-cloud encoder: PTv3 backbone + latent-compressor head.
 
-Maps a surface point cloud ``(B, N, 3)`` to the fixed-length tokenized latent
-distribution ``Z`` that the wireframe decoder consumes as cross-attention memory.
+Maps a (variable-size) surface point cloud, packed as ``coord (P_sum, 3)`` +
+``offset (B,)``, to the fixed-length tokenized latent distribution ``Z`` that
+the wireframe decoder consumes as cross-attention memory.
 
 Pipeline::
 
-    point cloud (B, N, 3)
+    packed point cloud (coord (P_sum, 3), offset (B,))
         -> PointTransformerV3            # serialized sparse attention
         -> per-voxel features (V, C)     # V varies per sample
         -> group by sample + pad         # (B, Lmax, C) + key_padding_mask
@@ -133,10 +134,16 @@ class PCEncoder(nn.Module):
         mask[batch, within] = False
         return padded, mask
 
-    def _to_data_dict(self, point_cloud: torch.Tensor) -> dict:
-        """Build the PTv3 input dict from a ``(B, N, 3)`` point cloud."""
-        b, n, _ = point_cloud.shape
-        coord = point_cloud.reshape(-1, 3).contiguous()
+    def _to_data_dict(
+        self, coord: torch.Tensor, offset: torch.Tensor
+    ) -> dict:
+        """Build the PTv3 input dict from packed ``coord`` + ``offset``.
+
+        ``coord`` is ``(P_sum, 3)`` (all samples' points concatenated) and
+        ``offset`` is ``(B,)`` cumulative per-sample point counts (PTv3's
+        native variable-length layout).
+        """
+        coord = coord.contiguous()
         if self.in_channels == 3:
             feat = coord
         else:
@@ -144,26 +151,27 @@ class PCEncoder(nn.Module):
             # the caller; fall back to padding with zeros if absent.
             pad = coord.new_zeros(coord.shape[0], self.in_channels - 3)
             feat = torch.cat([coord, pad], dim=-1)
-        offset = torch.arange(
-            n, n * b + 1, n, device=point_cloud.device, dtype=torch.long
-        )
         return {
             "coord": coord,
             "feat": feat,
-            "offset": offset,
+            "offset": offset.contiguous(),
             "grid_size": self.grid_size,
         }
 
     def forward(
-        self, point_cloud: torch.Tensor
+        self, coord: torch.Tensor, offset: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Encode ``point_cloud (B, N, 3)`` to the latent distribution.
+        """Encode a packed point cloud to the latent distribution.
+
+        Args:
+            coord: ``(P_sum, 3)`` concatenated points of all ``B`` samples.
+            offset: ``(B,)`` cumulative per-sample point counts.
 
         Returns ``(mu, logvar)`` each ``(B, latent_num, latent_dim)``;
         ``logvar`` is ``None`` for a deterministic (non-variational) head.
         """
-        b = point_cloud.shape[0]
-        point = self.backbone(self._to_data_dict(point_cloud))
+        b = int(offset.shape[0])
+        point = self.backbone(self._to_data_dict(coord, offset))
         feat = point["feat"]
         batch = point["batch"]
         tokens, key_padding_mask = self._group_by_batch(feat, batch, b)

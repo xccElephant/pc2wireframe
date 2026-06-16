@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from .dataset import (
     PointCloudDataset,
     WireframeGraphDataset,
+    collate_point_clouds,
     collate_wireframe_graphs,
 )
 
@@ -59,7 +60,8 @@ class WireframeDataModule(pl.LightningDataModule):
         max_vertices: int = 384,
         max_edges: int = 1024,
         num_edge_points: int = 32,
-        pc_num_points: int = 4096,
+        # Input point cloud is variable size (packed for PTv3); 0 = keep all.
+        max_pc_points: int = 0,
         min_edges: int = 1,
         max_load_retries: int = 64,
         # ----- data loader -----
@@ -99,7 +101,7 @@ class WireframeDataModule(pl.LightningDataModule):
             max_vertices=self.hparams.max_vertices,
             max_edges=self.hparams.max_edges,
             num_edge_points=self.hparams.num_edge_points,
-            pc_num_points=self.hparams.pc_num_points,
+            max_pc_points=self.hparams.max_pc_points,
             min_edges=self.hparams.min_edges,
             max_load_retries=self.hparams.max_load_retries,
         )
@@ -123,7 +125,7 @@ class WireframeDataModule(pl.LightningDataModule):
             self.predict_dataset = PointCloudDataset(
                 pointcloud_dir=self._path(
                     self.hparams.predict_pointcloud_subdir),
-                pc_num_points=self.hparams.pc_num_points,
+                max_pc_points=self.hparams.max_pc_points,
                 recursive_glob=self.hparams.recursive_glob,
             )
 
@@ -168,6 +170,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             drop_last=False,
+            collate_fn=collate_point_clouds,
             **self._loader_kwargs(),
         )
 
