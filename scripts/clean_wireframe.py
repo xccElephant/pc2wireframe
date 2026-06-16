@@ -1,39 +1,29 @@
 #!/usr/bin/env python3
 """Clean the (very noisy) PC2Wireframe *train* ground-truth wireframes.
 
-Motivation
-----------
 The raw ``data/train/sample_edge/*.npz`` ground truth is extremely dirty: even
-geometrically simple parts ship hundreds — sometimes thousands — of edges. A
-quick audit over the training set shows::
+geometrically simple parts ship hundreds — sometimes thousands — of edges,
+which blows past the loader's edge cap and silently drops the sample. The mess
+is always the same few things, so the clean-up is deliberately simple:
 
-    edges  p50=258  p75=756  p90=1805  p99=11k  max=23k
-    -> 38% of samples blow past the 384-edge cap and ~19% past 1024,
-       i.e. a large chunk of training data is silently *skipped* by the loader.
+1. **Weld duplicate vertices.** Endpoints sitting within a small tolerance are
+   the same vertex. Two such vertices are merged *unless* a genuine edge runs
+   between them (real arc length) — a tiny straight stub between them is just
+   noise and collapses with them.
+2. **Drop the junk the welding exposes.** After merging, duplicate edges,
+   self-loops with no arc, and zero-arc-length edges are removed.
+3. **Dissolve smooth degree-2 chains.** A vertex with exactly two incident
+   edges that pass straight through it is a spurious subdivision point; the two
+   edges are concatenated into one.
+4. **Split spirals / zig-zags.** A polyline is cut at sharp interior corners
+   (so a multi-segment zig-zag becomes separate edges) and on accumulated
+   turning (so a spiral / closed loop becomes a few gentle, open arcs with a
+   real endpoint chord).
 
-The root causes are exactly what you suspected:
-
-1. **Near-duplicate vertices.** Endpoints that are visually the same point sit
-   at slightly different coordinates, so they never merge. Each surplus vertex
-   keeps its incident edges separate.
-2. **Subdivided edges.** A single straight / smooth CAD edge is stored as a
-   chain of many tiny segments passing through degree-2 vertices.
-3. **Overlapping / duplicate edges.** The same edge appears more than once
-   (e.g. once per adjacent face), or two slightly-offset copies coexist.
-4. **Tessellated detail patches.** Some regions are a dense 2D mesh of tiny
-   segments rather than a clean B-rep wireframe.
-
-This script applies a principled, geometry-faithful clean-up:
-
-    weld near-duplicate vertices   (KD-tree union-find, tol ~ % of bbox diag)
-      -> drop degenerate edges     (both endpoints welded together)
-      -> de-duplicate edges        (same endpoints + similar polyline)
-      -> dissolve degree-2 chains  (merge smooth/collinear subdivided edges)
-      -> resample every edge        back to a fixed point count
-
-The NPZ schema is preserved exactly (``start_verts``, ``end_verts``,
-``edge_points``, ``edge_us``, ``original_edge_indices``) so the cleaned files
-are a drop-in replacement for the dataset / dataloader.
+Every surviving edge is then resampled to a fixed point count. The NPZ schema
+is preserved exactly (``start_verts``, ``end_verts``, ``edge_points``,
+``edge_us``, ``original_edge_indices``) so the cleaned files are a drop-in
+replacement for the dataset / dataloader. Point clouds are untouched.
 
 Usage
 -----
@@ -48,11 +38,6 @@ Clean the whole train split into a new directory (parallelized)::
         --in-dir data/train/sample_edge \
         --out-dir data/train_clean/sample_edge \
         --workers 16
-
-Point clouds are untouched: cleaning only edits the wireframe edge files, so
-the cleaned split can keep pointing at the original ``sample_pointcloud`` dir.
-Tune ``--weld-rel`` / ``--max-turn-deg`` / ``--dissolve`` to trade fidelity for
-sparsity; the ``test`` mode is there precisely so you can eyeball the result.
 """
 from __future__ import annotations
 
@@ -78,19 +63,21 @@ except Exception:  # pragma: no cover - scipy is expected to be present
 class CleanConfig:
     """Knobs for the cleaning pipeline.
 
-    ``weld_tol = max(weld_abs, weld_rel * bbox_diag)``. Everything is measured
-    in the shape's own coordinate frame; using a fraction of the bounding-box
-    diagonal makes the defaults scale-invariant across parts.
+    Distances are a fraction of the shape's bounding-box diagonal, so the
+    defaults are scale-invariant across parts. ``weld_tol`` for example is
+    ``max(weld_abs, weld_rel * bbox_diag)``.
     """
 
-    weld_rel: float = 5e-3      # weld points closer than 0.5% of bbox diagonal
-    weld_abs: float = 0.0       # ... but never below this absolute distance
-    dedup: bool = True          # collapse duplicate edges (same endpoints)
-    dedup_geom_rel: float = 5e-3  # two edges are "the same" if mean dist < this
-    dissolve: bool = True       # merge smooth degree-2 chains into one edge
-    max_turn_deg: float = 15.0  # chain stays merged while the turn stays below
-    num_edge_points: int = 32   # resample every cleaned edge to this many pts
-    min_edge_len_rel: float = 0.0  # optionally drop edges shorter than this
+    weld_rel: float = 5e-3       # weld vertices closer than 0.5% of bbox diag
+    weld_abs: float = 0.0        # ... but never below this absolute distance
+    dissolve: bool = True        # merge smooth degree-2 chains into one edge
+    max_turn_deg: float = 15.0   # a chain is "smooth" while its turn stays below
+    split: bool = True           # split spirals / zig-zags into simple arcs
+    corner_deg: float = 45.0     # cut a polyline at interior kinks above this
+    max_total_turn_deg: float = 180.0  # cut a curve every this much total turn
+    min_arc_rel: float = 2e-3    # drop edges shorter than this (arc length)
+    min_chord_rel: float = 1e-3  # drop edges whose endpoints ~coincide (chord)
+    num_edge_points: int = 32    # resample every cleaned edge to this many pts
 
 
 # ----------------------------------------------------------------------
@@ -109,6 +96,12 @@ def _polyline_length(poly: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(poly, axis=0), axis=1).sum())
 
 
+def _chord(poly: np.ndarray) -> float:
+    if poly.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(poly[-1] - poly[0]))
+
+
 def _resample_polyline(poly: np.ndarray, n: int) -> np.ndarray:
     """Resample an ordered polyline to ``n`` points by cumulative arc length."""
     poly = np.asarray(poly, dtype=np.float64)
@@ -122,28 +115,17 @@ def _resample_polyline(poly: np.ndarray, n: int) -> np.ndarray:
     if total <= 1e-12:
         return np.repeat(poly[:1], n, axis=0)
     dst = np.linspace(0.0, total, n)
-    out = np.stack(
-        [np.interp(dst, cum, poly[:, c]) for c in range(3)], axis=-1)
-    return out
+    return np.stack([np.interp(dst, cum, poly[:, c]) for c in range(3)], axis=-1)
 
 
-def _tangent_away(poly: np.ndarray, at_start: bool, min_dist: float) -> np.ndarray:
-    """Unit direction leaving the polyline endpoint, robust to tiny segments.
-
-    Walks a few points inward until it has moved at least ``min_dist`` so that
-    a single noisy first segment cannot dominate the tangent estimate.
-    """
+def _tangent_away(poly: np.ndarray, min_dist: float) -> np.ndarray:
+    """Unit direction leaving ``poly[0]``, robust to tiny first segments."""
     poly = np.asarray(poly, dtype=np.float64)
     if poly.shape[0] < 2:
         return np.zeros(3)
-    if at_start:
-        origin = poly[0]
-        seq = poly[1:]
-    else:
-        origin = poly[-1]
-        seq = poly[-2::-1]
-    far = seq[-1]
-    for p in seq:
+    origin = poly[0]
+    far = poly[-1]
+    for p in poly[1:]:
         if np.linalg.norm(p - origin) >= min_dist:
             far = p
             break
@@ -152,19 +134,48 @@ def _tangent_away(poly: np.ndarray, at_start: bool, min_dist: float) -> np.ndarr
     return d / nrm if nrm > 1e-12 else np.zeros(3)
 
 
-# ----------------------------------------------------------------------
-# Vertex welding
-# ----------------------------------------------------------------------
-def _weld(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
-    """Union-find weld of points within ``tol``.
+def _turning_angles(poly: np.ndarray) -> np.ndarray:
+    """Per-interior-point turning angle (rad) along an ordered polyline.
 
-    Returns ``(ids, centroids)`` where ``ids[i]`` is the welded vertex id of
-    input point ``i`` and ``centroids`` are the per-cluster mean coordinates.
+    Returns an array of length ``K-2``; entry ``i`` is the angle between the
+    segment directions meeting at ``poly[i+1]``. Near-zero-length segments
+    contribute a zero turn so duplicate samples do not inject spurious corners.
     """
-    n = len(points)
-    if n == 0:
-        return np.zeros(0, dtype=np.int64), np.zeros((0, 3))
-    parent = np.arange(n)
+    if poly.shape[0] < 3:
+        return np.zeros(0)
+    d = poly[1:] - poly[:-1]
+    L = np.linalg.norm(d, axis=1, keepdims=True)
+    t = d / np.maximum(L, 1e-12)
+    cos = np.clip(np.einsum("ij,ij->i", t[:-1], t[1:]), -1.0, 1.0)
+    ang = np.arccos(cos)
+    seg_ok = (L[:-1, 0] > 1e-9) & (L[1:, 0] > 1e-9)
+    return np.where(seg_ok, ang, 0.0)
+
+
+# ----------------------------------------------------------------------
+# 1. Vertex welding (merge duplicate vertices, protect real edges)
+# ----------------------------------------------------------------------
+def _weld_vertices(
+    polys: list[np.ndarray], tol: float, protect_arc: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Union-find weld of edge endpoints within ``tol``.
+
+    Two endpoints are merged when they are within ``tol`` *unless* they are the
+    two ends of a single edge whose arc length is >= ``protect_arc`` — that is a
+    genuine (small but real) edge and must not collapse to a point. A tiny
+    straight stub (arc < ``protect_arc``) is allowed to collapse.
+
+    Returns ``(ids, centroids)`` where ``ids`` has shape ``(E, 2)`` giving the
+    welded vertex id of each edge's start/end and ``centroids`` are the
+    per-cluster mean coordinates.
+    """
+    e = len(polys)
+    pts = np.empty((2 * e, 3), dtype=np.float64)
+    for i, p in enumerate(polys):
+        pts[2 * i] = p[0]
+        pts[2 * i + 1] = p[-1]
+
+    parent = np.arange(2 * e)
 
     def find(x: int) -> int:
         root = x
@@ -174,28 +185,219 @@ def _weld(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
             parent[x], x = root, parent[x]
         return root
 
-    if tol > 0 and cKDTree is not None:
-        tree = cKDTree(points)
-        pairs = tree.query_pairs(tol, output_type="ndarray")
-        for a, b in pairs:
-            ra, rb = find(int(a)), find(int(b))
-            if ra != rb:
-                parent[ra] = rb
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    if tol > 0 and cKDTree is not None and e:
+        tree = cKDTree(pts)
+        for a, b in tree.query_pairs(tol, output_type="ndarray"):
+            a, b = int(a), int(b)
+            if a // 2 == b // 2:
+                # the two ends of the same edge: only collapse a tiny stub
+                if _polyline_length(polys[a // 2]) >= protect_arc:
+                    continue
+            union(a, b)
 
     remap: dict[int, int] = {}
-    ids = np.empty(n, dtype=np.int64)
-    for i in range(n):
+    ids = np.empty(2 * e, dtype=np.int64)
+    for i in range(2 * e):
         r = find(i)
         if r not in remap:
             remap[r] = len(remap)
         ids[i] = remap[r]
+
     nv = len(remap)
     centroids = np.zeros((nv, 3))
     counts = np.zeros(nv)
-    np.add.at(centroids, ids, points)
+    np.add.at(centroids, ids, pts)
     np.add.at(counts, ids, 1.0)
     centroids /= np.maximum(counts[:, None], 1.0)
-    return ids, centroids
+    return ids.reshape(e, 2), centroids
+
+
+# ----------------------------------------------------------------------
+# 2. Edge de-duplication
+# ----------------------------------------------------------------------
+def _orient(edge: dict[str, Any], first: int) -> np.ndarray:
+    """Return the polyline oriented so it starts at vertex id ``first``."""
+    poly = edge["poly"]
+    return poly if edge["u"] == first else poly[::-1]
+
+
+def _dedup_edges(
+    edges: list[dict[str, Any]], geom_tol: float
+) -> list[dict[str, Any]]:
+    """Collapse edges sharing the same (undirected) endpoints + geometry."""
+    groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for e in edges:
+        key = (min(e["u"], e["v"]), max(e["u"], e["v"]))
+        groups.setdefault(key, []).append(e)
+
+    out: list[dict[str, Any]] = []
+    for key, members in groups.items():
+        kept: list[dict[str, Any]] = []
+        for e in sorted(members, key=lambda x: -x["len"]):
+            mid_e = _resample_polyline(_orient(e, key[0]), 8)
+            if any(
+                np.linalg.norm(mid_e - _resample_polyline(_orient(k, key[0]), 8),
+                               axis=1).mean() < geom_tol
+                for k in kept
+            ):
+                continue
+            kept.append(e)
+        out.extend(kept)
+    return out
+
+
+def _dedup_polys(
+    edges: list[dict[str, Any]], tol: float
+) -> list[dict[str, Any]]:
+    """Drop duplicate arcs by quantized (endpoints + midpoint), keep longest.
+
+    Splitting can re-create overlapping arcs (e.g. two source curves that share
+    a boundary); this keeps the final edge set minimal.
+    """
+    if tol <= 0:
+        return edges
+    seen: set[tuple] = set()
+    out: list[dict[str, Any]] = []
+    for e in sorted(edges, key=lambda x: -x.get("len", 0.0)):
+        p = e["poly"]
+        a = tuple(np.round(p[0] / tol).astype(np.int64).tolist())
+        b = tuple(np.round(p[-1] / tol).astype(np.int64).tolist())
+        mid = tuple(np.round(p[len(p) // 2] / tol).astype(np.int64).tolist())
+        key = (min(a, b), max(a, b), mid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+# ----------------------------------------------------------------------
+# 3. Dissolve smooth degree-2 chains
+# ----------------------------------------------------------------------
+def _dissolve_chains(
+    edges: list[dict[str, Any]],
+    num_vertices: int,
+    max_turn_deg: float,
+    weld_tol: float,
+) -> list[dict[str, Any]]:
+    """Merge edges across smooth degree-2 vertices into single polylines.
+
+    A degree-2 vertex (exactly two incident edges) that is *smooth* — the two
+    edges pass through it with a turn below ``max_turn_deg`` — is a spurious
+    subdivision point and gets dissolved, concatenating the two polylines. Real
+    junctions (degree != 2) and sharp corners are preserved.
+    """
+    cos_thresh = np.cos(np.deg2rad(180.0 - max_turn_deg))
+    adj: list[list[int]] = [[] for _ in range(num_vertices)]
+    for ei, e in enumerate(edges):
+        adj[e["u"]].append(ei)
+        if e["v"] != e["u"]:
+            adj[e["v"]].append(ei)
+
+    def is_smooth(vid: int, inc: list[int]) -> bool:
+        e0, e1 = edges[inc[0]], edges[inc[1]]
+        if e0 is None or e1 is None:
+            return False
+        d0 = _tangent_away(_orient_to(e0, vid), weld_tol)
+        d1 = _tangent_away(_orient_to(e1, vid), weld_tol)
+        if not d0.any() or not d1.any():
+            return False
+        # smooth pass-through => the two "away" directions are ~antiparallel
+        return float(d0 @ d1) <= cos_thresh
+
+    alive = [True] * len(edges)
+    changed = True
+    while changed:
+        changed = False
+        for vid in range(num_vertices):
+            inc = [ei for ei in adj[vid] if alive[ei]]
+            adj[vid] = inc
+            if len(inc) != 2 or inc[0] == inc[1] or not is_smooth(vid, inc):
+                continue
+            ei0, ei1 = inc
+            e0, e1 = edges[ei0], edges[ei1]
+            a = e0["v"] if e0["u"] == vid else e0["u"]
+            b = e1["v"] if e1["u"] == vid else e1["u"]
+            if a == b:
+                # merging would fold a 2-edge bigon into a self loop; leave it
+                continue
+            poly_a = _orient_to(e0, a)              # a ... vid
+            poly_b = _orient_to(e1, vid)           # vid ... b
+            merged = np.concatenate([poly_a, poly_b[1:]], axis=0)
+            new_id = len(edges)
+            edges.append({"u": a, "v": b, "poly": merged,
+                          "len": _polyline_length(merged)})
+            alive.append(True)
+            alive[ei0] = alive[ei1] = False
+            edges[ei0] = edges[ei1] = None  # type: ignore[assignment]
+            adj[vid] = []
+            adj[a] = [x for x in adj[a] if x not in (ei0, ei1)] + [new_id]
+            adj[b] = [x for x in adj[b] if x not in (ei0, ei1)] + [new_id]
+            changed = True
+
+    return [e for e in edges if e is not None]
+
+
+def _orient_to(edge: dict[str, Any], start_vid: int) -> np.ndarray:
+    poly = edge["poly"]
+    return poly if edge["u"] == start_vid else poly[::-1]
+
+
+# ----------------------------------------------------------------------
+# 4. Split spirals / zig-zags into simple arcs
+# ----------------------------------------------------------------------
+def _split_at_corners(poly: np.ndarray, corner_rad: float) -> list[np.ndarray]:
+    """Split a polyline at interior points whose turn exceeds ``corner_rad``."""
+    if poly.shape[0] < 3 or corner_rad <= 0:
+        return [poly]
+    ang = _turning_angles(poly)
+    corners = (np.where(ang > corner_rad)[0] + 1).tolist()
+    if not corners:
+        return [poly]
+    bounds = [0, *corners, poly.shape[0] - 1]
+    return [poly[a:b + 1] for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+
+def _split_by_total_turn(poly: np.ndarray, turn_cap: float) -> list[np.ndarray]:
+    """Cut a smooth curve every ``turn_cap`` radians of accumulated turning.
+
+    This turns a spiral (or a closed loop, ~2*pi of turning) into the fewest
+    near-equal-turn open arcs that each keep a real endpoint chord.
+    """
+    if poly.shape[0] < 3 or turn_cap <= 0:
+        return [poly]
+    cum = np.cumsum(_turning_angles(poly))   # cum[i] ~ turn up to poly[i+1]
+    total = float(cum[-1])
+    if total <= turn_cap:
+        return [poly]
+    n_pieces = int(np.ceil(total / turn_cap))
+    step = total / n_pieces
+    cuts: list[int] = []
+    target = step
+    for i, c in enumerate(cum):
+        if len(cuts) >= n_pieces - 1:
+            break
+        if c >= target - 1e-9:
+            idx = i + 1
+            if not cuts or idx > cuts[-1]:
+                cuts.append(idx)
+            target += step
+    bounds = [0, *cuts, poly.shape[0] - 1]
+    return [poly[a:b + 1] for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+
+def _split_curve(
+    poly: np.ndarray, corner_rad: float, turn_cap: float
+) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for piece in _split_at_corners(poly, corner_rad):
+        out.extend(_split_by_total_turn(piece, turn_cap))
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -219,179 +421,65 @@ def clean_wireframe(
     """Clean one wireframe npz dict. Returns ``(new_data, stats)``."""
     polys = _parse_edges(data)
     raw_edges = len(polys)
-    raw_verts = int(
-        np.unique(
-            np.round(
-                np.concatenate([p[[0, -1]] for p in polys], 0)
-                if polys else np.zeros((0, 3)),
-                6,
-            ),
-            axis=0,
-        ).shape[0]
-    ) if polys else 0
-
     if not polys:
-        empty = _empty_npz(cfg.num_edge_points)
-        return empty, _stats(raw_verts, raw_edges, 0, 0, 0.0)
+        return _empty_npz(cfg.num_edge_points), _stats(0, 0, 0, 0, 0.0)
 
-    all_pts = np.concatenate(polys, axis=0)
-    diag = _bbox_diag(all_pts)
+    raw_pts = np.concatenate([p[[0, -1]] for p in polys], 0)
+    raw_verts = int(np.unique(np.round(raw_pts, 6), axis=0).shape[0])
+
+    diag = _bbox_diag(np.concatenate(polys, axis=0))
     weld_tol = max(cfg.weld_abs, cfg.weld_rel * diag)
+    min_arc = max(weld_tol, cfg.min_arc_rel * diag)
+    min_chord = cfg.min_chord_rel * diag
 
-    # --- 1. weld endpoints --------------------------------------------------
-    endpoints = np.stack([np.concatenate([p[0], p[-1]]) for p in polys])
-    endpoints = endpoints.reshape(-1, 3)  # [s0,e0,s1,e1,...]
-    ids, centroids = _weld(endpoints, weld_tol)
-    ids = ids.reshape(raw_edges, 2)
-
-    # snap polyline endpoints onto the welded centroids
+    # --- 1. weld duplicate vertices (protect genuine edges) ----------------
+    ids, centroids = _weld_vertices(polys, weld_tol, protect_arc=min_arc)
     edges: list[dict[str, Any]] = []
-    min_len = cfg.min_edge_len_rel * diag
     for i, p in enumerate(polys):
         u, v = int(ids[i, 0]), int(ids[i, 1])
         p = p.copy()
         p[0] = centroids[u]
         p[-1] = centroids[v]
-        length = _polyline_length(p)
-        # degenerate: endpoints welded together AND no real arc length (a true
-        # closed loop with u==v but real length is kept as a loop edge).
-        if u == v and length < weld_tol:
+        arc = _polyline_length(p)
+        # drop degenerate / zero-arc / collapsed-stub edges. Closed loops
+        # (u == v) with real arc length survive and are split below.
+        if arc < min_arc:
             continue
-        if min_len > 0 and length < min_len and u != v:
-            continue
-        edges.append({"u": u, "v": v, "poly": p, "len": length})
+        edges.append({"u": u, "v": v, "poly": p, "len": arc})
 
-    # --- 2. de-duplicate edges ---------------------------------------------
-    if cfg.dedup and edges:
-        edges = _dedup_edges(edges, cfg.dedup_geom_rel * diag)
+    # --- 2. drop duplicate edges -------------------------------------------
+    if edges:
+        edges = _dedup_edges(edges, weld_tol)
 
     # --- 3. dissolve smooth degree-2 chains --------------------------------
     if cfg.dissolve and edges:
         edges = _dissolve_chains(
             edges, len(centroids), cfg.max_turn_deg, weld_tol)
 
-    # --- 4. resample + repackage -------------------------------------------
+    # --- 4. split spirals / zig-zags into simple arcs ----------------------
+    if cfg.split and edges:
+        corner_rad = np.deg2rad(cfg.corner_deg)
+        turn_cap = np.deg2rad(cfg.max_total_turn_deg)
+        split: list[dict[str, Any]] = []
+        for e in edges:
+            for sub in _split_curve(e["poly"], corner_rad, turn_cap):
+                if sub.shape[0] < 2:
+                    continue
+                arc = _polyline_length(sub)
+                if arc < min_arc or _chord(sub) < min_chord:
+                    continue
+                split.append({"poly": sub, "len": arc})
+        edges = _dedup_polys(split, weld_tol)
+    elif edges:
+        # no splitting: still drop near-zero-chord (closed) leftovers
+        edges = [e for e in edges if _chord(e["poly"]) >= min_chord]
+
+    # --- 5. resample + repackage -------------------------------------------
     new = _pack_edges(edges, cfg.num_edge_points)
-    stats = _stats(
-        raw_verts, raw_edges,
-        new["start_verts"].shape[0] and _count_unique_verts(new),
-        new["start_verts"].shape[0],
-        diag,
-    )
+    n_edges = new["start_verts"].shape[0]
+    stats = _stats(raw_verts, raw_edges,
+                   _count_unique_verts(new) if n_edges else 0, n_edges, diag)
     return new, stats
-
-
-def _dedup_edges(
-    edges: list[dict[str, Any]], geom_tol: float
-) -> list[dict[str, Any]]:
-    """Collapse edges sharing the same (undirected) endpoints + geometry."""
-    groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
-    for e in edges:
-        key = (min(e["u"], e["v"]), max(e["u"], e["v"]))
-        groups.setdefault(key, []).append(e)
-
-    out: list[dict[str, Any]] = []
-    for key, members in groups.items():
-        if len(members) == 1:
-            out.append(members[0])
-            continue
-        kept: list[dict[str, Any]] = []
-        for e in sorted(members, key=lambda x: -x["len"]):
-            mid_e = _resample_polyline(_orient(e, key[0]), 8)
-            dup = False
-            for k in kept:
-                mid_k = _resample_polyline(_orient(k, key[0]), 8)
-                if np.linalg.norm(mid_e - mid_k, axis=1).mean() < geom_tol:
-                    dup = True
-                    break
-            if not dup:
-                kept.append(e)
-        out.extend(kept)
-    return out
-
-
-def _orient(edge: dict[str, Any], first: int) -> np.ndarray:
-    """Return the polyline oriented so it starts at vertex id ``first``."""
-    poly = edge["poly"]
-    return poly if edge["u"] == first else poly[::-1]
-
-
-def _dissolve_chains(
-    edges: list[dict[str, Any]],
-    num_vertices: int,
-    max_turn_deg: float,
-    weld_tol: float,
-) -> list[dict[str, Any]]:
-    """Merge edges across smooth degree-2 vertices into single polylines.
-
-    A degree-2 vertex (exactly two incident edges) that is *smooth* — the two
-    edges pass through it with a turn below ``max_turn_deg`` — is a spurious
-    subdivision point and gets dissolved, concatenating the two polylines. Real
-    junctions (degree != 2) and sharp corners are preserved. Pure smooth cycles
-    are kept as two edges so they survive the ``u != v`` requirement.
-    """
-    cos_thresh = np.cos(np.deg2rad(180.0 - max_turn_deg))
-    # adjacency: vertex -> list of (edge_id)
-    adj: list[list[int]] = [[] for _ in range(num_vertices)]
-    for ei, e in enumerate(edges):
-        adj[e["u"]].append(ei)
-        if e["v"] != e["u"]:
-            adj[e["v"]].append(ei)
-
-    def is_smooth(vid: int) -> bool:
-        inc = adj[vid]
-        if len(inc) != 2 or inc[0] == inc[1]:
-            return False
-        e0, e1 = edges[inc[0]], edges[inc[1]]
-        if e0 is None or e1 is None:
-            return False
-        d0 = _tangent_away(_orient_to(e0, vid), True, weld_tol)
-        d1 = _tangent_away(_orient_to(e1, vid), True, weld_tol)
-        if not d0.any() or not d1.any():
-            return False
-        # smooth pass-through => the two "away" directions are ~antiparallel
-        return float(d0 @ d1) <= cos_thresh
-
-    # iteratively dissolve until a fixpoint
-    alive = [True] * len(edges)
-    changed = True
-    while changed:
-        changed = False
-        for vid in range(num_vertices):
-            inc = [ei for ei in adj[vid] if alive[ei]]
-            adj[vid] = inc
-            if len(inc) != 2 or inc[0] == inc[1]:
-                continue
-            if not is_smooth(vid):
-                continue
-            ei0, ei1 = inc
-            e0, e1 = edges[ei0], edges[ei1]
-            a = e0["v"] if e0["u"] == vid else e0["u"]
-            b = e1["v"] if e1["u"] == vid else e1["u"]
-            if a == b:
-                # merging would fold a 2-edge bigon into a self loop; leave it
-                continue
-            poly_a = _orient_to(e0, a)              # a ... vid
-            poly_b = _orient_to(e1, vid)            # vid ... b
-            merged = np.concatenate([poly_a, poly_b[1:]], axis=0)
-            new_id = len(edges)
-            edges.append({"u": a, "v": b, "poly": merged,
-                          "len": _polyline_length(merged)})
-            alive.append(True)
-            alive[ei0] = alive[ei1] = False
-            edges[ei0] = edges[ei1] = None  # type: ignore[assignment]
-            # rewire: vid loses both edges; a and b swap their old edge -> new
-            adj[vid] = []
-            adj[a] = [x for x in adj[a] if x not in (ei0, ei1)] + [new_id]
-            adj[b] = [x for x in adj[b] if x not in (ei0, ei1)] + [new_id]
-            changed = True
-
-    return [e for e in edges if e is not None]
-
-
-def _orient_to(edge: dict[str, Any], start_vid: int) -> np.ndarray:
-    poly = edge["poly"]
-    return poly if edge["u"] == start_vid else poly[::-1]
 
 
 # ----------------------------------------------------------------------
@@ -473,7 +561,7 @@ def _visualize(samples: list[dict[str, Any]], out_path: str) -> None:
     import matplotlib.pyplot as plt
 
     n = len(samples)
-    fig = plt.figure(figsize=(8, 4 * n))
+    fig = plt.figure(figsize=(8, 3.2 * n))
     for r, s in enumerate(samples):
         for c, (tag, polys) in enumerate(
             [("raw", s["raw_polys"]), ("clean", s["clean_polys"])]
@@ -490,9 +578,11 @@ def _visualize(samples: list[dict[str, Any]], out_path: str) -> None:
             )
             ax.set_box_aspect((1, 1, 1))
             ax.tick_params(labelsize=5)
-    fig.tight_layout()
+    # tight_layout misjudges 3D-axis extents, so the bottom row's ticks/labels
+    # get clipped; bbox_inches="tight" expands the canvas to include them.
+    fig.subplots_adjust(top=0.98, bottom=0.02, hspace=0.3, wspace=0.05)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
 
 
@@ -665,14 +755,23 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--in-dir", default="data/train/sample_edge")
         sp.add_argument("--out-dir", default="data/train_clean/sample_edge")
         sp.add_argument("--weld-rel", type=float, default=5e-3,
-                        help="weld points within this fraction of bbox diag")
+                        help="weld vertices within this fraction of bbox diag")
         sp.add_argument("--weld-abs", type=float, default=0.0)
-        sp.add_argument("--no-dedup", action="store_true")
         sp.add_argument("--no-dissolve", action="store_true")
         sp.add_argument("--max-turn-deg", type=float, default=15.0,
                         help="dissolve degree-2 chains turning less than this")
+        sp.add_argument("--no-split", action="store_true",
+                        help="do not split spirals / zig-zags")
+        sp.add_argument("--corner-deg", type=float, default=45.0,
+                        help="split a polyline at interior kinks above this")
+        sp.add_argument("--max-total-turn-deg", type=float, default=180.0,
+                        help="split a curve every this much accumulated turn")
+        sp.add_argument("--min-arc-rel", type=float, default=2e-3,
+                        help="drop edges shorter than this fraction of diag")
+        sp.add_argument("--min-chord-rel", type=float, default=1e-3,
+                        help="drop edges whose endpoints coincide within this "
+                             "fraction of bbox diag")
         sp.add_argument("--num-edge-points", type=int, default=32)
-        sp.add_argument("--min-edge-len-rel", type=float, default=0.0)
 
     sp_test = sub.add_parser("test", help="clean a few + visualize before/after")
     add_common(sp_test)
@@ -698,11 +797,14 @@ def cfg_from_args(args: argparse.Namespace) -> CleanConfig:
     return CleanConfig(
         weld_rel=args.weld_rel,
         weld_abs=args.weld_abs,
-        dedup=not args.no_dedup,
         dissolve=not args.no_dissolve,
         max_turn_deg=args.max_turn_deg,
+        split=not args.no_split,
+        corner_deg=args.corner_deg,
+        max_total_turn_deg=args.max_total_turn_deg,
+        min_arc_rel=args.min_arc_rel,
+        min_chord_rel=args.min_chord_rel,
         num_edge_points=args.num_edge_points,
-        min_edge_len_rel=args.min_edge_len_rel,
     )
 
 

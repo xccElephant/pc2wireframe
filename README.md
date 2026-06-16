@@ -63,14 +63,18 @@ TODO......
 
 原始 `data/train/sample_edge` 的 GT wireframe 非常脏：即便是简单几何体也动辄上百乃至上千条边（全量统计 `边 p50=254 / p90=1653 / max=57722`），**38% 的样本超过 384 顶点、17% 超过 1024 边**，被 dataloader 的 cap 直接跳过。根因是近重复顶点没合并、单条边被过度细分、重复/重叠边、以及细节区被网格化。
 
-`scripts/clean_wireframe.py` 按几何对每个 npz 做清洗（保持 schema 不变，可直接替换原数据）：
+`scripts/clean_wireframe.py` 按几何对每个 npz 做清洗（保持 schema 不变，可直接替换原数据），逻辑就四步：
 
-1. **焊接近重复顶点**：KD-tree 并查集，合并距离 < `max(weld_abs, weld_rel × bbox对角线)` 的端点（默认 `weld_rel=0.5%`，尺度无关）。
-2. **删除退化边**：端点焊到一起且零弧长的边（真闭合环保留）。
-3. **去重边**：同端点且几何相近的重复/重叠边只留一条。
-4. **溶解度数=2 的光滑链**：顶点只连两条边且平滑穿过（转角 < `max_turn_deg`，默认 15°）时，判为多余细分点，把两条边拼成一条；硬角点 / 三岔以上结点保留。
+1. **焊接重复顶点**：KD-tree 找近邻端点，距离 < `max(weld_abs, weld_rel × bbox对角线)`（默认 `weld_rel=0.5%`，尺度无关）就合并；但若这一对正好是**同一条有真实弧长的边**的两个端点，则保留不焊（保护真实的小边 / 倒角 / 圆角），只塌缩重复顶点与极短的直线 stub。
+2. **删垃圾边**：焊接后暴露出来的零弧长 / 退化边、塌缩 stub 直接删；同（无向）端点且几何相近的重复 / 重叠边只留最长一条。
+3. **溶解度数=2 的光滑链**：顶点只连两条边且平滑穿过（转角 < `max_turn_deg`，默认 15°）时判为多余细分点，把两条边拼成一条；硬角点 / 三岔以上结点保留。
+4. **拆螺旋 / 反复转折线**：先在尖锐拐角（> `corner_deg`，默认 45°）处切开（zig-zag 拆成独立边），再按累计转角每 `max_total_turn_deg`（默认 180°）切一刀，把螺旋线 / 闭合环拆成带真实弦长的开弧；最后丢掉零弦长 / 过短碎片并去重。
 
 最后每条边按弧长重采样回固定点数。
+
+前后对比（`test` 模式输出，左 raw / 右 clean）：
+
+![clean_preview](assets/clean_preview.png)
 
 ```bash
 # 随机洗几个 + 前后对比可视化（也可 --pick worst / --files 指定）
@@ -81,12 +85,12 @@ python scripts/clean_wireframe.py all \
     --in-dir data/train/sample_edge --out-dir data/train_clean/sample_edge --workers 16
 ```
 
-清洗后（`data/_clean_report.json`，平均削边 20%，超 1024 边样本 17%→8%）：
+清洗后（全量 24348 个样本，`data/_clean_report.json`，平均削边 16%，超 1024 边样本 17%→9%、超 384 边 38%→30%）：
 
 | | p50 | p75 | p90 | p95 | p99 |
 | --- | --- | --- | --- | --- | --- |
-| 顶点 | 122 | 256 | 492 | 720 | 1389 |
-| 边 | 205 | 449 | 906 | 1318 | 2684 |
+| 顶点 | 162→154 | 420→359 | 1066→783 | 1812→1208 | 7121→2918 |
+| 边 | 254→210 | 663→451 | 1653→920 | 2760→1359 | 10381→3001 |
 
 **接入训练**：`configs/data.yaml` 已指向 `train_clean/sample_edge`，并用独立的 `data/split_clean.json`（split 文件存的是完整路径，不能复用旧 split；`auto_build_split=true` 首次运行自动重建）。点云不处理——清洗只改 edge，文件名不变，仍按 stem 命中 `train/sample_pointcloud`。cap / query 按清洗后分布设为 `max_vertices=512 / max_edges=1024`，对应 `num_node_queries=512 / num_edge_queries=1024`。
 
