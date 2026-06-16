@@ -31,6 +31,7 @@ model:
       latent_num: 16
       latent_dim: 256
       compressor_heads: 8
+      compressor_layers: 2     # post-pooling Transformer decoder layers on the 16 latent tokens
       variational: true
 
     # ----- transformer wireframe decoder (node set + edge set) -----
@@ -65,6 +66,7 @@ model:
     curve_weight: 2.0
     topo_degree_weight: 0.5   # soft per-node degree consistency
     topo_dedup_weight: 0.5    # soft simple-graph dedup / self-loop penalty
+    aux_weight: 1.0           # deep-supervision weight on intermediate decoder layers
     focal_alpha: 0.25
     focal_gamma: 2.0
     match_node_coord: 5.0
@@ -101,8 +103,11 @@ trainer:
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/pc2wireframe.yaml
   num_nodes: 1
-  # find_unused_parameters: frozen curve VAE + conditionally-used heads -> permissive.
-  strategy: ddp_find_unused_parameters_true
+  # All trainable params (PTv3 enc+dec, compressor, every decoder head incl. the
+  # deep-supervision aux layers) contribute to the loss on each step, and the
+  # frozen curve VAE has requires_grad=False (DDP ignores it), so plain DDP is
+  # safe -- no need for the slower find_unused_parameters pass.
+  strategy: ddp
   sync_batchnorm: false         # models use Layer/GroupNorm, not BatchNorm
   use_distributed_sampler: true # shard the dataset across ranks
   precision: 32-true

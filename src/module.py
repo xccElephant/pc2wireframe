@@ -52,6 +52,7 @@ def _default_pc_encoder() -> dict[str, Any]:
         latent_num=16,
         latent_dim=256,
         compressor_heads=8,
+        compressor_layers=2,
         variational=True,
     )
 
@@ -299,6 +300,7 @@ class PC2WireframeModule(_BaseModule):
         curve_weight: float = 2.0,
         topo_degree_weight: float = 0.5,
         topo_dedup_weight: float = 0.5,
+        aux_weight: float = 1.0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         match_node_coord: float = 5.0,
@@ -351,6 +353,7 @@ class PC2WireframeModule(_BaseModule):
             curve_weight=curve_weight,
             topo_degree_weight=topo_degree_weight,
             topo_dedup_weight=topo_dedup_weight,
+            aux_weight=aux_weight,
             match_edge_exist=match_edge_exist,
             match_edge_topk=match_edge_topk,
             focal_alpha=focal_alpha,

@@ -37,6 +37,8 @@ class PCEncoder(nn.Module):
         latent_num: number of latent tokens ``K`` (default 16).
         latent_dim: per-token latent channels ``D`` (default 256; 16*256=4096).
         compressor_heads: attention heads in the pooling head.
+        compressor_layers: post-pooling Transformer decoder layers refining the
+            latent tokens (default 2; 0 = single cross-attn pooling).
         variational: VAE-style latent (predict logvar + reparam) if True.
         latent_budget_max: hard float cap on ``latent_num * latent_dim``.
     """
@@ -62,6 +64,7 @@ class PCEncoder(nn.Module):
         latent_num: int = 16,
         latent_dim: int = 256,
         compressor_heads: int = 8,
+        compressor_layers: int = 2,
         variational: bool = True,
         latent_budget_max: int | None = None,
     ) -> None:
@@ -95,6 +98,7 @@ class PCEncoder(nn.Module):
             num_tokens=latent_num,
             latent_dim=latent_dim,
             nhead=compressor_heads,
+            num_layers=compressor_layers,
             variational=variational,
             latent_budget_max=latent_budget_max,
         )

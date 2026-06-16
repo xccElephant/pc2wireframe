@@ -31,6 +31,7 @@ model:
       latent_num: 16
       latent_dim: 256
       compressor_heads: 8
+      compressor_layers: 2     # post-pooling Transformer decoder layers on the 16 latent tokens
       variational: true
 
     # ----- transformer wireframe decoder (node set + edge set) -----
@@ -65,6 +66,7 @@ model:
     curve_weight: 2.0         # matched-edge curve L1 (canonical frame)
     topo_degree_weight: 0.5   # soft per-node degree consistency
     topo_dedup_weight: 0.5    # soft simple-graph dedup / self-loop penalty
+    aux_weight: 1.0           # deep-supervision weight on intermediate decoder layers
     focal_alpha: 0.25
     focal_gamma: 2.0
     match_node_coord: 5.0     # node Hungarian cost: coord weight

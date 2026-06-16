@@ -33,6 +33,12 @@ needed for the second half):
 
 Endpoints follow the dataset's directed ``(start, end)`` convention so the
 endpoint-A target and the canonical curve orientation stay consistent.
+
+**Deep supervision**: the decoder also returns per-layer predictions
+(``aux_node`` / ``aux_edge``). The Hungarian matching is run once on the
+final-layer predictions and *reused* for every intermediate layer (cheaper than
+re-matching per layer and gives consistent targets); each aux layer is then
+supervised with the same matched node / edge losses, scaled by ``aux_weight``.
 """
 from __future__ import annotations
 
@@ -90,6 +96,8 @@ class WireframeCriterion(nn.Module):
         # ----- topology-aware loss -----
         topo_degree_weight: float = 0.0,
         topo_dedup_weight: float = 0.0,
+        # ----- deep supervision -----
+        aux_weight: float = 1.0,
         # ----- curve decode -----
         num_curve_points: int = 32,
     ) -> None:
@@ -108,6 +116,7 @@ class WireframeCriterion(nn.Module):
         self.focal_gamma = focal_gamma
         self.topo_degree_w = topo_degree_weight
         self.topo_dedup_w = topo_dedup_weight
+        self.aux_weight = aux_weight
         self.num_curve_points = num_curve_points
 
     # ------------------------------------------------------------------
@@ -227,6 +236,74 @@ class WireframeCriterion(nn.Module):
         return degree_loss, dedup_loss
 
     # ------------------------------------------------------------------
+    def _node_exist_bce(
+        self, node_exist_logit: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Node-existence BCE with clamped positive up-weighting (shared)."""
+        n_pos = target.sum()
+        n_neg = target.numel() - n_pos
+        pw = torch.clamp(
+            n_neg / torch.clamp(n_pos, min=1.0), 1.0, self.node_exist_pos_weight)
+        return F.binary_cross_entropy_with_logits(
+            node_exist_logit, target, pos_weight=pw)
+
+    def _node_layer_loss(
+        self,
+        coord_l: torch.Tensor,            # (B, Nq, 3)
+        node_exist_logit_l: torch.Tensor,  # (B, Nq)
+        match_info: list[dict | None],
+        node_exist_target: torch.Tensor,
+        n_nodes: int,
+    ) -> torch.Tensor:
+        """Weighted node loss for one (aux) layer, reusing the final matching."""
+        cl = coord_l.new_zeros(())
+        for s, info in enumerate(match_info):
+            if info is None:
+                continue
+            cl = cl + F.l1_loss(
+                coord_l[s, info["qi"]], info["gt_c"], reduction="sum")
+        cl = cl / max(n_nodes, 1)
+        nel = self._node_exist_bce(node_exist_logit_l, node_exist_target)
+        return self.node_coord_w * cl + self.node_exist_w * nel
+
+    def _edge_layer_loss(
+        self,
+        ep_a_l: torch.Tensor,             # (B, Ne, Nq)
+        ep_b_l: torch.Tensor,             # (B, Ne, Nq)
+        edge_exist_logit_l: torch.Tensor,  # (B, Ne)
+        curve_latent_l: torch.Tensor,     # (B, Ne, Dc)
+        match_info: list[dict | None],
+        edge_exist_target: torch.Tensor,
+        n_edges: int,
+        curve_vae: nn.Module,
+    ) -> torch.Tensor:
+        """Weighted edge loss for one (aux) layer, reusing the final matching."""
+        el = ep_a_l.new_zeros(())
+        cv = ep_a_l.new_zeros(())
+        for s, info in enumerate(match_info):
+            if info is None or info.get("ei") is None:
+                continue
+            ei = info["ei"]
+            el = el + (
+                F.cross_entropy(ep_a_l[s, ei], info["ta_gj"], reduction="sum")
+                + F.cross_entropy(ep_b_l[s, ei], info["tb_gj"], reduction="sum")
+            )
+            pred_curves = decode_curve_latent(
+                curve_vae, curve_latent_l[s, ei], self.num_curve_points)
+            tgt_curves = info["tgt_curves"]
+            cv = cv + (
+                F.l1_loss(pred_curves, tgt_curves, reduction="sum")
+                + 0.5 * F.l1_loss(
+                    pred_curves[:, [0, -1]], tgt_curves[:, [0, -1]],
+                    reduction="sum")
+            )
+        el = el / max(2 * n_edges, 1)
+        cv = cv / max(n_edges * self.num_curve_points * 3, 1)
+        eel = sigmoid_focal_loss(
+            edge_exist_logit_l, edge_exist_target,
+            alpha=self.focal_alpha, gamma=self.focal_gamma)
+        return self.edge_exist_w * eel + self.endpoint_w * el + self.curve_w * cv
+
     def forward(
         self,
         preds: dict[str, torch.Tensor],
@@ -260,6 +337,10 @@ class WireframeCriterion(nn.Module):
         log_pa_all = F.log_softmax(ep_a_logits, dim=-1)
         log_pb_all = F.log_softmax(ep_b_logits, dim=-1)
 
+        # Per-sample matching (computed once on the final-layer predictions) is
+        # cached and reused for every deep-supervision aux layer.
+        match_info: list[dict | None] = [None] * b
+
         for s in range(b):
             tgt = targets[s]
             gt_coords = tgt["node_coords"]
@@ -271,9 +352,12 @@ class WireframeCriterion(nn.Module):
                 coord[s], node_exist_logit[s], gt_coords,
                 self.match_node_coord, self.match_node_exist)
             node_exist_target[s, qi] = 1.0
+            gt_c = gt_coords[gi]
             coord_loss = coord_loss + F.l1_loss(
-                coord[s, qi], gt_coords[gi], reduction="sum")
+                coord[s, qi], gt_c, reduction="sum")
             n_nodes += nv
+            info: dict = {"qi": qi, "gt_c": gt_c, "ei": None}
+            match_info[s] = info
 
             # GT-node-id -> matched query id
             g2q = torch.full((nv,), -1, dtype=torch.long, device=device)
@@ -304,17 +388,19 @@ class WireframeCriterion(nn.Module):
                 edge_exist_logit[s], log_pa_all[s], log_pb_all[s],
                 ta, tb, self.match_edge_exist, self.match_edge_topk)
             edge_exist_target[s, ei] = 1.0
+            ta_gj, tb_gj = ta[gj], tb[gj]
+            tgt_curves = gt_curves[gj]
+            info.update(ei=ei, ta_gj=ta_gj, tb_gj=tb_gj, tgt_curves=tgt_curves)
 
             # endpoint cross-entropy on matched edge queries (directed A=start).
             endpoint_loss = endpoint_loss + (
-                F.cross_entropy(ep_a_logits[s, ei], ta[gj], reduction="sum")
-                + F.cross_entropy(ep_b_logits[s, ei], tb[gj], reduction="sum")
+                F.cross_entropy(ep_a_logits[s, ei], ta_gj, reduction="sum")
+                + F.cross_entropy(ep_b_logits[s, ei], tb_gj, reduction="sum")
             )
 
             # curve L1 in the canonical frame (frozen curve VAE decode).
             pred_curves = decode_curve_latent(
                 curve_vae, curve_latent[s, ei], self.num_curve_points)
-            tgt_curves = gt_curves[gj]
             curve_loss = curve_loss + (
                 F.l1_loss(pred_curves, tgt_curves, reduction="sum")
                 + 0.5 * F.l1_loss(
@@ -331,12 +417,8 @@ class WireframeCriterion(nn.Module):
         dedup_loss = dedup_loss / max(n_topo, 1)
 
         # node existence BCE with (clamped) positive up-weighting.
-        n_pos = node_exist_target.sum()
-        n_neg = node_exist_target.numel() - n_pos
-        pw = torch.clamp(
-            n_neg / torch.clamp(n_pos, min=1.0), 1.0, self.node_exist_pos_weight)
-        node_exist_loss = F.binary_cross_entropy_with_logits(
-            node_exist_logit, node_exist_target, pos_weight=pw)
+        node_exist_loss = self._node_exist_bce(
+            node_exist_logit, node_exist_target)
 
         # edge existence focal BCE (heavy negative imbalance).
         edge_exist_loss = sigmoid_focal_loss(
@@ -362,6 +444,25 @@ class WireframeCriterion(nn.Module):
             "topo_dedup_loss": dedup_loss.detach(),
             "n_match_edges": torch.tensor(float(n_edges), device=device),
         }
+
+        # ---- deep supervision: same losses on each intermediate layer,
+        # reusing the final-layer matching (cheaper + more stable targets). ----
+        aux_node = preds.get("aux_node") or []
+        aux_edge = preds.get("aux_edge") or []
+        if self.aux_weight > 0.0 and (aux_node or aux_edge):
+            aux_total = coord.new_zeros(())
+            for layer in aux_node:
+                aux_total = aux_total + self._node_layer_loss(
+                    layer["coord"], layer["node_exist_logit"],
+                    match_info, node_exist_target, n_nodes)
+            for layer in aux_edge:
+                aux_total = aux_total + self._edge_layer_loss(
+                    layer["ep_a_logits"], layer["ep_b_logits"],
+                    layer["edge_exist_logit"], layer["curve_latent"],
+                    match_info, edge_exist_target, n_edges, curve_vae)
+            total = total + self.aux_weight * aux_total
+            parts["aux_loss"] = aux_total.detach()
+
         return total, parts
 
 

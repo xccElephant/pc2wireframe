@@ -17,6 +17,16 @@ VAE any more:
     per-edge **curve latent** (consumed by the frozen curve VAE decoder, which
     predicts a residual polyline on top of the endpoint-interpolation baseline).
 
+Two refinements borrowed from the DETR family:
+
+  * **Iterative coordinate refinement** (Deformable-DETR style): the node stack
+    carries a per-query reference point; each layer predicts a *delta* that
+    updates the reference in inverse-sigmoid space, so coordinates are refined
+    layer by layer instead of regressed once at the end.
+  * **Deep supervision**: every intermediate node / edge layer emits a full set
+    of predictions through the shared heads. ``forward`` returns them under
+    ``aux_node`` / ``aux_edge`` so ``criterion.py`` can supervise each layer.
+
 Training matches node / edge queries to the GT graph with the Hungarian
 algorithm (see ``criterion.py``); this module is pure ``forward`` and owns no
 loss logic.
@@ -25,6 +35,14 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+
+
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Numerically-stable logit (inverse of ``sigmoid``) on ``[0, 1]`` inputs."""
+    x = x.clamp(0.0, 1.0)
+    x1 = x.clamp(min=eps)
+    x2 = (1.0 - x).clamp(min=eps)
+    return torch.log(x1 / x2)
 
 
 class _DecoderBlock(nn.Module):
@@ -126,6 +144,10 @@ class WireframeDecoder(nn.Module):
             for _ in range(node_layers)
         ])
         self.node_norm = nn.LayerNorm(d_model)
+        # Per-query initial reference point (in (0, 1), one per node query) for
+        # iterative coordinate refinement; the coord head predicts a delta that
+        # updates the reference in inverse-sigmoid space at every layer.
+        self.ref_head = nn.Linear(d_model, 3)
         self.coord_head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(),
             nn.Linear(d_model, 3))
@@ -158,11 +180,25 @@ class WireframeDecoder(nn.Module):
         h = self.latent_proj(latent_tokens)
         return self.latent_norm(h) + self.latent_pos
 
+    def _edge_heads(
+        self, edge_tokens: torch.Tensor, node_keys: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Apply the shared edge heads to one layer's normalised edge tokens."""
+        scale = self.endpoint_dim ** -0.5
+        return {
+            "edge_exist_logit": self.edge_exist_head(edge_tokens).squeeze(-1),
+            "ep_a_logits": torch.matmul(
+                self.ep_a_proj(edge_tokens), node_keys.transpose(1, 2)) * scale,
+            "ep_b_logits": torch.matmul(
+                self.ep_b_proj(edge_tokens), node_keys.transpose(1, 2)) * scale,
+            "curve_latent": self.curve_head(edge_tokens),
+        }
+
     def forward(self, latent_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         """Decode the latent into the node / edge predictions.
 
-        Returns a dict with (``B`` batch, ``Nq`` node queries, ``Ne`` edge
-        queries):
+        Returns a dict with the **final-layer** predictions (``B`` batch, ``Nq``
+        node queries, ``Ne`` edge queries):
             ``node_tokens``       ``(B, Nq, d_model)``
             ``coord``             ``(B, Nq, 3)``   in ``(-1, 1)``
             ``node_exist_logit``  ``(B, Nq)``
@@ -171,43 +207,58 @@ class WireframeDecoder(nn.Module):
             ``ep_a_logits``       ``(B, Ne, Nq)``  endpoint-A node distribution
             ``ep_b_logits``       ``(B, Ne, Nq)``  endpoint-B node distribution
             ``curve_latent``      ``(B, Ne, curve_latent_dim)``
+        plus deep-supervision side outputs (lists over the *intermediate*
+        layers, finest last):
+            ``aux_node``  list of ``{coord, node_exist_logit}``
+            ``aux_edge``  list of ``{edge_exist_logit, ep_a_logits,
+                          ep_b_logits, curve_latent}``
         """
         b = latent_tokens.shape[0]
         mem = self.encode_memory(latent_tokens)
 
-        # ----- nodes -----
+        # ----- nodes (iterative coordinate refinement) -----
         q = self.node_queries.unsqueeze(0).expand(b, -1, -1)
+        # initial reference point in (0, 1), one per query.
+        reference = self.ref_head(self.node_queries).sigmoid()
+        reference = reference.unsqueeze(0).expand(b, -1, -1)
+        node_coords: list[torch.Tensor] = []
+        node_exists: list[torch.Tensor] = []
+        node_tokens = q
         for layer in self.node_layers:
             q = layer(q, [mem])
-        node_tokens = self.node_norm(q)
-        coord = torch.tanh(self.coord_head(node_tokens))
-        node_exist_logit = self.node_exist_head(node_tokens).squeeze(-1)
+            node_tokens = self.node_norm(q)
+            # refine the reference in inverse-sigmoid space, then map (0,1)->(-1,1).
+            delta = self.coord_head(node_tokens)
+            new_ref = (delta + inverse_sigmoid(reference)).sigmoid()
+            node_coords.append(new_ref * 2.0 - 1.0)
+            node_exists.append(self.node_exist_head(node_tokens).squeeze(-1))
+            reference = new_ref.detach()
+        coord = node_coords[-1]
+        node_exist_logit = node_exists[-1]
 
-        # ----- edges (attend to latent memory + node features) -----
+        # ----- edges (attend to latent memory + final node features) -----
+        node_keys = self.node_key_proj(node_tokens)             # (B, Nq, h)
         e = self.edge_queries.unsqueeze(0).expand(b, -1, -1)
+        edge_preds: list[dict[str, torch.Tensor]] = []
+        edge_tokens = e
         for layer in self.edge_layers:
             e = layer(e, [mem, node_tokens])
-        edge_tokens = self.edge_norm(e)
-        edge_exist_logit = self.edge_exist_head(edge_tokens).squeeze(-1)
+            edge_tokens = self.edge_norm(e)
+            edge_preds.append(self._edge_heads(edge_tokens, node_keys))
 
-        node_keys = self.node_key_proj(node_tokens)             # (B, Nq, h)
-        scale = self.endpoint_dim ** -0.5
-        ep_a_logits = torch.matmul(
-            self.ep_a_proj(edge_tokens), node_keys.transpose(1, 2)) * scale
-        ep_b_logits = torch.matmul(
-            self.ep_b_proj(edge_tokens), node_keys.transpose(1, 2)) * scale
-        curve_latent = self.curve_head(edge_tokens)
-
-        return {
+        out: dict[str, torch.Tensor] = {
             "node_tokens": node_tokens,
             "coord": coord,
             "node_exist_logit": node_exist_logit,
             "edge_tokens": edge_tokens,
-            "edge_exist_logit": edge_exist_logit,
-            "ep_a_logits": ep_a_logits,
-            "ep_b_logits": ep_b_logits,
-            "curve_latent": curve_latent,
+            **edge_preds[-1],
+            "aux_node": [
+                {"coord": c, "node_exist_logit": x}
+                for c, x in zip(node_coords[:-1], node_exists[:-1])
+            ],
+            "aux_edge": edge_preds[:-1],
         }
+        return out
 
 
 __all__ = ["WireframeDecoder"]
