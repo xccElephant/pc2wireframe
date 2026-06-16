@@ -1,44 +1,31 @@
-"""Set-prediction criterion for the point-cloud -> wireframe decoder.
+"""Set-prediction criterion for the point-cloud -> wireframe model.
 
-The decoder emits a fixed set of node queries and edge queries; the GT graph is
-a variable-size set, so supervision is done in two Hungarian-matched stages
-(global optimal assignment, not greedy):
+Vertices and edges are supervised differently:
 
-  1. **Nodes** -- match node queries to GT vertices on an L1-coordinate cost
-     (minus an existence bonus). Matched queries supervise coordinate (L1) and
-     are the positives for the node-existence BCE.
-  2. **Edges** -- with the node match fixed, each GT edge's two endpoints map to
-     specific *query* indices. Match edge queries to GT edges on a cost built
-     from edge existence + the two endpoint log-probabilities. To keep the
-     assignment tractable the edge match is optionally restricted to a top-k
-     candidate set (each GT edge proposes its ``k`` best-scoring edge queries;
-     the Hungarian runs on the union, shrinking the cost matrix from
-     ``Nq_edge x ne`` to ``|C| x ne``). Matched edge queries supervise: edge
-     existence (**Focal BCE**, for the heavy positive/negative imbalance), the
-     two endpoint distributions (cross-entropy over node queries) and the
-     per-edge curve latent (**L1** in the canonical curve frame, decoded through
-     the frozen curve VAE).
+  1. **Nodes (DETR set prediction)** -- match node queries to GT vertices with
+     the Hungarian algorithm on an L1-coordinate cost (minus an existence
+     bonus). Matched queries supervise coordinate (L1) and are the positives
+     for the node-existence BCE. Deep supervision reuses this matching on every
+     intermediate node layer.
+  2. **Edges (Relationformer pairwise prediction)** -- there is no edge query
+     set and no edge matching. With the node match fixed, each GT edge becomes a
+     pair of *matched query* indices (a positive vertex pair). For each sample
+     we build a small candidate set (all matched-GT positive pairs + random and
+     kNN hard negatives, see ``edge_decoder.sample_pairs_train``) and score it
+     with the relation edge head (``model.score_pairs``). The candidates are
+     supervised with an **existence (alive) Focal BCE** (handling the heavy
+     positive/negative imbalance) and, on the positive pairs only, a **curve
+     L1** in the canonical curve frame (decoded through the frozen curve VAE).
 
-On top of the matched losses we add a **topology-aware** term (no matching
-needed for the second half):
+Edge orientation is fixed by a deterministic coordinate rule in the dataset
+(``A`` = lexicographically smaller endpoint), so the canonical GT curve is
+already oriented start -> end = A -> B and no endpoint cross-entropy / curve
+direction handling is needed here.
 
-  * *soft-degree consistency* -- each query's expected incident-edge count
-    ``sum_e sigma(exist_e) * (P_a[e,q] + P_b[e,q])`` is regressed (smooth-L1) to
-    the GT degree of its matched vertex (0 for unmatched queries), penalising
-    over-/under-connected nodes.
-  * *dedup / self-loop* -- the soft directed adjacency
-    ``M = (P_a * exist)^T @ P_b`` should describe a simple graph: any unordered
-    pair carries at most one edge (penalise ``relu(M+M^T - 1)``) and there are
-    no self-loops (penalise ``diag(M)``).
-
-Endpoints follow the dataset's directed ``(start, end)`` convention so the
-endpoint-A target and the canonical curve orientation stay consistent.
-
-**Deep supervision**: the decoder also returns per-layer predictions
-(``aux_node`` / ``aux_edge``). The Hungarian matching is run once on the
-final-layer predictions and *reused* for every intermediate layer (cheaper than
-re-matching per layer and gives consistent targets); each aux layer is then
-supervised with the same matched node / edge losses, scaled by ``aux_weight``.
+**Deep supervision** is applied to the node stack only: the node Hungarian
+matching is run once on the final layer and reused for every ``aux_node`` layer
+(cheaper + consistent targets), scaled by ``aux_weight``. The pairwise edge head
+runs once on the final-layer node tokens / relation token.
 """
 from __future__ import annotations
 
@@ -47,6 +34,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
+from .edge_decoder import sample_pairs_train
 from .packing import decode_curve_latent
 
 
@@ -74,7 +62,7 @@ def sigmoid_focal_loss(
 
 
 class WireframeCriterion(nn.Module):
-    """Hungarian node/edge matching + the matched-space wireframe losses."""
+    """Hungarian node matching + pairwise (Relationformer) edge losses."""
 
     def __init__(
         self,
@@ -85,17 +73,15 @@ class WireframeCriterion(nn.Module):
         match_node_coord: float = 5.0,
         match_node_exist: float = 1.0,
         node_exist_pos_weight: float = 10.0,
-        # ----- edge matching / loss -----
+        # ----- pairwise edge loss -----
         edge_exist_weight: float = 2.0,
-        endpoint_weight: float = 1.0,
         curve_weight: float = 2.0,
-        match_edge_exist: float = 0.5,
-        match_edge_topk: int = 0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
-        # ----- topology-aware loss -----
-        topo_degree_weight: float = 0.0,
-        topo_dedup_weight: float = 0.0,
+        # ----- training candidate-pair sampling -----
+        max_train_pairs: int = 2048,
+        neg_ratio: float = 3.0,
+        knn_k: int = 8,
         # ----- deep supervision -----
         aux_weight: float = 1.0,
         # ----- curve decode -----
@@ -108,14 +94,12 @@ class WireframeCriterion(nn.Module):
         self.match_node_exist = match_node_exist
         self.node_exist_pos_weight = node_exist_pos_weight
         self.edge_exist_w = edge_exist_weight
-        self.endpoint_w = endpoint_weight
         self.curve_w = curve_weight
-        self.match_edge_exist = match_edge_exist
-        self.match_edge_topk = match_edge_topk
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
-        self.topo_degree_w = topo_degree_weight
-        self.topo_dedup_w = topo_dedup_weight
+        self.max_train_pairs = int(max_train_pairs)
+        self.neg_ratio = float(neg_ratio)
+        self.knn_k = int(knn_k)
         self.aux_weight = aux_weight
         self.num_curve_points = num_curve_points
 
@@ -137,103 +121,6 @@ class WireframeCriterion(nn.Module):
         dev = coord.device
         return (torch.as_tensor(qi, dtype=torch.long, device=dev),
                 torch.as_tensor(gi, dtype=torch.long, device=dev))
-
-    @staticmethod
-    @torch.no_grad()
-    def _match_edges(
-        edge_exist_logit: torch.Tensor,   # (Ne,)
-        log_pa: torch.Tensor,             # (Ne, Nq)
-        log_pb: torch.Tensor,             # (Ne, Nq)
-        ta: torch.Tensor,                 # (ne,) target endpoint-A query id
-        tb: torch.Tensor,                 # (ne,) target endpoint-B query id
-        exist_w: float,
-        topk: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Hungarian match edge queries -> GT edges. Returns ``(e_idx, g_idx)``.
-
-        With ``topk > 0`` the assignment is restricted to a candidate set: each
-        GT edge contributes its ``topk`` best-scoring edge queries (by endpoint
-        log-prob) and the Hungarian runs on the union ``C`` only, shrinking the
-        cost matrix from ``Ne x ne`` to ``|C| x ne``. The candidate set is padded
-        (by global best endpoint score) up to ``min(ne, Ne)`` so every GT edge
-        can still receive a distinct query.
-        """
-        ne = ta.shape[0]
-        if ne == 0:
-            z = edge_exist_logit.new_zeros(0, dtype=torch.long)
-            return z, z
-        # endpoint log-prob of each (query, gt-edge) pair, directed (A=start).
-        ep = log_pa[:, ta] + log_pb[:, tb]                    # (Ne, ne)
-        cost = -ep - exist_w * F.logsigmoid(edge_exist_logit).unsqueeze(1)
-        dev = edge_exist_logit.device
-        n_q = ep.shape[0]
-
-        if topk and 0 < topk < n_q:
-            k = min(topk, n_q)
-            sel = torch.zeros(n_q, dtype=torch.bool, device=dev)
-            sel[torch.topk(ep, k, dim=0).indices.reshape(-1)] = True
-            need = min(ne, n_q)
-            if int(sel.sum()) < need:
-                order = torch.argsort(ep.max(dim=1).values, descending=True)
-                rest = order[~sel[order]]
-                sel[rest[: need - int(sel.sum())]] = True
-            cand = torch.nonzero(sel, as_tuple=False).squeeze(1)   # (|C|,)
-            sub = cost[cand].detach().cpu().numpy()
-            ei_sub, gj = linear_sum_assignment(sub)
-            ei = cand[torch.as_tensor(ei_sub, dtype=torch.long, device=dev)]
-            return ei, torch.as_tensor(gj, dtype=torch.long, device=dev)
-
-        ei, gj = linear_sum_assignment(cost.detach().cpu().numpy())
-        return (torch.as_tensor(ei, dtype=torch.long, device=dev),
-                torch.as_tensor(gj, dtype=torch.long, device=dev))
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _topology_losses(
-        edge_exist_logit: torch.Tensor,   # (Ne,)
-        log_pa: torch.Tensor,             # (Ne, Nq)
-        log_pb: torch.Tensor,             # (Ne, Nq)
-        edge_a: torch.Tensor,             # (ne_gt,) GT endpoint-A node id
-        edge_b: torch.Tensor,             # (ne_gt,) GT endpoint-B node id
-        qi: torch.Tensor,                 # (nm,) matched query ids
-        gi: torch.Tensor,                 # (nm,) matched GT vertex ids
-        nv: int,
-        nq: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Differentiable topology losses for one sample.
-
-        Returns ``(degree_loss, dedup_loss)``:
-          * ``degree_loss`` -- smooth-L1 between the soft per-query degree and
-            the GT degree of its matched vertex (0 if unmatched), summed over the
-            ``nq`` queries.
-          * ``dedup_loss`` -- soft simple-graph violation (self-loops +
-            multi-edges), normalised by the GT edge count.
-        """
-        device = edge_exist_logit.device
-        exist = torch.sigmoid(edge_exist_logit)               # (Ne,)
-        pa = log_pa.exp()                                     # (Ne, Nq)
-        pb = log_pb.exp()                                     # (Ne, Nq)
-
-        # ---- soft-degree consistency ----
-        exp_deg = (exist.unsqueeze(1) * (pa + pb)).sum(0)     # (Nq,)
-        gt_degree = torch.zeros(nv, device=device)
-        if edge_a.numel() > 0:
-            ones = torch.ones(edge_a.shape[0], device=device)
-            gt_degree.scatter_add_(0, edge_a, ones)
-            gt_degree.scatter_add_(0, edge_b, ones)
-        target_deg = torch.zeros(nq, device=device)
-        target_deg[qi] = gt_degree[gi]
-        degree_loss = F.smooth_l1_loss(exp_deg, target_deg, reduction="sum")
-
-        # ---- dedup / self-loop (soft directed adjacency) ----
-        adj = (pa * exist.unsqueeze(1)).transpose(0, 1) @ pb  # (Nq, Nq)
-        self_loop = torch.diagonal(adj).sum()
-        undirected = adj + adj.transpose(0, 1)
-        undirected = undirected - torch.diag_embed(torch.diagonal(undirected))
-        multi_edge = 0.5 * torch.relu(undirected - 1.0).sum()
-        ne_gt = max(int(edge_a.shape[0]), 1)
-        dedup_loss = (self_loop + multi_edge) / ne_gt
-        return degree_loss, dedup_loss
 
     # ------------------------------------------------------------------
     def _node_exist_bce(
@@ -266,79 +153,31 @@ class WireframeCriterion(nn.Module):
         nel = self._node_exist_bce(node_exist_logit_l, node_exist_target)
         return self.node_coord_w * cl + self.node_exist_w * nel
 
-    def _edge_layer_loss(
-        self,
-        ep_a_l: torch.Tensor,             # (B, Ne, Nq)
-        ep_b_l: torch.Tensor,             # (B, Ne, Nq)
-        edge_exist_logit_l: torch.Tensor,  # (B, Ne)
-        curve_latent_l: torch.Tensor,     # (B, Ne, Dc)
-        match_info: list[dict | None],
-        edge_exist_target: torch.Tensor,
-        n_edges: int,
-        curve_vae: nn.Module,
-    ) -> torch.Tensor:
-        """Weighted edge loss for one (aux) layer, reusing the final matching."""
-        el = ep_a_l.new_zeros(())
-        cv = ep_a_l.new_zeros(())
-        for s, info in enumerate(match_info):
-            if info is None or info.get("ei") is None:
-                continue
-            ei = info["ei"]
-            el = el + (
-                F.cross_entropy(ep_a_l[s, ei], info["ta_gj"], reduction="sum")
-                + F.cross_entropy(ep_b_l[s, ei], info["tb_gj"], reduction="sum")
-            )
-            pred_curves = decode_curve_latent(
-                curve_vae, curve_latent_l[s, ei], self.num_curve_points)
-            tgt_curves = info["tgt_curves"]
-            cv = cv + (
-                F.l1_loss(pred_curves, tgt_curves, reduction="sum")
-                + 0.5 * F.l1_loss(
-                    pred_curves[:, [0, -1]], tgt_curves[:, [0, -1]],
-                    reduction="sum")
-            )
-        el = el / max(2 * n_edges, 1)
-        cv = cv / max(n_edges * self.num_curve_points * 3, 1)
-        eel = sigmoid_focal_loss(
-            edge_exist_logit_l, edge_exist_target,
-            alpha=self.focal_alpha, gamma=self.focal_gamma)
-        return self.edge_exist_w * eel + self.endpoint_w * el + self.curve_w * cv
-
+    # ------------------------------------------------------------------
     def forward(
         self,
         preds: dict[str, torch.Tensor],
         targets: list[dict[str, torch.Tensor]],
-        curve_vae: nn.Module,
+        model: nn.Module,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coord = preds["coord"]
         node_exist_logit = preds["node_exist_logit"]
-        edge_exist_logit = preds["edge_exist_logit"]
-        ep_a_logits = preds["ep_a_logits"]
-        ep_b_logits = preds["ep_b_logits"]
-        curve_latent = preds["curve_latent"]
+        node_tokens = preds["node_tokens"]
+        rln_token = preds["rln_token"]
         b, nq, _ = coord.shape
-        ne_q = edge_exist_logit.shape[1]
         device = coord.device
+        curve_vae = model.curve_vae
 
         node_exist_target = torch.zeros(b, nq, device=device)
-        edge_exist_target = torch.zeros(b, ne_q, device=device)
-
         coord_loss = coord.new_zeros(())
-        endpoint_loss = coord.new_zeros(())
+        edge_exist_loss = coord.new_zeros(())
         curve_loss = coord.new_zeros(())
-        degree_loss = coord.new_zeros(())
-        dedup_loss = coord.new_zeros(())
         n_nodes = 0
-        n_edges = 0
-        n_deg_q = 0
-        n_topo = 0
+        n_pairs = 0
+        n_pos_edges = 0
 
-        need_topo = self.topo_degree_w > 0.0 or self.topo_dedup_w > 0.0
-        log_pa_all = F.log_softmax(ep_a_logits, dim=-1)
-        log_pb_all = F.log_softmax(ep_b_logits, dim=-1)
-
-        # Per-sample matching (computed once on the final-layer predictions) is
-        # cached and reused for every deep-supervision aux layer.
+        # Per-sample node matching (computed once on the final-layer predictions)
+        # is cached and reused for every deep-supervision aux node layer.
         match_info: list[dict | None] = [None] * b
 
         for s in range(b):
@@ -356,110 +195,97 @@ class WireframeCriterion(nn.Module):
             coord_loss = coord_loss + F.l1_loss(
                 coord[s, qi], gt_c, reduction="sum")
             n_nodes += nv
-            info: dict = {"qi": qi, "gt_c": gt_c, "ei": None}
-            match_info[s] = info
+            match_info[s] = {"qi": qi, "gt_c": gt_c}
 
-            # GT-node-id -> matched query id
+            # candidate vertices for the pairwise edge head = matched queries.
+            v = int(qi.shape[0])
+            if v < 2:
+                continue
+            # query id -> local candidate index; GT vertex id -> matched query.
+            q2local = torch.full((nq,), -1, dtype=torch.long, device=device)
+            q2local[qi] = torch.arange(v, device=device)
             g2q = torch.full((nv,), -1, dtype=torch.long, device=device)
             g2q[gi] = qi
 
-            # ---- topology-aware loss (needs only preds + node match) ----
-            if need_topo:
-                d_loss, dd_loss = self._topology_losses(
-                    edge_exist_logit[s], log_pa_all[s], log_pb_all[s],
-                    tgt["edge_a"], tgt["edge_b"], qi, gi, nv, nq)
-                degree_loss = degree_loss + d_loss
-                dedup_loss = dedup_loss + dd_loss
-                n_deg_q += nq
-                n_topo += 1
-
+            # positive local pairs (one per valid GT edge), curve targets aligned.
             ne = tgt["edge_a"].shape[0]
-            if ne == 0:
-                continue
-            ta = g2q[tgt["edge_a"]]
-            tb = g2q[tgt["edge_b"]]
-            valid = (ta >= 0) & (tb >= 0) & (ta != tb)
-            if not bool(valid.any()):
-                continue
-            ta, tb = ta[valid], tb[valid]
-            gt_curves = tgt["edge_curve"][valid]
+            if ne > 0:
+                ta = g2q[tgt["edge_a"]]
+                tb = g2q[tgt["edge_b"]]
+                valid = (ta >= 0) & (tb >= 0) & (ta != tb)
+                ta, tb = ta[valid], tb[valid]
+                gt_curves = tgt["edge_curve"][valid]
+                pos_local = torch.stack([q2local[ta], q2local[tb]], dim=-1)
+            else:
+                pos_local = torch.zeros(0, 2, dtype=torch.long, device=device)
+                gt_curves = tgt["edge_curve"][:0]
 
-            ei, gj = self._match_edges(
-                edge_exist_logit[s], log_pa_all[s], log_pb_all[s],
-                ta, tb, self.match_edge_exist, self.match_edge_topk)
-            edge_exist_target[s, ei] = 1.0
-            ta_gj, tb_gj = ta[gj], tb[gj]
-            tgt_curves = gt_curves[gj]
-            info.update(ei=ei, ta_gj=ta_gj, tb_gj=tb_gj, tgt_curves=tgt_curves)
-
-            # endpoint cross-entropy on matched edge queries (directed A=start).
-            endpoint_loss = endpoint_loss + (
-                F.cross_entropy(ep_a_logits[s, ei], ta_gj, reduction="sum")
-                + F.cross_entropy(ep_b_logits[s, ei], tb_gj, reduction="sum")
+            cand_tokens = node_tokens[s, qi]              # (V, D) with grad
+            cand_pos = coord[s, qi]                        # (V, 3) with grad
+            pair_idx, alive_target = sample_pairs_train(
+                pos_local, cand_pos.detach(),
+                neg_ratio=self.neg_ratio,
+                max_train_pairs=self.max_train_pairs,
+                knn_k=self.knn_k,
             )
+            if pair_idx.shape[0] == 0:
+                continue
 
-            # curve L1 in the canonical frame (frozen curve VAE decode).
-            pred_curves = decode_curve_latent(
-                curve_vae, curve_latent[s, ei], self.num_curve_points)
-            curve_loss = curve_loss + (
-                F.l1_loss(pred_curves, tgt_curves, reduction="sum")
-                + 0.5 * F.l1_loss(
-                    pred_curves[:, [0, -1]], tgt_curves[:, [0, -1]],
-                    reduction="sum")
-            )
-            n_edges += ei.shape[0]
+            res = model.score_pairs(
+                cand_tokens, cand_pos, rln_token[s], pair_idx)
+            edge_exist_loss = edge_exist_loss + sigmoid_focal_loss(
+                res["alive_logit"], alive_target,
+                alpha=self.focal_alpha, gamma=self.focal_gamma,
+                reduction="sum")
+            n_pairs += int(pair_idx.shape[0])
+
+            # curve L1 on the positive pairs (first rows; aligned to gt_curves).
+            n_pos = min(int(pos_local.shape[0]), int(pair_idx.shape[0]))
+            if n_pos > 0 and "curve_latent" in res:
+                pred_curves = decode_curve_latent(
+                    curve_vae, res["curve_latent"][:n_pos], self.num_curve_points)
+                tgt_curves = gt_curves[:n_pos]
+                curve_loss = curve_loss + (
+                    F.l1_loss(pred_curves, tgt_curves, reduction="sum")
+                    + 0.5 * F.l1_loss(
+                        pred_curves[:, [0, -1]], tgt_curves[:, [0, -1]],
+                        reduction="sum")
+                )
+                n_pos_edges += n_pos
 
         coord_loss = coord_loss / max(n_nodes, 1)
-        endpoint_loss = endpoint_loss / max(2 * n_edges, 1)
+        edge_exist_loss = edge_exist_loss / max(n_pairs, 1)
         curve_loss = curve_loss / max(
-            n_edges * self.num_curve_points * 3, 1)
-        degree_loss = degree_loss / max(n_deg_q, 1)
-        dedup_loss = dedup_loss / max(n_topo, 1)
+            n_pos_edges * self.num_curve_points * 3, 1)
 
         # node existence BCE with (clamped) positive up-weighting.
         node_exist_loss = self._node_exist_bce(
             node_exist_logit, node_exist_target)
 
-        # edge existence focal BCE (heavy negative imbalance).
-        edge_exist_loss = sigmoid_focal_loss(
-            edge_exist_logit, edge_exist_target,
-            alpha=self.focal_alpha, gamma=self.focal_gamma)
-
         total = (
             self.node_coord_w * coord_loss
             + self.node_exist_w * node_exist_loss
             + self.edge_exist_w * edge_exist_loss
-            + self.endpoint_w * endpoint_loss
             + self.curve_w * curve_loss
-            + self.topo_degree_w * degree_loss
-            + self.topo_dedup_w * dedup_loss
         )
         parts = {
             "coord_loss": coord_loss.detach(),
             "node_exist_loss": node_exist_loss.detach(),
             "edge_exist_loss": edge_exist_loss.detach(),
-            "endpoint_loss": endpoint_loss.detach(),
             "curve_loss": curve_loss.detach(),
-            "topo_degree_loss": degree_loss.detach(),
-            "topo_dedup_loss": dedup_loss.detach(),
-            "n_match_edges": torch.tensor(float(n_edges), device=device),
+            "n_match_edges": torch.tensor(float(n_pos_edges), device=device),
+            "n_cand_pairs": torch.tensor(float(n_pairs), device=device),
         }
 
-        # ---- deep supervision: same losses on each intermediate layer,
-        # reusing the final-layer matching (cheaper + more stable targets). ----
+        # ---- deep supervision: node losses on each intermediate node layer,
+        # reusing the final-layer node matching (cheaper + stable targets). ----
         aux_node = preds.get("aux_node") or []
-        aux_edge = preds.get("aux_edge") or []
-        if self.aux_weight > 0.0 and (aux_node or aux_edge):
+        if self.aux_weight > 0.0 and aux_node:
             aux_total = coord.new_zeros(())
             for layer in aux_node:
                 aux_total = aux_total + self._node_layer_loss(
                     layer["coord"], layer["node_exist_logit"],
                     match_info, node_exist_target, n_nodes)
-            for layer in aux_edge:
-                aux_total = aux_total + self._edge_layer_loss(
-                    layer["ep_a_logits"], layer["ep_b_logits"],
-                    layer["edge_exist_logit"], layer["curve_latent"],
-                    match_info, edge_exist_target, n_edges, curve_vae)
             total = total + self.aux_weight * aux_total
             parts["aux_loss"] = aux_total.detach()
 

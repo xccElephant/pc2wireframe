@@ -6,11 +6,12 @@ The pipeline is trained in **two** independent stages, each with its own config
   1. :class:`CurveVAEModule` -- train the per-curve neural parametric VAE
      (``AutoencoderKL1D``) on canonicalised GT curves.
   2. :class:`PC2WireframeModule` -- train the end-to-end point-cloud ->
-     wireframe model (PTv3 encoder + latent compressor + transformer wireframe
-     decoder) with the **curve VAE frozen** (loaded from stage 1). The decoder
-     predicts a node set and an edge set directly; supervision is via Hungarian
-     node / edge matching (coordinates, existence with Focal BCE, endpoint
-     distributions, and a matched-edge curve L1 through the frozen curve VAE).
+     wireframe model (PTv3 encoder + latent compressor + wireframe decoder +
+     Relationformer edge head) with the **curve VAE frozen** (loaded from stage
+     1). The decoder predicts a node set (Hungarian-matched: coordinate L1 +
+     existence Focal BCE, deeply supervised); edges are scored over candidate
+     vertex pairs (alive Focal BCE + positive-pair curve L1 through the frozen
+     curve VAE).
 
 Both share the ``AdamW`` + linear-warmup/cosine-decay schedule in
 :class:`_BaseModule` and are driven through ``LightningCLI`` (see
@@ -60,13 +61,19 @@ def _default_pc_encoder() -> dict[str, Any]:
 def _default_decoder() -> dict[str, Any]:
     return dict(
         num_node_queries=768,    # >= data.yaml max_vertices
-        num_edge_queries=1024,   # >= data.yaml max_edges
+        num_rln_tokens=1,        # Relationformer global relation token(s)
         d_model=512,
         nhead=8,
         dim_ff=2048,
         node_layers=6,
-        edge_layers=4,
-        endpoint_dim=128,
+        dropout=0.1,
+    )
+
+
+def _default_edge_head() -> dict[str, Any]:
+    return dict(
+        hidden=512,
+        num_layers=3,
         dropout=0.1,
     )
 
@@ -276,11 +283,11 @@ class CurveVAEModule(_BaseModule):
 class PC2WireframeModule(_BaseModule):
     """Stage 2 -- train the end-to-end point-cloud -> wireframe model.
 
-    The PTv3 encoder + latent compressor + wireframe decoder are trained jointly;
-    the curve VAE (loaded frozen from stage 1) only turns the predicted per-edge
-    curve latent into a polyline. Supervision is set-prediction: Hungarian
-    node / edge matching, then matched coordinate / existence / endpoint / curve
-    losses (see :class:`~src.models.criterion.WireframeCriterion`).
+    The PTv3 encoder + latent compressor + wireframe decoder + relation edge
+    head are trained jointly; the curve VAE (loaded frozen from stage 1) only
+    turns a predicted per-edge curve latent into a polyline. Supervision is
+    Hungarian node matching + a Relationformer pairwise edge head (see
+    :class:`~src.models.criterion.WireframeCriterion`).
     """
 
     def __init__(
@@ -289,6 +296,7 @@ class PC2WireframeModule(_BaseModule):
         pc_encoder: dict[str, Any] | None = None,
         decoder: dict[str, Any] | None = None,
         curve_vae: dict[str, Any] | None = None,
+        edge_head: dict[str, Any] | None = None,
         # ----- frozen curve VAE warm-start (stage-1 ckpt) -----
         curve_vae_ckpt: str | None = None,
         # ----- loss weights -----
@@ -296,21 +304,22 @@ class PC2WireframeModule(_BaseModule):
         node_coord_weight: float = 5.0,
         node_exist_weight: float = 1.0,
         edge_exist_weight: float = 2.0,
-        endpoint_weight: float = 1.0,
         curve_weight: float = 2.0,
-        topo_degree_weight: float = 0.5,
-        topo_dedup_weight: float = 0.5,
         aux_weight: float = 1.0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         match_node_coord: float = 5.0,
         match_node_exist: float = 1.0,
-        match_edge_exist: float = 0.5,
-        match_edge_topk: int = 64,
         node_exist_pos_weight: float = 10.0,
+        # ----- pairwise edge candidate sampling (training) -----
+        max_train_pairs: int = 2048,
+        neg_ratio: float = 3.0,
+        knn_k: int = 8,
         # ----- inference thresholds (also used for val reconstruction) -----
         vertex_threshold: float = 0.5,
         edge_threshold: float = 0.5,
+        infer_max_pairs: int = 40000,
+        topk_pairs: int = 0,
         # ----- eval metric (CCD / TA / VPE -> weighted final score) -----
         eval_w_ccd: float = 0.3,
         eval_w_ta: float = 0.4,
@@ -334,6 +343,7 @@ class PC2WireframeModule(_BaseModule):
             pc_encoder=pc_encoder or _default_pc_encoder(),
             decoder=decoder or _default_decoder(),
             curve_vae=curve_vae or _default_curve_vae(),
+            edge_head=edge_head or _default_edge_head(),
         )
         if curve_vae_ckpt:
             _load_submodule(
@@ -349,15 +359,13 @@ class PC2WireframeModule(_BaseModule):
             match_node_exist=match_node_exist,
             node_exist_pos_weight=node_exist_pos_weight,
             edge_exist_weight=edge_exist_weight,
-            endpoint_weight=endpoint_weight,
             curve_weight=curve_weight,
-            topo_degree_weight=topo_degree_weight,
-            topo_dedup_weight=topo_dedup_weight,
             aux_weight=aux_weight,
-            match_edge_exist=match_edge_exist,
-            match_edge_topk=match_edge_topk,
             focal_alpha=focal_alpha,
             focal_gamma=focal_gamma,
+            max_train_pairs=max_train_pairs,
+            neg_ratio=neg_ratio,
+            knn_k=knn_k,
             num_curve_points=eval_num_per_edge,
         )
 
@@ -378,7 +386,7 @@ class PC2WireframeModule(_BaseModule):
         out = self.model(
             batch["point_cloud"], batch["pc_offset"], sample=(stage == "train"))
         targets = build_targets(batch)
-        total, parts = self.criterion(out["preds"], targets, self.model.curve_vae)
+        total, parts = self.criterion(out["preds"], targets, self.model)
 
         # KL on the PC-encoder latent (only when variational).
         if out["logvar"] is not None:
@@ -403,6 +411,9 @@ class PC2WireframeModule(_BaseModule):
             out["preds"],
             vertex_threshold=self.hparams.vertex_threshold,
             edge_threshold=self.hparams.edge_threshold,
+            knn_k=self.hparams.knn_k,
+            infer_max_pairs=self.hparams.infer_max_pairs,
+            topk_pairs=self.hparams.topk_pairs,
             num_points=self.hparams.eval_num_per_edge,
         )
         self.val_metrics.update(preds_wf, _gt_wireframes(batch))
@@ -429,6 +440,9 @@ class PC2WireframeModule(_BaseModule):
             out["preds"],
             vertex_threshold=self.hparams.vertex_threshold,
             edge_threshold=self.hparams.edge_threshold,
+            knn_k=self.hparams.knn_k,
+            infer_max_pairs=self.hparams.infer_max_pairs,
+            topk_pairs=self.hparams.topk_pairs,
             num_points=self.hparams.eval_num_per_edge,
         )
         if "pc_center" in batch:

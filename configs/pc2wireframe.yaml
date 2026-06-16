@@ -34,16 +34,20 @@ model:
       compressor_layers: 2     # post-pooling Transformer decoder layers on the 16 latent tokens
       variational: true
 
-    # ----- transformer wireframe decoder (node set + edge set) -----
+    # ----- transformer wireframe decoder (node set + relation token) -----
     decoder:
       num_node_queries: 512     # >= data.yaml max_vertices
-      num_edge_queries: 1024    # >= data.yaml max_edges
+      num_rln_tokens: 1         # Relationformer global relation token(s)
       d_model: 512
       nhead: 8
       dim_ff: 2048
       node_layers: 6
-      edge_layers: 4
-      endpoint_dim: 128
+      dropout: 0.1
+
+    # ----- Relationformer pairwise edge head (alive + curve latent) -----
+    edge_head:
+      hidden: 512
+      num_layers: 3
       dropout: 0.1
 
     # ----- frozen curve VAE -- MUST match the stage-1 architecture -----
@@ -61,23 +65,25 @@ model:
     kl_weight: 1.0e-4         # KL on the PC-encoder latent
     node_coord_weight: 5.0    # matched-node coordinate L1
     node_exist_weight: 1.0    # node existence BCE
-    edge_exist_weight: 2.0    # edge existence Focal BCE
-    endpoint_weight: 1.0      # endpoint-distribution cross-entropy
-    curve_weight: 2.0         # matched-edge curve L1 (canonical frame)
-    topo_degree_weight: 0.5   # soft per-node degree consistency
-    topo_dedup_weight: 0.5    # soft simple-graph dedup / self-loop penalty
-    aux_weight: 1.0           # deep-supervision weight on intermediate decoder layers
+    edge_exist_weight: 2.0    # pairwise edge alive Focal BCE
+    curve_weight: 2.0         # positive-pair curve L1 (canonical frame)
+    aux_weight: 1.0           # deep-supervision weight on intermediate node layers
     focal_alpha: 0.25
     focal_gamma: 2.0
     match_node_coord: 5.0     # node Hungarian cost: coord weight
     match_node_exist: 1.0     # node Hungarian cost: existence bonus
-    match_edge_exist: 0.5     # edge Hungarian cost: existence weight
-    match_edge_topk: 64       # edge match candidates per GT edge (0 = full Ne x ne)
     node_exist_pos_weight: 10.0
+
+    # ----- pairwise edge candidate sampling (training) -----
+    max_train_pairs: 2048     # cap on candidate pairs per sample
+    neg_ratio: 3.0            # negatives per positive (half random, half kNN-hard)
+    knn_k: 8                  # kNN for hard negatives
 
     # ----- inference / val reconstruction thresholds -----
     vertex_threshold: 0.5
     edge_threshold: 0.5
+    infer_max_pairs: 40000    # enumerate all pairs below this; else kNN shortlist
+    topk_pairs: 0             # optional cap on kept edges (0 = no cap)
 
     # ----- eval metric: CCD / TA / VPE -> weighted final score (val/score) -----
     eval_w_ccd: 0.3

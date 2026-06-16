@@ -405,9 +405,19 @@ class WireframeGraphDataset(Dataset):
             v = get_vertex_id(end[i])
             if u is None or v is None or u == v:
                 continue
+            poly = _resample_polyline(raw_edge_points[i], fmt.num_edge_points)
+            # Deterministic orientation rule: the "start" endpoint A is the
+            # vertex with the lexicographically smaller (x, y, z) coordinate.
+            # Because the pairwise edge head scores undirected pairs, fixing the
+            # curve direction here (and reversing the polyline to match) keeps
+            # the canonical curve frame consistent between training and the
+            # coordinate-ordered inference reconstruction (no curve-direction
+            # special-casing downstream).
+            if vertices[u].tolist() > vertices[v].tolist():
+                u, v = v, u
+                poly = np.ascontiguousarray(poly[::-1])
             edge_index.append((u, v))
-            edge_points.append(_resample_polyline(
-                raw_edge_points[i], fmt.num_edge_points))
+            edge_points.append(poly)
 
         nv = len(vertices)
         ne = len(edge_index)

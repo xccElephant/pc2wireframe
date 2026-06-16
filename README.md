@@ -20,7 +20,7 @@
 | 阶段 | 模块 | 作用 | config |
 | --- | --- | --- | --- |
 | Stage 1 | **Curve VAE** (`AutoencoderKL1D`) | 把单条**规范化曲线**编码成 12 维 token latent，并可在任意参数 `t` 处解码 | `configs/curve_vae.yaml` |
-| Stage 2 | **PC2Wireframe** (PTv3 + Latent Compressor + Transformer Decoder) | 点云直接预测 wireframe：PTv3 提特征 → cross-attn 压缩成 `16×256` latent → Transformer 解码器并行预测节点集 + 边集（含曲线 latent）；**Curve VAE 全程冻结**，仅用来解码曲线 | `configs/pc2wireframe.yaml` |
+| Stage 2 | **PC2Wireframe** (PTv3 + Latent Compressor + Transformer Decoder + 成对边头) | 点云直接预测 wireframe：PTv3 提特征 → cross-attn 压缩成 `16×256` latent → Transformer 解码器预测节点集（DETR query）→ Relationformer 式关系头对**顶点对**打分出边（含曲线 latent）；**Curve VAE 全程冻结**，仅用来解码曲线 | `configs/pc2wireframe.yaml` |
 
 `16 × 256 = 4096` floats，正好是比赛的 latent 预算上限。
 
@@ -35,22 +35,22 @@
 
 ## PC2Wireframe
 
-端到端地把点云解码成 wireframe，**不再有独立的 wireframe VAE / teacher posterior**——直接对预测出的图做集合监督。参考官方基线，但把"候选对 + 贪心匹配"换成了 DETR 风格的**学习查询 + 全局匈牙利匹配**：
+端到端地把点云解码成 wireframe，**不再有独立的 wireframe VAE / teacher posterior**——直接对预测出的图做集合监督。**顶点侧**沿用 DETR 风格的**学习查询 + 全局匈牙利匹配**；**边侧**改用 [Relationformer (ECCV 2022)](https://arxiv.org/abs/2203.10202) 式的**成对预测**：直接对（存活）顶点对算存在性 + 曲线 latent，端点就是该对的两个顶点索引，从根本上消除"上千 edge query 全局匹配训不动"的问题（不再有 edge query / 指针端点 / 边匈牙利匹配）。
 
 - **编码**：PTv3 backbone 提取逐体素点云特征；`16` 个可学 query 先通过 cross-attention 把它们汇聚成 16 个 token，再经 **2 层标准 Transformer decoder**（token 间 self-attn + cross-attn 回 PTv3 特征 + FFN，Perceiver 式）细化，最后投影成 `(B, 16, 256)` 的高斯后验 latent（保留小 KL 正则，提交时用 `mu`）。
-- **解码器**：隐变量 token 投影后作为 cross-attention 的 **memory**。
-  - **节点**：`num_node_queries=512` 个学习查询并行 cross-attend 到 memory，两个头分别预测每个节点的**坐标**与**存在置信度**（免数数的节点集）；坐标走 **Deformable-DETR 式迭代细化**——每层在 inverse-sigmoid 空间对参考点叠加一个 delta，逐层逼近而非末层一次回归。
-  - **边**：`num_edge_queries=1024` 个边查询先 self-attn，再 cross-attend 到 latent memory，最后 cross-attend 到**节点特征**；预测每条边的**存在性**、两个**端点分布**（指针式 `edge_q · node_k` 在节点查询上的 softmax）以及一个**逐边曲线 latent**。
-  - **曲线**：边查询输出的曲线 latent 喂给**冻结的 Stage-1 Curve VAE**，在端点线性插值基线上解码出残差折线（规范帧），推理时再 denorm 到预测端点上。
-- **训练（集合预测）**：先用**匈牙利匹配**把节点查询对齐到 GT 顶点（坐标 L1 代价），再以该匹配为基准把边查询对齐到 GT 边（存在性 + 端点 log 概率代价）。在匹配空间监督：
+- **节点解码器**：隐变量 token 投影后作为 cross-attention 的 **memory**。`num_node_queries=512` 个学习查询 + `num_rln_tokens` 个可学 **`[rln]` token** 一起 self-attn，再 cross-attend 回 memory；节点查询的两个头分别预测每个节点的**坐标**与**存在置信度**（免数数的节点集），坐标走 **Deformable-DETR 式迭代细化**（每层在 inverse-sigmoid 空间对参考点叠加 delta，逐层逼近）；`[rln]` token 不带坐标，专门承载全局关系/拓扑上下文，喂给成对边头。
+- **成对边头（`RelationEdgeHead`）**：对候选顶点对 `(i, j)` 构造对称表征 `pair_repr = [o_i + o_j, |o_i − o_j|, r, p_i, p_j, p_i − p_j]`（`o` 节点 token、`r` 全局 `[rln]` token、`p` 预测坐标），过 3 层 MLP(+LayerNorm) 出 **alive 存在性** + **曲线 latent**（两头共享 trunk）。`o_i+o_j / |o_i−o_j|` 天然对称满足无向，`r` 注入 baseline 纯 `MLP([o_i,o_j])` 所缺的全局上下文。
+  - **训练候选**：全部 GT 正样本对（来自节点匹配）+ `neg_ratio` 倍负样本（一半随机、一半 kNN 难负），上限 `max_train_pairs`。
+  - **推理候选**：`V*(V-1)/2 ≤ infer_max_pairs` 时全枚举，否则取各点 kNN 并集。
+  - **曲线**：成对头输出的曲线 latent 喂给**冻结的 Stage-1 Curve VAE**，在端点线性插值基线上解码出残差折线（规范帧），推理时再 denorm 到预测端点上。
+- **训练（集合预测 + 成对监督）**：先用**匈牙利匹配**把节点查询对齐到 GT 顶点（坐标 L1 代价），每条 GT 边即映射为一对**匹配上的 query**（正样本对）；按上述策略采样候选对后用关系头打分。监督：
   - 节点坐标 **L1** + 节点存在 **加权 BCE**；
-  - 边存在性 **Focal BCE**（处理边的正负样本极端不平衡）；
-  - 端点分布 **交叉熵**（在节点查询上的指针分类）；
-  - 匹配边的曲线 **L1**（规范帧内，对齐冻结 Curve VAE 的解码）。
-- **深监督（deep supervision）**：节点 / 边解码栈的每个中间层都经共享 head 出预测并参与 loss（`aux_weight` 加权）；匈牙利匹配只在最终层算一次并缓存复用到所有 aux 层，比逐层重匹配更省、目标更稳，配合迭代细化加速收敛。
-- **边方向**：沿用数据集的有向 `(start, end)` 约定，端点-A 目标与规范曲线朝向天然一致，推理时端点 A→B 顺序即解码顺序。
+  - 候选对的 alive **Focal BCE**（处理边的正负样本极端不平衡）；
+  - 正样本对的曲线 **L1**（规范帧内，对齐冻结 Curve VAE 的解码）。
+- **深监督（deep supervision）**：节点解码栈的每个中间层都经共享 head 出预测并参与 loss（`aux_weight` 加权）；匈牙利匹配只在最终层算一次并缓存复用到所有 aux 层，比逐层重匹配更省、目标更稳，配合迭代细化加速收敛。
+- **边方向（确定性规则）**：评分对边是**无向**的，故用一条确定性定向规则处理曲线方向——`A = 坐标字典序较小的端点`（x→y→z）。数据集在 `_load_graph` 里就按该规则重排每条 GT 边的 `(start, end)` 与 polyline 再 `normalize_curves`，推理时对预测端点套同一规则后 denorm，训练/推理一致、下游零额外处理。
 
-模型见 `src/models/{pc_encoder,wireframe_decoder,pc2wireframe}.py`，匹配 / 损失见 `src/models/criterion.py`，数据打包见 `src/models/packing.py`。
+模型见 `src/models/{pc_encoder,wireframe_decoder,edge_decoder,pc2wireframe}.py`，匹配 / 损失见 `src/models/criterion.py`，数据打包见 `src/models/packing.py`。
 
 ### 重建效果 (200 Epoch)
 
@@ -90,7 +90,7 @@ python scripts/clean_wireframe.py all \
 | 顶点 | 162→154 | 420→359 | 1066→783 | 1812→1208 | 7121→2918 |
 | 边 | 254→210 | 663→451 | 1653→920 | 2760→1359 | 10381→3001 |
 
-**接入训练**：`configs/data.yaml` 已指向 `train_clean/sample_edge`，并用独立的 `data/split_clean.json`（split 文件存的是完整路径，不能复用旧 split；`auto_build_split=true` 首次运行自动重建）。点云不处理——清洗只改 edge，文件名不变，仍按 stem 命中 `train/sample_pointcloud`。cap / query 按清洗后分布设为 `max_vertices=512 / max_edges=1024`，对应 `num_node_queries=512 / num_edge_queries=1024`。
+**接入训练**：`configs/data.yaml` 已指向 `train_clean/sample_edge`，并用独立的 `data/split_clean.json`（split 文件存的是完整路径，不能复用旧 split；`auto_build_split=true` 首次运行自动重建）。点云不处理——清洗只改 edge，文件名不变，仍按 stem 命中 `train/sample_pointcloud`。cap 按清洗后分布设为 `max_vertices=512 / max_edges=1024`，节点查询对应 `num_node_queries=512`（边不再用 query，改为成对预测，故无 `num_edge_queries`）。
 
 
 ## 训练

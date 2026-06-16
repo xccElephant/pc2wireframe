@@ -164,6 +164,9 @@ def run_eval(model: PC2WireframeModule, loader, device: str, max_samples: int,
             out["preds"],
             vertex_threshold=vertex_threshold,
             edge_threshold=edge_threshold,
+            knn_k=int(model.hparams.knn_k),
+            infer_max_pairs=int(model.hparams.infer_max_pairs),
+            topk_pairs=int(model.hparams.topk_pairs),
             num_points=num_per_edge,
         )
         for gt, pred in zip(gts, preds):

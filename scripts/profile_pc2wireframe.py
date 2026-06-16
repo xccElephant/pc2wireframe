@@ -203,7 +203,7 @@ def run(args) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable params: {n_params/1e6:.1f}M  "
           f"latent={enc.compressor.num_tokens}x{enc.compressor.latent_dim}  "
-          f"node_q={model.decoder.num_node_queries} edge_q={model.decoder.num_edge_queries}")
+          f"node_q={model.decoder.num_node_queries} rln={model.decoder.num_rln_tokens}")
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-4)
@@ -248,7 +248,7 @@ def run(args) -> None:
                 from src.models.packing import build_targets
                 targets = build_targets(batch)
             with stop("criterion"):
-                total, parts = module.criterion(preds, targets, model.curve_vae)
+                total, parts = module.criterion(preds, targets, model)
                 if logvar is not None:
                     total = total + module.hparams.kl_weight * (
                         -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp()))
