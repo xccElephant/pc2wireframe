@@ -29,8 +29,7 @@ model:
       latent_num: 16
       latent_dim: 256
       compressor_heads: 8
-      compressor_layers: 2
-      variational: false        # deterministic latent (z = mu, no KL)
+      compressor_layers: 1
 
     # ----- RF velocity network (point-set DiT) -----
     rf_net:

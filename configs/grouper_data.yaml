@@ -1,0 +1,39 @@
+data:
+  class_path: src.data.WireframeGrouperDataModule
+  init_args:
+    # ----- paths (relative to project root); shared with the RF stage -----
+    data_root: data
+    train_edge_subdir: train/sample_edge
+    train_pointcloud_subdir: train/sample_pointcloud
+    predict_pointcloud_subdir: test/sample_pointcloud
+    split_path: data/split.json
+    recursive_glob: false
+
+    # ----- train/val split (reuses the RF-stage split file) -----
+    use_val: true
+    auto_build_split: true
+    train_ratio: 0.9
+    split_seed: 42
+
+    # ----- graph / point-cloud / RF-target format (must match the RF stage) -----
+    vertex_merge_tol: 0.0001
+    max_vertices: 0
+    max_edges: 0
+    num_edge_points: 32
+    max_pc_points: 0
+    wf_num_points: 8192
+    min_edges: 1
+    max_load_retries: 64
+
+    # ----- grouper input augmentation (bridges clean GT -> noisy RF output) -----
+    # Applied to the TRAIN split only; val stays clean for honest metrics.
+    jitter_std: 0.005        # per-point Gaussian xyz jitter (normalized frame)
+    type_noise_std: 0.05     # Gaussian noise on the (0/1) type channel
+
+    # ----- data loader -----
+    shuffle: true
+    num_workers: 8
+    batch_size: 64
+    pin_memory: true
+    prefetch_factor: 2
+    persistent_workers: true

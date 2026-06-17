@@ -8,9 +8,11 @@ without the full dependency set installed.
 from .latent_compressor import LatentCompressor
 from .pc_encoder import PCEncoder
 from .rf_pointset import RFPointSetVelocity
+from .wireframe_grouper import WireframeGrouper
 
 __all__ = [
     "LatentCompressor",
     "PCEncoder",
     "RFPointSetVelocity",
+    "WireframeGrouper",
 ]

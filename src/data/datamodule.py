@@ -33,7 +33,9 @@ from torch.utils.data import DataLoader
 from .dataset import (
     PointCloudDataset,
     WireframeGraphDataset,
+    WireframePointDataset,
     collate_rf_batch,
+    collate_grouper_batch,
 )
 
 
@@ -88,6 +90,9 @@ class WireframeDataModule(pl.LightningDataModule):
     def _pointcloud_dirs(self) -> list[str]:
         return [self._path(self.hparams.train_pointcloud_subdir)]
 
+    # Collate used by all dataloaders; subclasses override (e.g. stage 2).
+    collate_fn = staticmethod(collate_rf_batch)
+
     def _make_graph_dataset(self, split: str) -> WireframeGraphDataset:
         return WireframeGraphDataset(
             split=split,
@@ -134,6 +139,20 @@ class WireframeDataModule(pl.LightningDataModule):
     # ------------------------------------------------------------------
     # dataloaders
     # ------------------------------------------------------------------
+    @staticmethod
+    def _seed_worker(worker_id: int) -> None:
+        """Give each DataLoader worker a distinct numpy seed.
+
+        The datasets draw arc-length samples / augmentation noise with numpy's
+        global RNG; forked workers otherwise inherit one identical seed and
+        produce correlated "random" draws. Re-seeding from the worker's torch
+        seed (which Lightning advances per epoch) decorrelates them.
+        """
+        import numpy as np
+        import torch
+
+        np.random.seed(torch.initial_seed() % 2**32)
+
     def _loader_kwargs(self) -> dict:
         nw = self.hparams.num_workers
         return dict(
@@ -141,6 +160,7 @@ class WireframeDataModule(pl.LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             prefetch_factor=self.hparams.prefetch_factor if nw > 0 else None,
             persistent_workers=self.hparams.persistent_workers and nw > 0,
+            worker_init_fn=self._seed_worker if nw > 0 else None,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -149,7 +169,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=self.hparams.shuffle,
             drop_last=True,
-            collate_fn=collate_rf_batch,
+            collate_fn=self.collate_fn,
             **self._loader_kwargs(),
         )
 
@@ -162,7 +182,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=collate_rf_batch,
+            collate_fn=self.collate_fn,
             **self._loader_kwargs(),
         )
 
@@ -172,7 +192,7 @@ class WireframeDataModule(pl.LightningDataModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             drop_last=False,
-            collate_fn=collate_rf_batch,
+            collate_fn=self.collate_fn,
             **self._loader_kwargs(),
         )
 
@@ -181,4 +201,58 @@ class WireframeDataModule(pl.LightningDataModule):
         return self.predict_dataloader()
 
 
-__all__ = ["WireframeDataModule"]
+class WireframeGrouperDataModule(WireframeDataModule):
+    """Data module for the wireframe grouper: GT wireframe point sets + labels.
+
+    Identical split / path handling to :class:`WireframeDataModule`, but the
+    train / val datasets emit the *labelled* point set
+    (:class:`WireframePointDataset`) and use :func:`collate_grouper_batch`.
+    Two extra knobs control the input augmentation that bridges the gap to the
+    noisy RF-stage output (``jitter_std`` / ``type_noise_std``); augmentation
+    is applied to the train split only (val stays clean for honest metrics).
+
+    The ``predict`` dataloader is inherited unchanged (point-cloud-only); the
+    grouper is normally run on the RF stage's emitted point sets rather than
+    from raw point clouds, so prediction wiring is left to the caller.
+    """
+
+    collate_fn = staticmethod(collate_grouper_batch)
+
+    def __init__(
+        self,
+        *,
+        jitter_std: float = 0.005,
+        type_noise_std: float = 0.05,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        # The parent's __init__ already saved all shared hparams; only add the
+        # two grouper-specific ones (avoid recapturing **kwargs as a dict).
+        self.save_hyperparameters("jitter_std", "type_noise_std")
+
+    def _make_graph_dataset(self, split: str) -> WireframePointDataset:
+        # Augment the train split only; keep val clean.
+        aug = split in ("train", "all", "trainval")
+        return WireframePointDataset(
+            split=split,
+            split_path=self.hparams.split_path,
+            edge_dir=self._path(self.hparams.train_edge_subdir),
+            pointcloud_dirs=self._pointcloud_dirs,
+            train_ratio=self.hparams.train_ratio,
+            split_seed=self.hparams.split_seed,
+            recursive_glob=self.hparams.recursive_glob,
+            auto_build_split=self.hparams.auto_build_split,
+            vertex_merge_tol=self.hparams.vertex_merge_tol,
+            max_vertices=self.hparams.max_vertices,
+            max_edges=self.hparams.max_edges,
+            num_edge_points=self.hparams.num_edge_points,
+            max_pc_points=self.hparams.max_pc_points,
+            wf_num_points=self.hparams.wf_num_points,
+            min_edges=self.hparams.min_edges,
+            max_load_retries=self.hparams.max_load_retries,
+            jitter_std=self.hparams.jitter_std if aug else 0.0,
+            type_noise_std=self.hparams.type_noise_std if aug else 0.0,
+        )
+
+
+__all__ = ["WireframeDataModule", "WireframeGrouperDataModule"]

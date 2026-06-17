@@ -1,0 +1,91 @@
+# Wireframe grouper -- the learned replacement for the fragile traditional
+# reconstruction. Trains on GT wireframe point sets (+ augmentation to simulate
+# the RF stage's noise); no point-cloud encoder involved.
+#
+# Run with:
+#   python -m src.main fit --config configs/grouper_data.yaml --config configs/grouper.yaml
+#
+# point set (xyz, type) -> WireframeGrouper (point transformer) -> per-point
+# {vertex_score, vertex_offset, endpoint_offset, embedding, arclen}
+# -> group_wireframe decode -> wireframe -> CCD / TA / VPE.
+seed_everything: 3407
+
+model:
+  class_path: src.module.WireframeGrouperModule
+  init_args:
+    # ----- grouper network (stock TransformerEncoder backbone + per-point heads)
+    grouper:
+      point_dim: 4            # (x, y, z, type)
+      d_model: 256
+      depth: 6
+      nhead: 8
+      mlp_ratio: 4.0
+      dropout: 0.0
+      embed_dim: 8            # instance-embedding dimension
+
+    # ----- loss weights -----
+    w_score: 1.0              # vertex/edge classification (BCE)
+    w_vertex: 1.0             # vertex-centre voting (smooth-L1)
+    w_endpoint: 1.0           # endpoint voting (order-invariant smooth-L1)
+    w_arclen: 1.0             # arc-length regression (MSE)
+    w_embed: 0.2              # discriminative instance embedding (kept small:
+                              # vertex/endpoint/arclen heads drive the metric)
+    embed_delta_var: 0.5      # pull margin (De Brabandere et al.)
+    embed_delta_dist: 1.5     # push margin
+
+    # ----- decode (validation) -----
+    vertex_thresh: 0.5        # sigmoid(vertex_score) >= thr -> vertex point
+    vertex_merge_radius: 0.01 # vertex DBSCAN eps; with vertex_merge_relative
+    vertex_merge_relative: true  # = fraction of the point-set bbox diagonal
+    split_by_embedding: true  # split same-endpoint edges via embedding DBSCAN
+    embed_eps: 0.5            # DBSCAN eps in embedding space (~delta_dist)
+    min_edge_points: 3        # drop edges with fewer supporting points
+    num_per_edge: 32          # points per reconstructed edge curve
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+
+    # ----- optimization -----
+    # LR ~sqrt(4)x the batch-16 base (batch is now 64).
+    lr: 6.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: wireframe_grouper
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

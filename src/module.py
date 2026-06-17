@@ -30,7 +30,8 @@ import torch.nn.functional as F
 from .metrics import WireframeScore
 from .models.pc_encoder import PCEncoder
 from .models.rf_pointset import RFPointSetVelocity
-from .recon import reconstruct_wireframe
+from .models.wireframe_grouper import WireframeGrouper, grouper_loss
+from .recon import group_wireframe, reconstruct_wireframe
 
 
 # ----------------------------------------------------------------------
@@ -55,9 +56,7 @@ def _default_pc_encoder() -> dict[str, Any]:
         latent_num=16,
         latent_dim=256,
         compressor_heads=8,
-        compressor_layers=2,
-        # Deterministic latent for the compression setting (z = mu, no KL).
-        variational=False,
+        compressor_layers=1,
     )
 
 
@@ -71,6 +70,18 @@ def _default_rf_net() -> dict[str, Any]:
         mlp_ratio=4.0,
         dropout=0.0,
         grad_checkpoint=False,
+    )
+
+
+def _default_grouper() -> dict[str, Any]:
+    return dict(
+        point_dim=4,
+        d_model=256,
+        depth=6,
+        nhead=8,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        embed_dim=8,
     )
 
 
@@ -190,13 +201,12 @@ class RFWireframeModule(_BaseModule):
 
     # ------------------------------------------------------------------
     def encode(self, batch: dict[str, Any]) -> torch.Tensor:
-        """Deterministic latent ``z = mu`` of shape ``(B, K, D)``.
+        """Latent ``z`` of shape ``(B, K, D)``.
 
         Consumes the packed point cloud ``batch["point_cloud"] (P_sum, 3)`` +
         ``batch["pc_offset"] (B,)``.
         """
-        mu, _ = self.encoder(batch["point_cloud"], batch["pc_offset"])
-        return mu
+        return self.encoder(batch["point_cloud"], batch["pc_offset"])
 
     def training_step(self, batch, batch_idx):
         z = self.encode(batch)
@@ -303,4 +313,154 @@ class RFWireframeModule(_BaseModule):
             wf["edge_points"] = wf["edge_points"] * scale + center
 
 
-__all__ = ["RFWireframeModule"]
+# ----------------------------------------------------------------------
+# Wireframe grouper module (learned point-set -> wireframe read-out)
+# ----------------------------------------------------------------------
+class WireframeGrouperModule(_BaseModule):
+    """Learned read-out: a wireframe point set ``(N, 4)`` -> explicit wireframe.
+
+    Trains :class:`WireframeGrouper` on the labelled point set produced by
+    ``WireframeGrouperDataModule`` (per-point vertex/edge mask, edge id,
+    arc-length, endpoints, vertex target). Decoding at validation time uses
+    :func:`src.recon.group_wireframe` and scores against the native GT graph
+    with the same CCD / TA / VPE proxy as the RF stage, so ``val/score`` is
+    directly comparable to the traditional-reconstruction baseline.
+
+    This module is standalone: it consumes wireframe point sets, not raw point
+    clouds, so it can be trained on GT point sets without the RF encoder. At
+    inference it is fed the RF stage's ODE-sampled point set.
+    """
+
+    def __init__(
+        self,
+        # ----- model -----
+        grouper: dict[str, Any] | None = None,
+        # ----- loss weights -----
+        w_score: float = 1.0,
+        w_vertex: float = 1.0,
+        w_endpoint: float = 1.0,
+        w_arclen: float = 1.0,
+        w_embed: float = 1.0,
+        embed_delta_var: float = 0.5,
+        embed_delta_dist: float = 1.5,
+        # ----- decode (validation) -----
+        vertex_thresh: float = 0.5,
+        vertex_merge_radius: float = 0.01,
+        vertex_merge_relative: bool = True,
+        split_by_embedding: bool = True,
+        embed_eps: float = 0.5,
+        min_edge_points: int = 3,
+        num_per_edge: int = 32,
+        # ----- eval metric -----
+        eval_w_ccd: float = 0.3,
+        eval_w_ta: float = 0.4,
+        eval_w_vpe: float = 0.3,
+        eval_ccd_tau: float = 0.1,
+        eval_vpe_tau: float = 0.1,
+        eval_match_thresh: float = 0.1,
+        # ----- optimization -----
+        lr: float = 3e-4,
+        weight_decay: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.95),
+        warmup_steps: int = 500,
+        max_steps: int = 100_000,
+        grad_clip: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.net = WireframeGrouper(**(grouper or _default_grouper()))
+        self.val_metrics = WireframeScore(
+            w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
+            ccd_tau=eval_ccd_tau, vpe_tau=eval_vpe_tau,
+            match_thresh=eval_match_thresh, num_per_edge=num_per_edge,
+        )
+
+    def _loss(self, out, batch) -> dict[str, torch.Tensor]:
+        return grouper_loss(
+            out, batch,
+            w_score=self.hparams.w_score,
+            w_vertex=self.hparams.w_vertex,
+            w_endpoint=self.hparams.w_endpoint,
+            w_arclen=self.hparams.w_arclen,
+            w_embed=self.hparams.w_embed,
+            embed_kwargs=dict(
+                delta_var=self.hparams.embed_delta_var,
+                delta_dist=self.hparams.embed_delta_dist,
+            ),
+        )
+
+    def training_step(self, batch, batch_idx):
+        out = self.net(batch["wf_points"])
+        losses = self._loss(out, batch)
+        bs = batch["wf_points"].shape[0]
+        self.log("train/loss", losses["loss"], batch_size=bs,
+                 prog_bar=True, sync_dist=True)
+        self.log_dict(
+            {f"train/{k}": v for k, v in losses.items() if k != "loss"},
+            batch_size=bs, sync_dist=True,
+        )
+        return losses["loss"]
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def decode(self, out: dict[str, torch.Tensor], pts: torch.Tensor
+               ) -> list[dict[str, Any]]:
+        """Decode a batch of per-point fields into wireframes (numpy)."""
+        xyz = pts[..., :3].detach().cpu().numpy()
+        vs = out["vertex_score"].detach().cpu().numpy()
+        voff = out["vertex_offset"].detach().cpu().numpy()
+        eoff = out["endpoint_offset"].detach().cpu().numpy()
+        emb = out["embedding"].detach().cpu().numpy()
+        arclen = out["arclen"].detach().cpu().numpy()
+        wfs: list[dict[str, Any]] = []
+        for i in range(xyz.shape[0]):
+            wfs.append(group_wireframe(
+                {
+                    "xyz": xyz[i],
+                    "vertex_score": vs[i],
+                    "vertex_offset": voff[i],
+                    "endpoint_offset": eoff[i],
+                    "embedding": emb[i],
+                    "arclen": arclen[i],
+                },
+                vertex_thresh=self.hparams.vertex_thresh,
+                vertex_merge_radius=self.hparams.vertex_merge_radius,
+                merge_relative=self.hparams.vertex_merge_relative,
+                split_by_embedding=self.hparams.split_by_embedding,
+                embed_eps=self.hparams.embed_eps,
+                min_edge_points=self.hparams.min_edge_points,
+                num_per_edge=self.hparams.num_per_edge,
+            ))
+        return wfs
+
+    @staticmethod
+    def _gt_to_numpy(gt_wireframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "vertices": g["vertices"].detach().cpu().numpy(),
+                "edge_index": g["edge_index"].detach().cpu().numpy(),
+                "edge_points": g["edge_points"].detach().cpu().numpy(),
+            }
+            for g in gt_wireframes
+        ]
+
+    def validation_step(self, batch, batch_idx):
+        out = self.net(batch["wf_points"])
+        losses = self._loss(out, batch)
+        self.log("val/loss", losses["loss"],
+                 batch_size=batch["wf_points"].shape[0], sync_dist=True)
+        preds = self.decode(out, batch["wf_points"])
+        self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
+
+    def on_validation_epoch_end(self) -> None:
+        res = self.val_metrics.compute()
+        self.log_dict(
+            {f"val/{k}": v for k, v in res.items() if k != "score"},
+            prog_bar=False, sync_dist=False,
+        )
+        self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
+        self.val_metrics.reset()
+
+
+__all__ = ["RFWireframeModule", "WireframeGrouperModule"]

@@ -227,6 +227,146 @@ def _build_wf_target(
     return out
 
 
+def _sample_arclength_labeled(
+    edge_points: np.ndarray, num: int
+) -> dict[str, np.ndarray]:
+    """Global arc-length sampling that also returns per-point structure labels.
+
+    Same sampling distribution as :func:`_sample_arclength` (every consecutive
+    segment across all edges pooled into one arc-length parameterisation) but
+    additionally records, for each sampled point, the **source edge id**, its
+    normalised **arc-length position** ``t in [0, 1]`` along that edge, and the
+    edge's two **endpoint** coordinates (the first / last polyline points).
+    These are the supervision targets the stage-2 grouper regresses.
+
+    Returns a dict of ``num``-length arrays: ``points (num,3)``,
+    ``edge_id (num,)``, ``arclen (num,)``, ``endpoint_a/b (num,3)``.
+    """
+    eps = 1e-12
+    pts = np.asarray(edge_points, dtype=np.float64).reshape(
+        -1, edge_points.shape[1], 3)
+    e, u = pts.shape[0], pts.shape[1]
+    out = {
+        "points": np.zeros((num, 3), dtype=np.float32),
+        "edge_id": np.full(num, -1, dtype=np.int64),
+        "arclen": np.zeros(num, dtype=np.float32),
+        "endpoint_a": np.zeros((num, 3), dtype=np.float32),
+        "endpoint_b": np.zeros((num, 3), dtype=np.float32),
+    }
+    if num <= 0 or e == 0 or u == 0:
+        return out
+
+    ea = pts[:, 0, :]   # (E, 3) edge endpoint a
+    eb = pts[:, -1, :]  # (E, 3) edge endpoint b
+
+    def _fill_from_flat(idx: np.ndarray, eid: np.ndarray) -> dict[str, np.ndarray]:
+        flat = pts.reshape(-1, 3)
+        out["points"] = flat[idx].astype(np.float32)
+        out["edge_id"] = eid.astype(np.int64)
+        out["endpoint_a"] = ea[eid].astype(np.float32)
+        out["endpoint_b"] = eb[eid].astype(np.float32)
+        return out
+
+    if u == 1:
+        idx = np.random.choice(e, num, replace=e < num)
+        return _fill_from_flat(idx, idx)
+
+    seg_start = pts[:, :-1, :]            # (E, U-1, 3)
+    seg_vec = pts[:, 1:, :] - seg_start   # (E, U-1, 3)
+    seg_len = np.linalg.norm(seg_vec, axis=2)        # (E, U-1)
+    edge_len = seg_len.sum(axis=1)                   # (E,)
+    seg_cum_prev = np.cumsum(seg_len, axis=1) - seg_len  # (E, U-1)
+
+    flat_len = seg_len.reshape(-1)        # (E*(U-1),)
+    total = float(flat_len.sum())
+    if total <= eps:
+        flat = pts.reshape(-1, 3)
+        idx = np.random.choice(flat.shape[0], num, replace=flat.shape[0] < num)
+        return _fill_from_flat(idx, idx // u)
+
+    cum = np.cumsum(flat_len)
+    cum_prev = cum - flat_len
+    u_pos = np.random.uniform(0.0, total, size=num)
+    seg_idx = np.clip(
+        np.searchsorted(cum, u_pos, side="right"), 0, flat_len.shape[0] - 1)
+    local = (u_pos - cum_prev[seg_idx]) / np.maximum(flat_len[seg_idx], eps)
+
+    seg_start_flat = seg_start.reshape(-1, 3)
+    seg_vec_flat = seg_vec.reshape(-1, 3)
+    sampled = seg_start_flat[seg_idx] + local[:, None] * seg_vec_flat[seg_idx]
+
+    n_seg = u - 1
+    edge_id = seg_idx // n_seg
+    within = seg_idx % n_seg
+    dist_along = seg_cum_prev[edge_id, within] + local * seg_len[edge_id, within]
+    t = dist_along / np.maximum(edge_len[edge_id], eps)
+
+    out["points"] = sampled.astype(np.float32)
+    out["edge_id"] = edge_id.astype(np.int64)
+    out["arclen"] = t.astype(np.float32)
+    out["endpoint_a"] = ea[edge_id].astype(np.float32)
+    out["endpoint_b"] = eb[edge_id].astype(np.float32)
+    return out
+
+
+def _build_wf_target_labeled(
+    vertices: np.ndarray, edge_points: np.ndarray, num_points: int
+) -> dict[str, np.ndarray]:
+    """Build the fixed-size RF point set ``(N, 4)`` *plus* stage-2 labels.
+
+    The point set is identical to :func:`_build_wf_target` (vertices as
+    ``type=1`` points, the rest arc-length-sampled edge points as ``type=0``);
+    in addition every point carries the supervision the stage-2 grouper needs:
+
+      * ``is_vertex (N,)``     -- bool mask (vertex point vs edge point);
+      * ``edge_id (N,)``       -- source edge id for edge points (``-1`` else);
+      * ``arclen (N,)``        -- arc-length position ``t`` for edge points;
+      * ``endpoint_a/b (N,3)`` -- the two endpoint coords of that edge;
+      * ``vertex_target (N,3)``-- clean vertex coord for vertex points (the
+        vertex-center voting target; under input augmentation the target stays
+        clean while the input xyz is jittered).
+    """
+    n = int(num_points)
+    pts = np.zeros((n, 4), dtype=np.float32)
+    is_vertex = np.zeros(n, dtype=bool)
+    edge_id = np.full(n, -1, dtype=np.int64)
+    arclen = np.zeros(n, dtype=np.float32)
+    endpoint_a = np.zeros((n, 3), dtype=np.float32)
+    endpoint_b = np.zeros((n, 3), dtype=np.float32)
+    vertex_target = np.zeros((n, 3), dtype=np.float32)
+
+    v = int(vertices.shape[0])
+    if v >= n:
+        idx = np.random.choice(v, n, replace=False)
+        pts[:, :3] = vertices[idx]
+        pts[:, 3] = 1.0
+        is_vertex[:] = True
+        vertex_target[:] = vertices[idx]
+    else:
+        if v > 0:
+            pts[:v, :3] = vertices
+            pts[:v, 3] = 1.0
+            is_vertex[:v] = True
+            vertex_target[:v] = vertices
+        s = _sample_arclength_labeled(edge_points, n - v)
+        pts[v:, :3] = s["points"]
+        pts[v:, 3] = 0.0
+        edge_id[v:] = s["edge_id"]
+        arclen[v:] = s["arclen"]
+        endpoint_a[v:] = s["endpoint_a"]
+        endpoint_b[v:] = s["endpoint_b"]
+
+    return {
+        "points": pts,
+        "is_vertex": is_vertex,
+        "edge_id": edge_id,
+        "arclen": arclen,
+        "endpoint_a": endpoint_a,
+        "endpoint_b": endpoint_b,
+        "vertex_target": vertex_target,
+    }
+
+
 # ----------------------------------------------------------------------
 # Graph format + file resolution
 # ----------------------------------------------------------------------
@@ -543,25 +683,17 @@ class WireframeGraphDataset(Dataset):
                 vertices = _apply_unit_cube(graph["vertices"], center, scale)
                 edge_points = _apply_unit_cube(
                     graph["edge_points"], center, scale)
-                wf_points = _build_wf_target(
-                    vertices, edge_points, self.format.wf_num_points)
 
-                return {
-                    "shape_id": os.path.splitext(
+                return self._make_item(
+                    shape_id=os.path.splitext(
                         os.path.basename(edge_path))[0],
-                    "point_cloud": torch.from_numpy(
-                        np.ascontiguousarray(pc)),
-                    "pc_center": torch.from_numpy(center),
-                    "pc_scale": torch.tensor(scale, dtype=torch.float32),
-                    "wf_points": torch.from_numpy(
-                        np.ascontiguousarray(wf_points)),
-                    "vertices": torch.from_numpy(
-                        np.ascontiguousarray(vertices)),
-                    "edge_index": torch.from_numpy(
-                        np.ascontiguousarray(graph["edge_index"])),
-                    "edge_points": torch.from_numpy(
-                        np.ascontiguousarray(edge_points)),
-                }
+                    pc=pc,
+                    center=center,
+                    scale=scale,
+                    vertices=vertices,
+                    edge_index=graph["edge_index"],
+                    edge_points=edge_points,
+                )
             except Exception as exc:
                 self._bad_files.add(edge_path)
                 if len(self._bad_files) <= 20:
@@ -571,6 +703,119 @@ class WireframeGraphDataset(Dataset):
             f"[WireframeGraphDataset] No valid sample after {max_tries} tries "
             f"(split={self.split!r}, bad_files={len(self._bad_files)})"
         )
+
+    def _make_item(
+        self,
+        *,
+        shape_id: str,
+        pc: np.ndarray,
+        center: np.ndarray,
+        scale: float,
+        vertices: np.ndarray,
+        edge_index: np.ndarray,
+        edge_points: np.ndarray,
+    ) -> dict[str, Any]:
+        """Build the per-sample dict from a normalized graph + point cloud.
+
+        Factored out of ``__getitem__`` so subclasses (e.g. the stage-2
+        ``WireframePointDataset``) can reuse the file loading / normalization
+        retry loop and only customise the emitted tensors.
+        """
+        wf_points = _build_wf_target(
+            vertices, edge_points, self.format.wf_num_points)
+        return {
+            "shape_id": shape_id,
+            "point_cloud": torch.from_numpy(np.ascontiguousarray(pc)),
+            "pc_center": torch.from_numpy(center),
+            "pc_scale": torch.tensor(scale, dtype=torch.float32),
+            "wf_points": torch.from_numpy(np.ascontiguousarray(wf_points)),
+            "vertices": torch.from_numpy(np.ascontiguousarray(vertices)),
+            "edge_index": torch.from_numpy(np.ascontiguousarray(edge_index)),
+            "edge_points": torch.from_numpy(np.ascontiguousarray(edge_points)),
+        }
+
+
+class WireframePointDataset(WireframeGraphDataset):
+    """Stage-2 dataset: the GT wireframe **point set** + per-point structure labels.
+
+    Reuses :class:`WireframeGraphDataset`'s file resolution / normalization /
+    retry loop and only changes the emitted sample: instead of the bare RF
+    target ``wf_points`` it returns the labelled target from
+    :func:`_build_wf_target_labeled` (vertex/edge mask, edge id, arc-length,
+    endpoints, vertex-center target) so the stage-2 grouper network can be
+    trained directly on GT point sets.
+
+    To bridge the gap between the clean GT point set (training) and the noisy
+    stage-1 RF output (inference), the *input* point set is optionally
+    augmented while the *labels stay clean*:
+
+      * ``jitter_std``     -- per-point Gaussian xyz jitter (normalized frame);
+      * ``type_noise_std`` -- Gaussian noise added to the ``type`` channel.
+
+    Augmentation is label-preserving (point count and per-point identity are
+    unchanged), so the fixed-size tensors still stack cleanly in the collate.
+    """
+
+    def __init__(
+        self,
+        *,
+        jitter_std: float = 0.0,
+        type_noise_std: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.jitter_std = float(jitter_std)
+        self.type_noise_std = float(type_noise_std)
+
+    def _make_item(
+        self,
+        *,
+        shape_id: str,
+        pc: np.ndarray,
+        center: np.ndarray,
+        scale: float,
+        vertices: np.ndarray,
+        edge_index: np.ndarray,
+        edge_points: np.ndarray,
+    ) -> dict[str, Any]:
+        lab = _build_wf_target_labeled(
+            vertices, edge_points, self.format.wf_num_points)
+        wf_points = lab["points"].copy()  # (N, 4) -- the (augmentable) input
+
+        if self.jitter_std > 0.0:
+            wf_points[:, :3] += np.random.normal(
+                0.0, self.jitter_std, size=wf_points[:, :3].shape
+            ).astype(np.float32)
+        if self.type_noise_std > 0.0:
+            wf_points[:, 3] = np.clip(
+                wf_points[:, 3]
+                + np.random.normal(
+                    0.0, self.type_noise_std, size=wf_points.shape[0]
+                ).astype(np.float32),
+                0.0,
+                1.0,
+            )
+
+        def _t(a: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(np.ascontiguousarray(a))
+
+        return {
+            "shape_id": shape_id,
+            "pc_center": _t(center),
+            "pc_scale": torch.tensor(scale, dtype=torch.float32),
+            "wf_points": _t(wf_points),
+            # per-point stage-2 labels (clean)
+            "lbl_is_vertex": _t(lab["is_vertex"]),
+            "lbl_edge_id": _t(lab["edge_id"]),
+            "lbl_arclen": _t(lab["arclen"]),
+            "lbl_endpoint_a": _t(lab["endpoint_a"]),
+            "lbl_endpoint_b": _t(lab["endpoint_b"]),
+            "lbl_vertex_target": _t(lab["vertex_target"]),
+            # native GT graph (for decode-time metrics)
+            "vertices": _t(vertices),
+            "edge_index": _t(edge_index),
+            "edge_points": _t(edge_points),
+        }
 
 
 class PointCloudDataset(Dataset):
@@ -669,11 +914,48 @@ def collate_rf_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return batch
 
 
+def collate_grouper_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate grouper samples: stack the fixed-size point set + per-point labels.
+
+    Every tensor here is fixed size ``(N, ...)`` (the labelled RF target), so
+    unlike the variable-size point clouds in :func:`collate_rf_batch` they all
+    stack directly into ``(B, N, ...)``. The native-size GT graph is kept as a
+    Python list under ``gt_wireframes`` for decode-time metrics.
+    """
+    stack_keys = [
+        "wf_points", "lbl_is_vertex", "lbl_edge_id", "lbl_arclen",
+        "lbl_endpoint_a", "lbl_endpoint_b", "lbl_vertex_target",
+    ]
+    batch: dict[str, Any] = {
+        "shape_id": [str(s["shape_id"]) for s in samples],
+        "num_graphs": len(samples),
+    }
+    for k in stack_keys:
+        batch[k] = torch.stack([s[k] for s in samples], dim=0)
+    if "pc_center" in samples[0]:
+        batch["pc_center"] = torch.stack(
+            [s["pc_center"] for s in samples], dim=0)
+        batch["pc_scale"] = torch.stack(
+            [s["pc_scale"] for s in samples], dim=0)
+    if "vertices" in samples[0]:
+        batch["gt_wireframes"] = [
+            {
+                "vertices": s["vertices"],
+                "edge_index": s["edge_index"],
+                "edge_points": s["edge_points"],
+            }
+            for s in samples
+        ]
+    return batch
+
+
 __all__ = [
     "GraphFormat",
     "WireframeGraphDataset",
+    "WireframePointDataset",
     "PointCloudDataset",
     "collate_rf_batch",
+    "collate_grouper_batch",
     "list_npz",
     "make_split",
     "save_split",

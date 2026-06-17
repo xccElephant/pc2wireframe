@@ -17,6 +17,18 @@ train_ddp() {
   python -m src.main fit --config "$DATA" --config configs/rf_ddp.yaml
 }
 
+# ----- wireframe grouper (learned reconstruction; trains on GT point sets) -----
+train_grouper() {
+  python -m src.main fit \
+    --config configs/grouper_data.yaml --config configs/grouper.yaml
+}
+
+# ----- wireframe grouper (8x A800 DDP) -----
+train_grouper_ddp() {
+  python -m src.main fit \
+    --config configs/grouper_data.yaml --config configs/grouper_ddp.yaml
+}
+
 # ----- inference / submission (pass CKPT=<rf.ckpt>) -----
 predict() {
   python -m src.main predict --config "$DATA" --config configs/rf.yaml \
