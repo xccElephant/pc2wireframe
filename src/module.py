@@ -4,17 +4,19 @@ A single trainable model is driven through ``LightningCLI`` (see
 ``src/main.py``):
 
     packed point cloud (coord (P_sum, 3), offset (B,))   (native, variable size)
-        -> PCEncoder (PTv3 + latent compressor, deterministic z = mu)
-        -> latent z (B, 16, 256)                       (4096-float budget)
+        -> UtoniaEncoder (frozen PTv3 + trainable latent compressor)
+        -> latent z (B, 64, 64)                        (4096-float budget)
     noise x0 ~ N(0, I) (B, N, 4)
         -> RFPointSetVelocity (point-set DiT), conditioned on z
         -> ODE integrate t: 0 -> 1 (torchdiffeq)
-        -> wireframe point set x1_hat (B, N, 4) = (xyz, type)
+        -> wireframe point set x1_hat (B, N, 4) = (xyz, sigmoid(type))
         -> traditional reconstruction -> wireframe {vertices, edge_index,
            edge_points} -> CCD / TA / VPE score
 
-Training is 1-rectified flow: TorchCFM ``ConditionalFlowMatcher(sigma=0)`` gives
-``(t, xt, ut)`` and the network regresses the velocity ``ut`` with an MSE loss.
+Training uses minibatch-OT-coupled rectified flow (TorchCFM): OT matches the
+noise/target point sets on xyz, then ``ConditionalFlowMatcher`` gives
+``(t, xt, ut)``. The loss is split -- xyz is a velocity MSE while the type
+channel is an x1-prediction BCE (with ``pos_weight`` for the rare vertex class).
 Validation samples deterministically from a fixed noise seed so the metric is
 comparable across epochs.
 """
@@ -28,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from .metrics import WireframeScore
-from .models.pc_encoder import PCEncoder
+from .models.utonia_encoder import UtoniaEncoder
 from .models.rf_pointset import RFPointSetVelocity
 from .models.wireframe_grouper import WireframeGrouper, grouper_loss
 from .recon import group_wireframe, reconstruct_wireframe
@@ -39,22 +41,12 @@ from .recon import group_wireframe, reconstruct_wireframe
 # ----------------------------------------------------------------------
 def _default_pc_encoder() -> dict[str, Any]:
     return dict(
-        in_channels=3,
+        utonia="logs/utonia/utonia.pth",
         grid_size=0.01,
-        cls_mode=False,
-        enc_depths=(2, 2, 2, 6, 2),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(1024, 1024, 1024, 1024),
-        stride=(2, 2, 2, 2),
-        enable_flash=True,
-        # 16 * 256 = 4096 floats (competition latent budget).
-        latent_num=16,
-        latent_dim=256,
+        freeze=True,
+        # 64 * 64 = 4096 floats (competition latent budget).
+        latent_num=64,
+        latent_dim=64,
         compressor_heads=8,
         compressor_layers=1,
     )
@@ -63,7 +55,7 @@ def _default_pc_encoder() -> dict[str, Any]:
 def _default_rf_net() -> dict[str, Any]:
     return dict(
         point_dim=4,
-        cond_dim=256,
+        cond_dim=64,
         d_model=384,
         depth=8,
         nhead=6,
@@ -158,6 +150,10 @@ class RFWireframeModule(_BaseModule):
         # ----- RF target / flow -----
         wf_num_points: int = 8192,
         flow_sigma: float = 0.0,
+        coupling: str = "ot",
+        w_xyz: float = 1.0,
+        w_type: float = 1.0,
+        type_pos_weight: float = 10.0,
         # ----- ODE sampling (validation / prediction) -----
         ode_steps: int = 50,
         ode_method: str = "euler",
@@ -185,13 +181,23 @@ class RFWireframeModule(_BaseModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.encoder = PCEncoder(**(pc_encoder or _default_pc_encoder()))
+        self.encoder = UtoniaEncoder(**(pc_encoder or _default_pc_encoder()))
         self.net = RFPointSetVelocity(**(rf_net or _default_rf_net()))
         self.point_dim = int(self.net.point_dim)
 
         from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
         self.flow_matcher = ConditionalFlowMatcher(sigma=float(flow_sigma))
+        # Minibatch-OT coupling reorders the (noise, target) pairs so the
+        # regression target is well-posed and conditioning matters more. The
+        # transport cost is computed on xyz only (the type channel must not
+        # drive the geometric assignment).
+        if str(coupling) == "ot":
+            from torchcfm.optimal_transport import OTPlanSampler
+
+            self.ot_sampler = OTPlanSampler(method="exact")
+        else:
+            self.ot_sampler = None
 
         self.val_metrics = WireframeScore(
             w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
@@ -208,15 +214,48 @@ class RFWireframeModule(_BaseModule):
         """
         return self.encoder(batch["point_cloud"], batch["pc_offset"])
 
+    def _ot_couple(
+        self, x0: torch.Tensor, x1: torch.Tensor, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """OT-reorder the minibatch (transport cost on xyz only).
+
+        ``sample_map`` returns source/target indices ``(i, j)``. The target
+        ``x1`` and its conditioning latent ``z`` MUST be reordered by the same
+        ``j`` so each ``(x1, z)`` pair stays the same shape; only the noise is
+        matched via ``i``.
+        """
+        c0 = x0[..., :3].reshape(x0.shape[0], -1)
+        c1 = x1[..., :3].reshape(x1.shape[0], -1)
+        pi = self.ot_sampler.get_map(c0, c1)
+        i, j = self.ot_sampler.sample_map(pi, x0.shape[0], replace=True)
+        return x0[i], x1[j], z[j]
+
     def training_step(self, batch, batch_idx):
         z = self.encode(batch)
         x1 = batch["wf_points"]
         x0 = torch.randn_like(x1)
+        if self.ot_sampler is not None:
+            x0, x1, z = self._ot_couple(x0, x1, z)
         t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
         v = self.net(t, xt, z)
-        loss = F.mse_loss(v, ut)
-        self.log("train/loss", loss, batch_size=z.shape[0],
-                 prog_bar=True, sync_dist=True)
+
+        t_ = t.view(-1, 1, 1).to(xt.dtype)
+
+        # Geometry: regress the xyz velocity directly.
+        loss_xyz = F.mse_loss(v[..., :3], ut[..., :3])
+        # Type: x1-prediction classification. (xt + (1 - t) * v)[type] is the
+        # predicted endpoint, used as a logit against the {0,1} target type
+        # (x1 is the OT-aligned target, since x0/x1/z were permuted together).
+        x1_hat_type = (xt + (1.0 - t_) * v)[..., 3]
+        pos_weight = x1_hat_type.new_tensor(float(self.hparams.type_pos_weight))
+        loss_type = F.binary_cross_entropy_with_logits(
+            x1_hat_type, x1[..., 3], pos_weight=pos_weight)
+        loss = self.hparams.w_xyz * loss_xyz + self.hparams.w_type * loss_type
+
+        bs = z.shape[0]
+        self.log("train/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
+        self.log("train/loss_xyz", loss_xyz, batch_size=bs, sync_dist=True)
+        self.log("train/loss_type", loss_type, batch_size=bs, sync_dist=True)
         return loss
 
     # ------------------------------------------------------------------
@@ -243,7 +282,12 @@ class RFWireframeModule(_BaseModule):
         t_span = torch.linspace(
             0.0, 1.0, int(self.hparams.ode_steps) + 1, device=z.device, dtype=z.dtype)
         traj = odeint(func, x0, t_span, method=str(self.hparams.ode_method))
-        return traj[-1]
+        x1_hat = traj[-1]
+        # The type channel is trained as a logit (x1-prediction BCE); squash it
+        # to [0, 1] so the downstream type_threshold and stage-2 input semantics
+        # stay valid for reconstruction / prediction.
+        return torch.cat(
+            [x1_hat[..., :3], torch.sigmoid(x1_hat[..., 3:])], dim=-1)
 
     def _reconstruct_batch(self, x1_hat: torch.Tensor) -> list[dict[str, Any]]:
         pts = x1_hat.detach().cpu().numpy()

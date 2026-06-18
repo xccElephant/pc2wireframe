@@ -1,297 +1,125 @@
 """
-Point Transformer - V3 Mode1
+Point Transformer - V3 Mode3 - Utonia
 Pointcept detached version
 
 Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-import sys
-from functools import partial
-from addict import Dict
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import os
 import math
+from packaging import version
+from huggingface_hub import hf_hub_download, PyTorchModelHubMixin
+from addict import Dict
 import torch
 import torch.nn as nn
+from torch.nn.init import trunc_normal_
 import spconv.pytorch as spconv
 import torch_scatter
-from timm.models.layers import DropPath
-from collections import OrderedDict
+from timm.layers import DropPath
 
 try:
     import flash_attn
 except ImportError:
     flash_attn = None
 
-from .serialization import encode
+from .structure import Point
+from .module import PointSequential, PointModule
+from .utils import offset2bincount
+
+MODELS = [
+    "utonia",
+    "utonia_linear_prob_head_sc",
+]
 
 
-@torch.inference_mode()
-def offset2bincount(offset):
-    return torch.diff(
-        offset, prepend=torch.tensor([0], device=offset.device, dtype=torch.long)
-    )
-
-
-@torch.inference_mode()
-def offset2batch(offset):
-    bincount = offset2bincount(offset)
-    return torch.arange(
-        len(bincount), device=offset.device, dtype=torch.long
-    ).repeat_interleave(bincount)
-
-
-@torch.inference_mode()
-def batch2offset(batch):
-    return torch.cumsum(batch.bincount(), dim=0).long()
-
-
-class Point(Dict):
-    """
-    Point Structure of Pointcept
-
-    A Point (point cloud) in Pointcept is a dictionary that contains various properties of
-    a batched point cloud. The property with the following names have a specific definition
-    as follows:
-
-    - "coord": original coordinate of point cloud;
-    - "grid_coord": grid coordinate for specific grid size (related to GridSampling);
-    Point also support the following optional attributes:
-    - "offset": if not exist, initialized as batch size is 1;
-    - "batch": if not exist, initialized as batch size is 1;
-    - "feat": feature of point cloud, default input of model;
-    - "grid_size": Grid size of point cloud (related to GridSampling);
-    (related to Serialization)
-    - "serialized_depth": depth of serialization, 2 ** depth * grid_size describe the maximum of point cloud range;
-    - "serialized_code": a list of serialization codes;
-    - "serialized_order": a list of serialization order determined by code;
-    - "serialized_inverse": a list of inverse mapping determined by code;
-    (related to Sparsify: SpConv)
-    - "sparse_shape": Sparse shape for Sparse Conv Tensor;
-    - "sparse_conv_feat": SparseConvTensor init with information provide by Point;
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # If one of "offset" or "batch" do not exist, generate by the existing one
-        if "batch" not in self.keys() and "offset" in self.keys():
-            self["batch"] = offset2batch(self.offset)
-        elif "offset" not in self.keys() and "batch" in self.keys():
-            self["offset"] = batch2offset(self.batch)
-
-    def serialization(self, order="z", depth=None, shuffle_orders=False):
-        """
-        Point Cloud Serialization
-
-        relay on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
-        """
-        assert "batch" in self.keys()
-        if "grid_coord" not in self.keys():
-            # if you don't want to operate GridSampling in data augmentation,
-            # please add the following augmentation into your pipline:
-            # dict(type="Copy", keys_dict={"grid_size": 0.01}),
-            # (adjust `grid_size` to what your want)
-            assert {"grid_size", "coord"}.issubset(self.keys())
-            self["grid_coord"] = torch.div(
-                self.coord - self.coord.min(0)[0], self.grid_size, rounding_mode="trunc"
-            ).int()
-
-        if depth is None:
-            # Adaptive measure the depth of serialization cube (length = 2 ^ depth)
-            depth = int(self.grid_coord.max()).bit_length()
-        self["serialized_depth"] = depth
-        # Maximum bit length for serialization code is 63 (int64)
-        assert depth * 3 + len(self.offset).bit_length() <= 63
-        # Here we follow OCNN and set the depth limitation to 16 (48bit) for the point position.
-        # Although depth is limited to less than 16, we can encode a 655.36^3 (2^16 * 0.01) meter^3
-        # cube with a grid size of 0.01 meter. We consider it is enough for the current stage.
-        # We can unlock the limitation by optimizing the z-order encoding function if necessary.
-        assert depth <= 16
-
-        # The serialization codes are arranged as following structures:
-        # [Order1 ([n]),
-        #  Order2 ([n]),
-        #   ...
-        #  OrderN ([n])] (k, n)
-        code = [
-            encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order
-        ]
-        code = torch.stack(code)
-        order = torch.argsort(code)
-        inverse = torch.zeros_like(order).scatter_(
-            dim=1,
-            index=order,
-            src=torch.arange(0, code.shape[1], device=order.device).repeat(
-                code.shape[0], 1
-            ),
-        )
-
-        if shuffle_orders:
-            perm = torch.randperm(code.shape[0])
-            code = code[perm]
-            order = order[perm]
-            inverse = inverse[perm]
-
-        self["serialized_code"] = code
-        self["serialized_order"] = order
-        self["serialized_inverse"] = inverse
-
-    def sparsify(self, pad=96):
-        """
-        Point Cloud Serialization
-
-        Point cloud is sparse, here we use "sparsify" to specifically refer to
-        preparing "spconv.SparseConvTensor" for SpConv.
-
-        relay on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
-
-        pad: padding sparse for sparse shape.
-        """
-        assert {"feat", "batch"}.issubset(self.keys())
-        if "grid_coord" not in self.keys():
-            # if you don't want to operate GridSampling in data augmentation,
-            # please add the following augmentation into your pipline:
-            # dict(type="Copy", keys_dict={"grid_size": 0.01}),
-            # (adjust `grid_size` to what your want)
-            assert {"grid_size", "coord"}.issubset(self.keys())
-            self["grid_coord"] = torch.div(
-                self.coord - self.coord.min(0)[0], self.grid_size, rounding_mode="trunc"
-            ).int()
-        if "sparse_shape" in self.keys():
-            sparse_shape = self.sparse_shape
-        else:
-            sparse_shape = torch.add(
-                torch.max(self.grid_coord, dim=0).values, pad
-            ).tolist()
-        sparse_conv_feat = spconv.SparseConvTensor(
-            features=self.feat,
-            indices=torch.cat(
-                [self.batch.unsqueeze(-1).int(), self.grid_coord.int()], dim=1
-            ).contiguous(),
-            spatial_shape=sparse_shape,
-            batch_size=self.batch[-1].tolist() + 1,
-        )
-        self["sparse_shape"] = sparse_shape
-        self["sparse_conv_feat"] = sparse_conv_feat
-
-
-class PointModule(nn.Module):
-    r"""PointModule
-    placeholder, all module subclass from this will take Point in PointSequential.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-
-class PointSequential(PointModule):
-    r"""A sequential container.
-    Modules will be added to it in the order they are passed in the constructor.
-    Alternatively, an ordered dict of modules can also be passed in.
-    """
-
-    def __init__(self, *args, **kwargs):
+class Point3DRoPE(nn.Module):
+    def __init__(self, head_dim, base=10000):
         super().__init__()
-        if len(args) == 1 and isinstance(args[0], OrderedDict):
-            for key, module in args[0].items():
-                self.add_module(key, module)
-        else:
-            for idx, module in enumerate(args):
-                self.add_module(str(idx), module)
-        for name, module in kwargs.items():
-            if sys.version_info < (3, 6):
-                raise ValueError("kwargs only supported in py36+")
-            if name in self._modules:
-                raise ValueError("name exists.")
-            self.add_module(name, module)
+        assert (
+            head_dim % 3 == 0
+        ), f"Head dimension must be divisible by 3 for 3D RoPE, {head_dim}"
 
-    def __getitem__(self, idx):
-        if not (-len(self) <= idx < len(self)):
-            raise IndexError("index {} is out of range".format(idx))
-        if idx < 0:
-            idx += len(self)
-        it = iter(self._modules.values())
-        for i in range(idx):
-            next(it)
-        return next(it)
+        self.head_dim = head_dim
+        self.chunk_dim = head_dim // 3
+        self.base = base
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.chunk_dim, 2).float() / self.chunk_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq)
 
-    def __len__(self):
-        return len(self._modules)
+    def get_cos_sin(self, xyz):
+        x = xyz[:, 0:1]
+        y = xyz[:, 1:2]
+        z = xyz[:, 2:3]
+        freqs = self.inv_freq.unsqueeze(0)
 
-    def add(self, module, name=None):
-        if name is None:
-            name = str(len(self._modules))
-            if name in self._modules:
-                raise KeyError("name exists")
-        self.add_module(name, module)
+        emb_x = x * freqs
+        emb_y = y * freqs
+        emb_z = z * freqs
 
-    def forward(self, input):
-        for k, module in self._modules.items():
-            # Point module
-            if isinstance(module, PointModule):
-                input = module(input)
-            # Spconv module
-            elif spconv.modules.is_spconv_module(module):
-                if isinstance(input, Point):
-                    input.sparse_conv_feat = module(input.sparse_conv_feat)
-                    input.feat = input.sparse_conv_feat.features
-                else:
-                    input = module(input)
-            # PyTorch module
-            else:
-                if isinstance(input, Point):
-                    input.feat = module(input.feat)
-                    if "sparse_conv_feat" in input.keys():
-                        input.sparse_conv_feat = input.sparse_conv_feat.replace_feature(
-                            input.feat
-                        )
-                elif isinstance(input, spconv.SparseConvTensor):
-                    if input.indices.shape[0] != 0:
-                        input = input.replace_feature(module(input.features))
-                else:
-                    input = module(input)
-        return input
+        emb_x = torch.cat((emb_x, emb_x), dim=-1)
+        emb_y = torch.cat((emb_y, emb_y), dim=-1)
+        emb_z = torch.cat((emb_z, emb_z), dim=-1)
+        emb_3d = torch.cat((emb_x, emb_y, emb_z), dim=-1)
+        return emb_3d.cos().unsqueeze(1), emb_3d.sin().unsqueeze(1)
+
+    def rotate_half(self, x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, q, k, xyz):
+        cos, sin = self.get_cos_sin(xyz)
+        qs = torch.split(q, self.chunk_dim, dim=-1)
+        ks = torch.split(k, self.chunk_dim, dim=-1)
+
+        coss = torch.split(cos, self.chunk_dim, dim=-1)
+        sins = torch.split(sin, self.chunk_dim, dim=-1)
+
+        q_outs = []
+        k_outs = []
+
+        for i in range(3):
+            q_part = (qs[i] * coss[i]) + (self.rotate_half(qs[i]) * sins[i])
+            k_part = (ks[i] * coss[i]) + (self.rotate_half(ks[i]) * sins[i])
+
+            q_outs.append(q_part)
+            k_outs.append(k_part)
+
+        q_rot = torch.cat(q_outs, dim=-1)
+        k_rot = torch.cat(k_outs, dim=-1)
+
+        return q_rot, k_rot
 
 
-class PDNorm(PointModule):
+class LayerScale(nn.Module):
     def __init__(
         self,
-        num_features,
-        norm_layer,
-        context_channels=256,
-        conditions=("ScanNet", "S3DIS", "Structured3D"),
-        decouple=True,
-        adaptive=False,
-    ):
+        dim: int,
+        init_values: float = 1e-5,
+        inplace: bool = False,
+    ) -> None:
         super().__init__()
-        self.conditions = conditions
-        self.decouple = decouple
-        self.adaptive = adaptive
-        if self.decouple:
-            self.norm = nn.ModuleList([norm_layer(num_features) for _ in conditions])
-        else:
-            self.norm = norm_layer
-        if self.adaptive:
-            self.modulation = nn.Sequential(
-                nn.SiLU(), nn.Linear(context_channels, 2 * num_features, bias=True)
-            )
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
 
-    def forward(self, point):
-        assert {"feat", "condition"}.issubset(point.keys())
-        if isinstance(point.condition, str):
-            condition = point.condition
-        else:
-            condition = point.condition[0]
-        if self.decouple:
-            assert condition in self.conditions
-            norm = self.norm[self.conditions.index(condition)]
-        else:
-            norm = self.norm
-        point.feat = norm(point.feat)
-        if self.adaptive:
-            assert "context" in point.keys()
-            shift, scale = self.modulation(point.context).chunk(2, dim=1)
-            point.feat = point.feat * (1.0 + scale) + shift
-        return point
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 
 class RPE(torch.nn.Module):
@@ -331,6 +159,10 @@ class SerializedAttention(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        rope_base=10,
+        shift_coords=None,
+        jitter_coords=None,
+        rescale_coords=None,
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -368,6 +200,10 @@ class SerializedAttention(PointModule):
         self.proj_drop = torch.nn.Dropout(proj_drop)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
+        self.rope = Point3DRoPE(head_dim=channels // num_heads, base=rope_base)
+        self.shift_coords = shift_coords
+        self.jitter_coords = jitter_coords
+        self.rescale_coords = rescale_coords
 
     @torch.no_grad()
     def get_rel_pos(self, point, order):
@@ -455,11 +291,17 @@ class SerializedAttention(PointModule):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
+        rope_coord = point.coord[order].clone()
+
+        qkv = qkv.reshape(-1, 3, H, C // H)
+        q, k, v = qkv.unbind(dim=1)
+        q, k = self.rope(q, k, rope_coord)
+
         if not self.enable_flash:
-            # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
-            q, k, v = (
-                qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
-            )
+            q = q.reshape(-1, K, H, C // H).permute(0, 2, 1, 3)
+            k = k.reshape(-1, K, H, C // H).permute(0, 2, 1, 3)
+            v = v.reshape(-1, K, H, C // H).permute(0, 2, 1, 3)
+
             # attn
             if self.upcast_attention:
                 q = q.float()
@@ -473,8 +315,9 @@ class SerializedAttention(PointModule):
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
+            qkv_roped = torch.stack([q, k, v], dim=1)
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half().reshape(-1, 3, H, C // H),
+                qkv_roped.to(torch.bfloat16),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
@@ -528,6 +371,7 @@ class Block(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.0,
+        layer_scale=None,
         norm_layer=nn.LayerNorm,
         act_layer=nn.GELU,
         pre_norm=True,
@@ -537,6 +381,10 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        rope_base=10,
+        shift_coords=None,
+        jitter_coords=None,
+        rescale_coords=None,
     ):
         super().__init__()
         self.channels = channels
@@ -555,6 +403,11 @@ class Block(PointModule):
         )
 
         self.norm1 = PointSequential(norm_layer(channels))
+        self.ls1 = PointSequential(
+            LayerScale(channels, init_values=layer_scale)
+            if layer_scale is not None
+            else nn.Identity()
+        )
         self.attn = SerializedAttention(
             channels=channels,
             patch_size=patch_size,
@@ -568,8 +421,17 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
+            rope_base=rope_base,
+            shift_coords=shift_coords,
+            jitter_coords=jitter_coords,
+            rescale_coords=rescale_coords,
         )
         self.norm2 = PointSequential(norm_layer(channels))
+        self.ls2 = PointSequential(
+            LayerScale(channels, init_values=layer_scale)
+            if layer_scale is not None
+            else nn.Identity()
+        )
         self.mlp = PointSequential(
             MLP(
                 in_channels=channels,
@@ -590,7 +452,7 @@ class Block(PointModule):
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
-        point = self.drop_path(self.attn(point))
+        point = self.drop_path(self.ls1(self.attn(point)))
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm1(point)
@@ -598,7 +460,7 @@ class Block(PointModule):
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm2(point)
-        point = self.drop_path(self.mlp(point))
+        point = self.drop_path(self.ls2(self.mlp(point)))
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm2(point)
@@ -606,7 +468,7 @@ class Block(PointModule):
         return point
 
 
-class SerializedPooling(PointModule):
+class GridPooling(PointModule):
     def __init__(
         self,
         in_channels,
@@ -622,8 +484,6 @@ class SerializedPooling(PointModule):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        assert stride == 2 ** (math.ceil(stride) - 1).bit_length()  # 2, 4, 8
-        # TODO: add support to grid pool (any stride)
         self.stride = stride
         assert reduce in ["sum", "mean", "min", "max"]
         self.reduce = reduce
@@ -637,49 +497,34 @@ class SerializedPooling(PointModule):
             self.act = PointSequential(act_layer())
 
     def forward(self, point: Point):
-        pooling_depth = (math.ceil(self.stride) - 1).bit_length()
-        if pooling_depth > point.serialized_depth:
-            pooling_depth = 0
-        assert {
-            "serialized_code",
-            "serialized_order",
-            "serialized_inverse",
-            "serialized_depth",
-        }.issubset(
-            point.keys()
-        ), "Run point.serialization() point cloud before SerializedPooling"
-
-        code = point.serialized_code >> pooling_depth * 3
-        code_, cluster, counts = torch.unique(
-            code[0],
+        if "grid_coord" in point.keys():
+            grid_coord = point.grid_coord
+        elif {"coord", "grid_size"}.issubset(point.keys()):
+            grid_coord = torch.div(
+                point.coord - point.coord.min(0)[0],
+                point.grid_size,
+                rounding_mode="trunc",
+            ).int()
+        else:
+            raise AssertionError(
+                "[gird_coord] or [coord, grid_size] should be include in the Point"
+            )
+        grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
+        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
+        grid_coord, cluster, counts = torch.unique(
+            grid_coord,
             sorted=True,
             return_inverse=True,
             return_counts=True,
+            dim=0,
         )
+        grid_coord = grid_coord & ((1 << 48) - 1)
         # indices of point sorted by cluster, for torch_scatter.segment_csr
         _, indices = torch.sort(cluster)
         # index pointer for sorted point, for torch_scatter.segment_csr
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
-        # generate down code, order, inverse
-        code = code[:, head_indices]
-        order = torch.argsort(code)
-        inverse = torch.zeros_like(order).scatter_(
-            dim=1,
-            index=order,
-            src=torch.arange(0, code.shape[1], device=order.device).repeat(
-                code.shape[0], 1
-            ),
-        )
-
-        if self.shuffle_orders:
-            perm = torch.randperm(code.shape[0])
-            code = code[perm]
-            order = order[perm]
-            inverse = inverse[perm]
-
-        # collect information
         point_dict = Dict(
             feat=torch_scatter.segment_csr(
                 self.proj(point.feat)[indices], idx_ptr, reduce=self.reduce
@@ -687,32 +532,44 @@ class SerializedPooling(PointModule):
             coord=torch_scatter.segment_csr(
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
-            grid_coord=point.grid_coord[head_indices] >> pooling_depth,
-            serialized_code=code,
-            serialized_order=order,
-            serialized_inverse=inverse,
-            serialized_depth=point.serialized_depth - pooling_depth,
+            grid_coord=grid_coord,
             batch=point.batch[head_indices],
         )
-
+        if "origin_coord" in point.keys():
+            point_dict["origin_coord"] = torch_scatter.segment_csr(
+                point.origin_coord[indices], idx_ptr, reduce="mean"
+            )
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
         if "context" in point.keys():
             point_dict["context"] = point.context
+        if "name" in point.keys():
+            point_dict["name"] = point.name
+        if "split" in point.keys():
+            point_dict["split"] = point.split
+        if "color" in point.keys():
+            point_dict["color"] = torch_scatter.segment_csr(
+                point.color[indices], idx_ptr, reduce="mean"
+            )
+        if "grid_size" in point.keys():
+            point_dict["grid_size"] = point.grid_size * self.stride
 
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
+            point_dict["idx_ptr"] = idx_ptr
+        order = point.order
         point = Point(point_dict)
         if self.norm is not None:
             point = self.norm(point)
         if self.act is not None:
             point = self.act(point)
+        point.serialization(order=order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
         return point
 
 
-class SerializedUnpooling(PointModule):
+class GridUnpooling(PointModule):
     def __init__(
         self,
         in_channels,
@@ -740,12 +597,15 @@ class SerializedUnpooling(PointModule):
         assert "pooling_parent" in point.keys()
         assert "pooling_inverse" in point.keys()
         parent = point.pop("pooling_parent")
-        inverse = point.pop("pooling_inverse")
-        point = self.proj(point)
+        inverse = point.pooling_inverse
+        feat = point.feat
+
         parent = self.proj_skip(parent)
-        parent.feat = parent.feat + point.feat[inverse]
+        parent.feat = parent.feat + self.proj(point).feat[inverse]
+        parent.sparse_conv_feat = parent.sparse_conv_feat.replace_feature(parent.feat)
 
         if self.traceable:
+            point.feat = feat
             parent["unpooling_parent"] = point
         return parent
 
@@ -757,45 +617,47 @@ class Embedding(PointModule):
         embed_channels,
         norm_layer=None,
         act_layer=None,
+        mask_token=False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
 
-        # TODO: check remove spconv
-        self.stem = PointSequential(
-            conv=spconv.SubMConv3d(
-                in_channels,
-                embed_channels,
-                kernel_size=5,
-                padding=1,
-                bias=False,
-                indice_key="stem",
-            )
-        )
+        self.stem = PointSequential(linear=nn.Linear(in_channels, embed_channels))
         if norm_layer is not None:
             self.stem.add(norm_layer(embed_channels), name="norm")
         if act_layer is not None:
             self.stem.add(act_layer(), name="act")
 
+        if mask_token:
+            self.mask_token = nn.Parameter(torch.zeros(1, embed_channels))
+        else:
+            self.mask_token = None
+
     def forward(self, point: Point):
         point = self.stem(point)
+        if "mask" in point.keys():
+            point.feat = torch.where(
+                point.mask.unsqueeze(-1),
+                self.mask_token.to(point.feat.dtype),
+                point.feat,
+            )
         return point
 
 
-class PointTransformerV3(PointModule):
+class PointTransformerV3(PointModule, PyTorchModelHubMixin):
     def __init__(
         self,
         in_channels=6,
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        order=("z", "z-trans"),
         stride=(2, 2, 2, 2),
-        enc_depths=(2, 2, 2, 6, 2),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_num_head=(2, 4, 8, 16, 32),
+        enc_depths=(3, 3, 3, 12, 3),
+        enc_channels=(48, 96, 192, 384, 512),
+        enc_num_head=(3, 6, 12, 24, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
+        dec_depths=(3, 3, 3, 3),
+        dec_channels=(96, 96, 192, 384),
+        dec_num_head=(6, 6, 12, 32),
         dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio=4,
         qkv_bias=True,
@@ -803,67 +665,50 @@ class PointTransformerV3(PointModule):
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.3,
+        layer_scale=None,
         pre_norm=True,
         shuffle_orders=True,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        cls_mode=False,
-        pdnorm_bn=False,
-        pdnorm_ln=False,
-        pdnorm_decouple=True,
-        pdnorm_adaptive=False,
-        pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        traceable=False,
+        mask_token=False,
+        enc_mode=False,
+        freeze_encoder=False,
+        rope_base=10,
+        shift_coords=None,
+        jitter_coords=None,
+        rescale_coords=None,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
-        self.cls_mode = cls_mode
+        self.enc_mode = enc_mode
         self.shuffle_orders = shuffle_orders
+        self.freeze_encoder = freeze_encoder
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
         assert self.num_stages == len(enc_channels)
         assert self.num_stages == len(enc_num_head)
         assert self.num_stages == len(enc_patch_size)
-        assert self.cls_mode or self.num_stages == len(dec_depths) + 1
-        assert self.cls_mode or self.num_stages == len(dec_channels) + 1
-        assert self.cls_mode or self.num_stages == len(dec_num_head) + 1
-        assert self.cls_mode or self.num_stages == len(dec_patch_size) + 1
+        assert self.enc_mode or self.num_stages == len(dec_depths) + 1
+        assert self.enc_mode or self.num_stages == len(dec_channels) + 1
+        assert self.enc_mode or self.num_stages == len(dec_num_head) + 1
+        assert self.enc_mode or self.num_stages == len(dec_patch_size) + 1
 
-        # norm layers
-        if pdnorm_bn:
-            bn_layer = partial(
-                PDNorm,
-                norm_layer=partial(
-                    nn.BatchNorm1d, eps=1e-3, momentum=0.01, affine=pdnorm_affine
-                ),
-                conditions=pdnorm_conditions,
-                decouple=pdnorm_decouple,
-                adaptive=pdnorm_adaptive,
-            )
-        else:
-            bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
-        if pdnorm_ln:
-            ln_layer = partial(
-                PDNorm,
-                norm_layer=partial(nn.LayerNorm, elementwise_affine=pdnorm_affine),
-                conditions=pdnorm_conditions,
-                decouple=pdnorm_decouple,
-                adaptive=pdnorm_adaptive,
-            )
-        else:
-            ln_layer = nn.LayerNorm
+        # normalization layer
+        ln_layer = nn.LayerNorm
         # activation layers
         act_layer = nn.GELU
 
         self.embedding = Embedding(
             in_channels=in_channels,
             embed_channels=enc_channels[0],
-            norm_layer=bn_layer,
+            norm_layer=ln_layer,
             act_layer=act_layer,
+            mask_token=mask_token,
         )
 
         # encoder
@@ -878,11 +723,11 @@ class PointTransformerV3(PointModule):
             enc = PointSequential()
             if s > 0:
                 enc.add(
-                    SerializedPooling(
+                    GridPooling(
                         in_channels=enc_channels[s - 1],
                         out_channels=enc_channels[s],
                         stride=stride[s - 1],
-                        norm_layer=bn_layer,
+                        norm_layer=ln_layer,
                         act_layer=act_layer,
                     ),
                     name="down",
@@ -899,6 +744,7 @@ class PointTransformerV3(PointModule):
                         attn_drop=attn_drop,
                         proj_drop=proj_drop,
                         drop_path=enc_drop_path_[i],
+                        layer_scale=layer_scale,
                         norm_layer=ln_layer,
                         act_layer=act_layer,
                         pre_norm=pre_norm,
@@ -908,6 +754,10 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        rope_base=rope_base,
+                        shift_coords=shift_coords,
+                        jitter_coords=jitter_coords,
+                        rescale_coords=rescale_coords,
                     ),
                     name=f"block{i}",
                 )
@@ -915,7 +765,7 @@ class PointTransformerV3(PointModule):
                 self.enc.add(module=enc, name=f"enc{s}")
 
         # decoder
-        if not self.cls_mode:
+        if not self.enc_mode:
             dec_drop_path = [
                 x.item() for x in torch.linspace(0, drop_path, sum(dec_depths))
             ]
@@ -928,12 +778,13 @@ class PointTransformerV3(PointModule):
                 dec_drop_path_.reverse()
                 dec = PointSequential()
                 dec.add(
-                    SerializedUnpooling(
+                    GridUnpooling(
                         in_channels=dec_channels[s + 1],
                         skip_channels=enc_channels[s],
                         out_channels=dec_channels[s],
-                        norm_layer=bn_layer,
+                        norm_layer=ln_layer,
                         act_layer=act_layer,
+                        traceable=traceable,
                     ),
                     name="up",
                 )
@@ -949,6 +800,7 @@ class PointTransformerV3(PointModule):
                             attn_drop=attn_drop,
                             proj_drop=proj_drop,
                             drop_path=dec_drop_path_[i],
+                            layer_scale=layer_scale,
                             norm_layer=ln_layer,
                             act_layer=act_layer,
                             pre_norm=pre_norm,
@@ -958,25 +810,80 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            rope_base=rope_base,
+                            shift_coords=shift_coords,
+                            jitter_coords=jitter_coords,
+                            rescale_coords=rescale_coords,
                         ),
                         name=f"block{i}",
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
+        if self.freeze_encoder:
+            for p in self.embedding.parameters():
+                p.requires_grad = False
+            for p in self.enc.parameters():
+                p.requires_grad = False
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, spconv.SubMConv3d):
+            trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def forward(self, data_dict):
-        """
-        A data_dict is a dictionary containing properties of a batched point cloud.
-        It should contain the following properties for PTv3:
-        1. "feat": feature of point cloud
-        2. "grid_coord": discrete coordinate after grid sampling (voxelization) or "coord" + "grid_size"
-        3. "offset" or "batch": https://github.com/Pointcept/Pointcept?tab=readme-ov-file#offset
-        """
         point = Point(data_dict)
+        point = self.embedding(point)
+
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
-        point = self.embedding(point)
         point = self.enc(point)
-        if not self.cls_mode:
+        if not self.enc_mode:
             point = self.dec(point)
         return point
+
+
+def load(
+    name: str = "utonia",
+    repo_id="Pointcept/utonia",
+    download_root: str = None,
+    custom_config: dict = None,
+    ckpt_only: bool = False,
+):
+    if name in MODELS:
+        print(f"Loading checkpoint from HuggingFace: {name} ...")
+        ckpt_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"{name}.pth",
+            repo_type="model",
+            revision="main",
+            local_dir=download_root or os.path.expanduser("~/.cache/utonia/ckpt"),
+        )
+    elif os.path.isfile(name):
+        print(f"Loading checkpoint in local path: {name} ...")
+        ckpt_path = name
+    else:
+        raise RuntimeError(f"Model {name} not found; available models = {MODELS}")
+
+    if version.parse(torch.__version__) >= version.parse("2.4"):
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    else:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+    if custom_config is not None:
+        for key, value in custom_config.items():
+            ckpt["config"][key] = value
+
+    if ckpt_only:
+        return ckpt
+
+    model = PointTransformerV3(**ckpt["config"])
+    model.load_state_dict(ckpt["state_dict"])
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model params: {n_parameters / 1e6:.2f}M")
+    return model

@@ -1,18 +1,18 @@
 """PC2Wireframe (Rectified-Flow branch) model package.
 
-Lightweight modules (``LatentCompressor``, ``PCEncoder``,
-``RFPointSetVelocity``) are exported eagerly; the heavy vendored stacks (PTv3)
-are imported lazily inside those classes so this package can be imported
-without the full dependency set installed.
+Lightweight modules (``LatentCompressor``, ``UtoniaEncoder``,
+``RFPointSetVelocity``) are exported eagerly; the heavy backbone (the frozen
+Utonia PTv3) is imported lazily inside ``UtoniaEncoder`` so this package can be
+imported without the full dependency set installed.
 """
 from .latent_compressor import LatentCompressor
-from .pc_encoder import PCEncoder
+from .utonia_encoder import UtoniaEncoder
 from .rf_pointset import RFPointSetVelocity
 from .wireframe_grouper import WireframeGrouper
 
 __all__ = [
     "LatentCompressor",
-    "PCEncoder",
+    "UtoniaEncoder",
     "RFPointSetVelocity",
     "WireframeGrouper",
 ]

@@ -9,30 +9,20 @@ seed_everything: 3407
 model:
   class_path: src.module.RFWireframeModule
   init_args:
-    # ----- point-cloud encoder: PTv3 backbone + latent-compressor head -----
+    # ----- point-cloud encoder: frozen Utonia PTv3 + trainable compressor -----
     pc_encoder:
-      in_channels: 3
+      utonia: logs/utonia/utonia.pth   # local Utonia checkpoint (download manually)
       grid_size: 0.01
-      cls_mode: false
-      enc_depths:    [2, 2, 2, 6, 2]
-      enc_channels:  [32, 64, 128, 256, 512]
-      enc_num_head:  [2, 4, 8, 16, 32]
-      enc_patch_size: [1024, 1024, 1024, 1024, 1024]
-      dec_depths:    [2, 2, 2, 2]
-      dec_channels:  [64, 64, 128, 256]
-      dec_num_head:  [4, 4, 8, 16]
-      dec_patch_size: [1024, 1024, 1024, 1024]
-      stride:        [2, 2, 2, 2]
-      enable_flash: true
-      latent_num: 16
-      latent_dim: 256
+      freeze: true
+      latent_num: 64
+      latent_dim: 64
       compressor_heads: 8
       compressor_layers: 1
 
     # ----- RF velocity network (point-set DiT) -----
     rf_net:
       point_dim: 4
-      cond_dim: 256
+      cond_dim: 64
       d_model: 384
       depth: 8
       nhead: 6
@@ -43,9 +33,13 @@ model:
     # ----- RF target / flow -----
     wf_num_points: 8192
     flow_sigma: 0.0
+    coupling: ot                # ot = minibatch-OT (xyz cost) | independent
+    w_xyz: 1.0
+    w_type: 1.0
+    type_pos_weight: 10.0
 
     # ----- ODE sampling (validation / prediction) -----
-    ode_steps: 20               # RF paths are ~straight; 20 euler steps suffice
+    ode_steps: 50               # RF paths are ~straight; 50 euler steps
     ode_method: euler
     sample_seed: 0
 
@@ -78,8 +72,9 @@ trainer:
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/rf.yaml
   num_nodes: 1
-  # All params are trainable and contribute to the loss each step, so plain DDP
-  # is safe (no find_unused_parameters pass).
+  # The frozen Utonia backbone has no grads; every *trainable* param (compressor
+  # + DiT) contributes to the loss each step, so plain DDP is safe (no
+  # find_unused_parameters pass).
   strategy: ddp
   sync_batchnorm: false         # model uses Layer/GroupNorm, not BatchNorm
   use_distributed_sampler: true

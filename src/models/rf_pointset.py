@@ -2,7 +2,7 @@
 
 Predicts the flow-matching velocity ``v (B, N, 4)`` of a noised point set
 ``xt (B, N, 4)`` at time ``t (B,)``, conditioned on the point-cloud latent
-``z (B, K, D)`` (here ``K=16`` tokens of ``D=256``).
+``z (B, K, D)`` (here ``K=64`` tokens of ``D=64``).
 
 Design (a point-set DiT, in the spirit of DiT / Point-E):
 

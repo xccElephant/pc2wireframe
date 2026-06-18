@@ -23,10 +23,11 @@ data:
 
     # ----- graph / point-cloud / RF-target format -----
     vertex_merge_tol: 0.0001
-    # Caps disabled (0): RF trains on the full raw distribution, no oversize
-    # skipping (the fixed-size arc-length target absorbs dense samples).
-    max_vertices: 0
-    max_edges: 0
+    # Skip pathologically large wireframes (the dataset drops a sample when
+    # nv > max_vertices or ne > max_edges); keeps the RF target distribution
+    # within a sane size envelope.
+    max_vertices: 1024
+    max_edges: 1024
     num_edge_points: 32
     # Input point cloud is kept at its NATIVE size and packed for PTv3
     # (coord + offset); 0 = keep all points (no detail loss). Set a positive
