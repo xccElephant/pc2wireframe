@@ -17,8 +17,10 @@ data:
 
     # ----- graph / point-cloud / RF-target format (must match the RF stage) -----
     vertex_merge_tol: 0.0001
-    max_vertices: 0
-    max_edges: 0
+    # Match the RF stage caps so both stages train on the same size distribution
+    # and 8192 points stay dense enough per edge.
+    max_vertices: 1024
+    max_edges: 1024
     num_edge_points: 32
     max_pc_points: 0
     wf_num_points: 8192
@@ -26,9 +28,11 @@ data:
     max_load_retries: 64
 
     # ----- grouper input augmentation (bridges clean GT -> noisy RF output) -----
-    # Applied to the TRAIN split only; val stays clean for honest metrics.
+    # jitter is applied to the TRAIN split only; val stays clean for honest metrics.
     jitter_std: 0.005        # per-point Gaussian xyz jitter (normalized frame)
-    type_noise_std: 0.05     # Gaussian noise on the (0/1) type channel
+    # Guarantee every GT edge keeps at least this many sampled anchor points
+    # (so short edges are never dropped under pure arc-length sampling).
+    min_pts_per_edge: 2
 
     # ----- data loader -----
     shuffle: true

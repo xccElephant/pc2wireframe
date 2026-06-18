@@ -56,6 +56,13 @@ class WireframeDataModule(pl.LightningDataModule):
         auto_build_split: bool = True,
         train_ratio: float = 0.9,
         split_seed: int = 42,
+        # When set, BOTH train and val datasets use exactly these edge npz files
+        # (split resolution is bypassed). Intended for single-sample overfit /
+        # debugging where train and val are the same shape(s).
+        overfit_files: list[str] | None = None,
+        # When set, the RF target sampling is seeded per index so each shape
+        # always yields the SAME wf_points (deterministic overfit target).
+        target_seed: int | None = None,
         # ----- graph / RF-target format -----
         vertex_merge_tol: float = 1e-4,
         # Caps <= 0 disable oversize skipping (RF-branch default: full data).
@@ -99,6 +106,7 @@ class WireframeDataModule(pl.LightningDataModule):
             split_path=self.hparams.split_path,
             edge_dir=self._path(self.hparams.train_edge_subdir),
             pointcloud_dirs=self._pointcloud_dirs,
+            files=self.hparams.overfit_files,
             train_ratio=self.hparams.train_ratio,
             split_seed=self.hparams.split_seed,
             recursive_glob=self.hparams.recursive_glob,
@@ -111,6 +119,7 @@ class WireframeDataModule(pl.LightningDataModule):
             wf_num_points=self.hparams.wf_num_points,
             min_edges=self.hparams.min_edges,
             max_load_retries=self.hparams.max_load_retries,
+            target_seed=self.hparams.target_seed,
         )
 
     # ------------------------------------------------------------------
@@ -207,9 +216,10 @@ class WireframeGrouperDataModule(WireframeDataModule):
     Identical split / path handling to :class:`WireframeDataModule`, but the
     train / val datasets emit the *labelled* point set
     (:class:`WireframePointDataset`) and use :func:`collate_grouper_batch`.
-    Two extra knobs control the input augmentation that bridges the gap to the
-    noisy RF-stage output (``jitter_std`` / ``type_noise_std``); augmentation
-    is applied to the train split only (val stays clean for honest metrics).
+    The ``jitter_std`` knob controls the input xyz augmentation that bridges
+    the gap to the noisy RF-stage output; augmentation is applied to the train
+    split only (val stays clean for honest metrics). ``min_pts_per_edge``
+    guarantees every GT edge keeps a minimum number of sampled points.
 
     The ``predict`` dataloader is inherited unchanged (point-cloud-only); the
     grouper is normally run on the RF stage's emitted point sets rather than
@@ -222,13 +232,13 @@ class WireframeGrouperDataModule(WireframeDataModule):
         self,
         *,
         jitter_std: float = 0.005,
-        type_noise_std: float = 0.05,
+        min_pts_per_edge: int = 0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         # The parent's __init__ already saved all shared hparams; only add the
         # two grouper-specific ones (avoid recapturing **kwargs as a dict).
-        self.save_hyperparameters("jitter_std", "type_noise_std")
+        self.save_hyperparameters("jitter_std", "min_pts_per_edge")
 
     def _make_graph_dataset(self, split: str) -> WireframePointDataset:
         # Augment the train split only; keep val clean.
@@ -238,6 +248,7 @@ class WireframeGrouperDataModule(WireframeDataModule):
             split_path=self.hparams.split_path,
             edge_dir=self._path(self.hparams.train_edge_subdir),
             pointcloud_dirs=self._pointcloud_dirs,
+            files=self.hparams.overfit_files,
             train_ratio=self.hparams.train_ratio,
             split_seed=self.hparams.split_seed,
             recursive_glob=self.hparams.recursive_glob,
@@ -251,7 +262,8 @@ class WireframeGrouperDataModule(WireframeDataModule):
             min_edges=self.hparams.min_edges,
             max_load_retries=self.hparams.max_load_retries,
             jitter_std=self.hparams.jitter_std if aug else 0.0,
-            type_noise_std=self.hparams.type_noise_std if aug else 0.0,
+            min_pts_per_edge=self.hparams.min_pts_per_edge,
+            target_seed=self.hparams.target_seed,
         )
 
 

@@ -5,14 +5,10 @@ Two dataset flavours are provided:
 ``WireframeGraphDataset``
     Used for training / validation. Loads a per-edge GT wireframe NPZ
     (endpoints + resampled curve points) together with its matching surface
-    point cloud, then derives the Rectified-Flow **target point set**
-    ``wf_points (N, 4) = (x, y, z, type)`` where ``type`` is ``1`` for vertex
-    points and ``0`` for edge points:
-
-      * every GT vertex contributes one ``type=1`` point (down-sampled when the
-        sample has more than ``N`` vertices);
-      * the remaining ``N - V`` points are drawn by **global arc-length
-        sampling** over all edge polylines, with ``type=0``.
+    point cloud, then derives the Rectified-Flow **anchor point set**
+    ``wf_points (N, 3) = (x, y, z)`` by **global arc-length sampling** over all
+    edge polylines (denser / longer curves receive proportionally more points;
+    no vertex points, no type channel).
 
     The fixed-size ``point_cloud`` and ``wf_points`` are stacked by the default
     collate (:func:`collate_rf_batch`); the *native-size* GT graph
@@ -26,7 +22,7 @@ Two dataset flavours are provided:
         point_cloud:  (Ni, 3)              float32   (native, variable size)
         pc_center:    (3,)                 float32
         pc_scale:     ()                   float32
-        wf_points:    (wf_num_points, 4)   float32   (fixed size, RF target)
+        wf_points:    (wf_num_points, 3)   float32   (fixed size, RF target)
         vertices:     (Vi, 3)              float32   (native GT)
         edge_index:   (Ei, 2)              int64     (LOCAL vertex ids)
         edge_points:  (Ei, U, 3)           float32
@@ -202,45 +198,132 @@ def _sample_arclength(edge_points: np.ndarray, num: int) -> np.ndarray:
     return sampled.astype(np.float32)
 
 
-def _build_wf_target(
-    vertices: np.ndarray, edge_points: np.ndarray, num_points: int
-) -> np.ndarray:
-    """Build the fixed-size RF target point set ``(num_points, 4)``.
+def _build_wf_target(edge_points: np.ndarray, num_points: int) -> np.ndarray:
+    """Build the fixed-size RF anchor point set ``(num_points, 3)``.
 
-    The type channel is *not* a fixed budget: all vertices are emitted with
-    ``type=1`` (down-sampled if ``V > num_points``) and the rest of the budget
-    is filled with arc-length-sampled edge points (``type=0``).
+    The stage-1 target is a pure xyz anchor cloud sampled by **global
+    arc length** over all edge polylines (no vertex points, no type channel).
     """
-    out = np.zeros((num_points, 4), dtype=np.float32)
-    v = int(vertices.shape[0])
-    if v >= num_points:
-        idx = np.random.choice(v, num_points, replace=False)
-        out[:, :3] = vertices[idx]
-        out[:, 3] = 1.0
-        return out
-    if v > 0:
-        out[:v, :3] = vertices
-        out[:v, 3] = 1.0
-    m = num_points - v
-    out[v:, :3] = _sample_arclength(edge_points, m)
-    out[v:, 3] = 0.0
-    return out
+    return _sample_arclength(edge_points, int(num_points))
+
+
+# Curve-type fit thresholds (max residual relative to the edge arc length).
+# Below ``_CURVE_LINE_THRESH`` the polyline is a straight line; otherwise below
+# ``_CURVE_ARC_THRESH`` (after a plane + least-squares-circle fit) it is an arc;
+# anything else falls back to a cubic Bezier.
+_CURVE_LINE_THRESH = 0.02
+_CURVE_ARC_THRESH = 0.02
+
+# Curve-type codes (kept in sync with the grouper's curve_type head + decoder).
+_CURVE_LINE = 0
+_CURVE_ARC = 1
+_CURVE_BEZIER = 2
+
+
+def _fit_curve_type(
+    polyline: np.ndarray,
+    *,
+    line_thresh: float = _CURVE_LINE_THRESH,
+    arc_thresh: float = _CURVE_ARC_THRESH,
+) -> int:
+    """Classify a GT polyline as ``0=line`` / ``1=arc`` / ``2=bezier``.
+
+    The decision is residual-based and scale-invariant (every residual is
+    measured relative to the polyline's arc length):
+
+      * **line**: small max perpendicular residual to the PCA principal axis;
+      * **arc**: otherwise, project onto the best-fit plane (the two dominant
+        PCA axes), fit a circle by least squares, and accept if the combined
+        in-plane radial + out-of-plane residual is small;
+      * **bezier**: everything else (the catch-all parameterisation).
+    """
+    pts = np.asarray(polyline, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] < 3:
+        return _CURVE_LINE
+    seg_len = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    arclen = float(seg_len.sum())
+    if arclen <= 1e-12:
+        return _CURVE_LINE
+
+    centered = pts - pts.mean(axis=0)
+    # PCA via SVD: rows of vt are principal axes (descending variance).
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    if vt.shape[0] < 3:
+        return _CURVE_LINE
+    axis0, axis1, normal = vt[0], vt[1], vt[2]
+
+    # Line test: residual orthogonal to the principal axis.
+    perp = centered - np.outer(centered @ axis0, axis0)
+    line_res = float(np.sqrt((perp ** 2).sum(axis=1)).max())
+    if line_res / arclen < line_thresh:
+        return _CURVE_LINE
+
+    # Arc test: least-squares circle in the (axis0, axis1) plane.
+    x = centered @ axis0
+    y = centered @ axis1
+    z = centered @ normal
+    a_mat = np.stack([x, y, np.ones_like(x)], axis=1)
+    b_vec = -(x ** 2 + y ** 2)
+    try:
+        sol, *_ = np.linalg.lstsq(a_mat, b_vec, rcond=None)
+    except np.linalg.LinAlgError:
+        return _CURVE_BEZIER
+    cx, cy = -0.5 * sol[0], -0.5 * sol[1]
+    r2 = cx ** 2 + cy ** 2 - sol[2]
+    if r2 <= 0.0:
+        return _CURVE_BEZIER
+    radius = np.sqrt(r2)
+    radial = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    arc_res = float(np.sqrt((radial - radius) ** 2 + z ** 2).max())
+    if arc_res / arclen < arc_thresh:
+        return _CURVE_ARC
+    return _CURVE_BEZIER
+
+
+def _points_on_edges(
+    pts: np.ndarray,
+    seg_vec: np.ndarray,
+    seg_len: np.ndarray,
+    edge_len: np.ndarray,
+    seg_cum_prev: np.ndarray,
+    eid: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Interpolate points at normalised arc-length ``t`` on edges ``eid``.
+
+    ``pts`` is ``(E, U, 3)``; ``eid (M,)`` indexes edges and ``t (M,)`` is the
+    per-point arc-length fraction in ``[0, 1]``. Returns ``(M, 3)`` coords.
+    """
+    eps = 1e-12
+    if eid.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    target = t * edge_len[eid]                       # (M,) distance along edge
+    cum_end = seg_cum_prev[eid] + seg_len[eid]       # (M, U-1)
+    # number of fully-passed segments = index of the hosting segment
+    within = np.clip(
+        (target[:, None] >= cum_end).sum(axis=1), 0, seg_len.shape[1] - 1)
+    seg_l = seg_len[eid, within]
+    local = (target - seg_cum_prev[eid, within]) / np.maximum(seg_l, eps)
+    local = np.clip(local, 0.0, 1.0)
+    return pts[eid, within] + local[:, None] * seg_vec[eid, within]
 
 
 def _sample_arclength_labeled(
-    edge_points: np.ndarray, num: int
+    edge_points: np.ndarray, num: int, min_pts_per_edge: int = 0
 ) -> dict[str, np.ndarray]:
-    """Global arc-length sampling that also returns per-point structure labels.
+    """Arc-length sampling with per-point structure labels (stage-2 targets).
 
-    Same sampling distribution as :func:`_sample_arclength` (every consecutive
-    segment across all edges pooled into one arc-length parameterisation) but
-    additionally records, for each sampled point, the **source edge id**, its
-    normalised **arc-length position** ``t in [0, 1]`` along that edge, and the
-    edge's two **endpoint** coordinates (the first / last polyline points).
-    These are the supervision targets the stage-2 grouper regresses.
+    Builds the same global arc-length distribution as :func:`_sample_arclength`,
+    but first guarantees every edge receives at least ``min_pts_per_edge``
+    uniformly-spaced samples (so short edges are never dropped), then fills the
+    rest of the ``num`` budget by global arc length. For every sampled point it
+    records the supervision the stage-2 grouper regresses:
 
-    Returns a dict of ``num``-length arrays: ``points (num,3)``,
-    ``edge_id (num,)``, ``arclen (num,)``, ``endpoint_a/b (num,3)``.
+      * ``edge_id (num,)``       -- source edge id;
+      * ``arclen (num,)``        -- normalised arc-length position ``t``;
+      * ``endpoint_a/b (num,3)`` -- the edge's two endpoint coords;
+      * ``curve_type (num,)``    -- ``0=line / 1=arc / 2=bezier`` of the edge;
+      * ``anchor1/anchor2 (num,3)`` -- the edge's ``t=1/3`` / ``t=2/3`` coords.
     """
     eps = 1e-12
     pts = np.asarray(edge_points, dtype=np.float64).reshape(
@@ -252,6 +335,9 @@ def _sample_arclength_labeled(
         "arclen": np.zeros(num, dtype=np.float32),
         "endpoint_a": np.zeros((num, 3), dtype=np.float32),
         "endpoint_b": np.zeros((num, 3), dtype=np.float32),
+        "curve_type": np.zeros(num, dtype=np.int64),
+        "anchor1": np.zeros((num, 3), dtype=np.float32),
+        "anchor2": np.zeros((num, 3), dtype=np.float32),
     }
     if num <= 0 or e == 0 or u == 0:
         return out
@@ -259,17 +345,29 @@ def _sample_arclength_labeled(
     ea = pts[:, 0, :]   # (E, 3) edge endpoint a
     eb = pts[:, -1, :]  # (E, 3) edge endpoint b
 
-    def _fill_from_flat(idx: np.ndarray, eid: np.ndarray) -> dict[str, np.ndarray]:
-        flat = pts.reshape(-1, 3)
-        out["points"] = flat[idx].astype(np.float32)
+    # Per-edge curve type (computed once on the clean polyline).
+    curve_type = np.array(
+        [_fit_curve_type(pts[i]) for i in range(e)], dtype=np.int64)
+
+    def _finish(eid: np.ndarray, t: np.ndarray, coords: np.ndarray
+                ) -> dict[str, np.ndarray]:
+        out["points"] = coords.astype(np.float32)
         out["edge_id"] = eid.astype(np.int64)
+        out["arclen"] = t.astype(np.float32)
         out["endpoint_a"] = ea[eid].astype(np.float32)
         out["endpoint_b"] = eb[eid].astype(np.float32)
+        out["curve_type"] = curve_type[eid]
+        out["anchor1"] = anchor1[eid].astype(np.float32)
+        out["anchor2"] = anchor2[eid].astype(np.float32)
         return out
 
+    # Degenerate polylines (single point per edge): fall back to flat sampling
+    # with anchors / arclen pinned to the lone point.
     if u == 1:
+        anchor1 = ea.copy()
+        anchor2 = eb.copy()
         idx = np.random.choice(e, num, replace=e < num)
-        return _fill_from_flat(idx, idx)
+        return _finish(idx, np.zeros(num), pts.reshape(-1, 3)[idx])
 
     seg_start = pts[:, :-1, :]            # (E, U-1, 3)
     seg_vec = pts[:, 1:, :] - seg_start   # (E, U-1, 3)
@@ -277,93 +375,88 @@ def _sample_arclength_labeled(
     edge_len = seg_len.sum(axis=1)                   # (E,)
     seg_cum_prev = np.cumsum(seg_len, axis=1) - seg_len  # (E, U-1)
 
-    flat_len = seg_len.reshape(-1)        # (E*(U-1),)
-    total = float(flat_len.sum())
+    # Edge anchors at t=1/3 and t=2/3 (arc-length param).
+    all_ids = np.arange(e)
+    anchor1 = _points_on_edges(
+        seg_start, seg_vec, seg_len, edge_len, seg_cum_prev,
+        all_ids, np.full(e, 1.0 / 3.0))
+    anchor2 = _points_on_edges(
+        seg_start, seg_vec, seg_len, edge_len, seg_cum_prev,
+        all_ids, np.full(e, 2.0 / 3.0))
+
+    total = float(seg_len.sum())
     if total <= eps:
-        flat = pts.reshape(-1, 3)
-        idx = np.random.choice(flat.shape[0], num, replace=flat.shape[0] < num)
-        return _fill_from_flat(idx, idx // u)
+        idx = np.random.choice(e, num, replace=e < num)
+        return _finish(idx, np.zeros(num), ea[idx])
 
-    cum = np.cumsum(flat_len)
-    cum_prev = cum - flat_len
-    u_pos = np.random.uniform(0.0, total, size=num)
-    seg_idx = np.clip(
-        np.searchsorted(cum, u_pos, side="right"), 0, flat_len.shape[0] - 1)
-    local = (u_pos - cum_prev[seg_idx]) / np.maximum(flat_len[seg_idx], eps)
+    # 1) Minimum per-edge allocation (uniform in arc length). Clamp the lower
+    #    bound so the base never exceeds the total budget.
+    per_edge_min = max(0, int(min_pts_per_edge))
+    if e > 0 and per_edge_min * e > num:
+        per_edge_min = num // e
+    base_eid = np.zeros(0, dtype=np.int64)
+    base_t = np.zeros(0, dtype=np.float64)
+    if per_edge_min > 0:
+        base_eid = np.repeat(all_ids, per_edge_min)
+        # midpoints of per_edge_min equal sub-intervals -> spread within edge
+        ts = (np.arange(per_edge_min) + 0.5) / per_edge_min
+        base_t = np.tile(ts, e)
 
-    seg_start_flat = seg_start.reshape(-1, 3)
-    seg_vec_flat = seg_vec.reshape(-1, 3)
-    sampled = seg_start_flat[seg_idx] + local[:, None] * seg_vec_flat[seg_idx]
+    # 2) Fill the remaining budget by global arc length.
+    n_fill = num - base_eid.shape[0]
+    if n_fill > 0:
+        flat_len = seg_len.reshape(-1)
+        cum = np.cumsum(flat_len)
+        cum_prev = cum - flat_len
+        u_pos = np.random.uniform(0.0, total, size=n_fill)
+        seg_idx = np.clip(
+            np.searchsorted(cum, u_pos, side="right"), 0, flat_len.shape[0] - 1)
+        local = (u_pos - cum_prev[seg_idx]) / np.maximum(flat_len[seg_idx], eps)
+        n_seg = u - 1
+        fill_eid = seg_idx // n_seg
+        within = seg_idx % n_seg
+        dist_along = (
+            seg_cum_prev[fill_eid, within] + local * seg_len[fill_eid, within])
+        fill_t = dist_along / np.maximum(edge_len[fill_eid], eps)
+    else:
+        fill_eid = np.zeros(0, dtype=np.int64)
+        fill_t = np.zeros(0, dtype=np.float64)
 
-    n_seg = u - 1
-    edge_id = seg_idx // n_seg
-    within = seg_idx % n_seg
-    dist_along = seg_cum_prev[edge_id, within] + local * seg_len[edge_id, within]
-    t = dist_along / np.maximum(edge_len[edge_id], eps)
-
-    out["points"] = sampled.astype(np.float32)
-    out["edge_id"] = edge_id.astype(np.int64)
-    out["arclen"] = t.astype(np.float32)
-    out["endpoint_a"] = ea[edge_id].astype(np.float32)
-    out["endpoint_b"] = eb[edge_id].astype(np.float32)
-    return out
+    eid = np.concatenate([base_eid, fill_eid]).astype(np.int64)[:num]
+    t = np.concatenate([base_t, fill_t]).astype(np.float64)[:num]
+    coords = _points_on_edges(
+        seg_start, seg_vec, seg_len, edge_len, seg_cum_prev, eid, t)
+    return _finish(eid, t, coords)
 
 
 def _build_wf_target_labeled(
-    vertices: np.ndarray, edge_points: np.ndarray, num_points: int
+    edge_points: np.ndarray,
+    num_points: int,
+    min_pts_per_edge: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Build the fixed-size RF point set ``(N, 4)`` *plus* stage-2 labels.
+    """Build the fixed-size stage-2 anchor point set ``(N, 3)`` *plus* labels.
 
-    The point set is identical to :func:`_build_wf_target` (vertices as
-    ``type=1`` points, the rest arc-length-sampled edge points as ``type=0``);
-    in addition every point carries the supervision the stage-2 grouper needs:
+    Every point is an **edge point** (no vertex points); vertices are recovered
+    downstream by endpoint voting. Each point carries the supervision the
+    stage-2 grouper regresses:
 
-      * ``is_vertex (N,)``     -- bool mask (vertex point vs edge point);
-      * ``edge_id (N,)``       -- source edge id for edge points (``-1`` else);
-      * ``arclen (N,)``        -- arc-length position ``t`` for edge points;
-      * ``endpoint_a/b (N,3)`` -- the two endpoint coords of that edge;
-      * ``vertex_target (N,3)``-- clean vertex coord for vertex points (the
-        vertex-center voting target; under input augmentation the target stays
-        clean while the input xyz is jittered).
+      * ``edge_id (N,)``       -- source edge id;
+      * ``arclen (N,)``        -- arc-length position ``t``;
+      * ``endpoint_a/b (N,3)`` -- the edge's two endpoint coords;
+      * ``curve_type (N,)``    -- ``0=line / 1=arc / 2=bezier`` of the edge;
+      * ``anchor1/anchor2 (N,3)`` -- the edge's ``t=1/3`` / ``t=2/3`` coords.
     """
-    n = int(num_points)
-    pts = np.zeros((n, 4), dtype=np.float32)
-    is_vertex = np.zeros(n, dtype=bool)
-    edge_id = np.full(n, -1, dtype=np.int64)
-    arclen = np.zeros(n, dtype=np.float32)
-    endpoint_a = np.zeros((n, 3), dtype=np.float32)
-    endpoint_b = np.zeros((n, 3), dtype=np.float32)
-    vertex_target = np.zeros((n, 3), dtype=np.float32)
-
-    v = int(vertices.shape[0])
-    if v >= n:
-        idx = np.random.choice(v, n, replace=False)
-        pts[:, :3] = vertices[idx]
-        pts[:, 3] = 1.0
-        is_vertex[:] = True
-        vertex_target[:] = vertices[idx]
-    else:
-        if v > 0:
-            pts[:v, :3] = vertices
-            pts[:v, 3] = 1.0
-            is_vertex[:v] = True
-            vertex_target[:v] = vertices
-        s = _sample_arclength_labeled(edge_points, n - v)
-        pts[v:, :3] = s["points"]
-        pts[v:, 3] = 0.0
-        edge_id[v:] = s["edge_id"]
-        arclen[v:] = s["arclen"]
-        endpoint_a[v:] = s["endpoint_a"]
-        endpoint_b[v:] = s["endpoint_b"]
-
+    s = _sample_arclength_labeled(
+        edge_points, int(num_points), min_pts_per_edge=int(min_pts_per_edge))
     return {
-        "points": pts,
-        "is_vertex": is_vertex,
-        "edge_id": edge_id,
-        "arclen": arclen,
-        "endpoint_a": endpoint_a,
-        "endpoint_b": endpoint_b,
-        "vertex_target": vertex_target,
+        "points": s["points"],
+        "edge_id": s["edge_id"],
+        "arclen": s["arclen"],
+        "endpoint_a": s["endpoint_a"],
+        "endpoint_b": s["endpoint_b"],
+        "curve_type": s["curve_type"],
+        "anchor1": s["anchor1"],
+        "anchor2": s["anchor2"],
     }
 
 
@@ -524,6 +617,7 @@ class WireframeGraphDataset(Dataset):
         split_path: str,
         edge_dir: str | None = None,
         pointcloud_dirs: list[str] | None = None,
+        files: list[str] | None = None,
         train_ratio: float = 0.9,
         split_seed: int = 42,
         recursive_glob: bool = False,
@@ -536,8 +630,14 @@ class WireframeGraphDataset(Dataset):
         wf_num_points: int = 8192,
         min_edges: int = 1,
         max_load_retries: int = 64,
+        target_seed: int | None = None,
     ) -> None:
         super().__init__()
+        # When set, the (otherwise random) arc-length / vertex sampling of the
+        # RF target is seeded deterministically per index, so each shape always
+        # yields the SAME wf_points. Needed for a clean single-sample overfit
+        # (a target that changes every epoch can never be memorized exactly).
+        self.target_seed = target_seed
         self.format = GraphFormat(
             vertex_merge_tol=vertex_merge_tol,
             max_vertices=max_vertices,
@@ -555,20 +655,26 @@ class WireframeGraphDataset(Dataset):
         self.max_load_retries = max(1, int(max_load_retries))
         self._bad_files: set[str] = set()
 
-        files = resolve_split_files(
-            split,
-            split_path=split_path,
-            edge_dir=edge_dir,
-            train_ratio=train_ratio,
-            split_seed=split_seed,
-            recursive_glob=recursive_glob,
-            auto_build=auto_build_split,
-        )
-        self.files = [p for p in files if os.path.isfile(p)]
+        # An explicit ``files`` list bypasses split resolution entirely (used to
+        # pin the dataset to a fixed set of shapes, e.g. single-sample overfit
+        # where train and val are the same file). Otherwise resolve from split.
+        if files is not None:
+            resolved = [str(p) for p in files]
+        else:
+            resolved = resolve_split_files(
+                split,
+                split_path=split_path,
+                edge_dir=edge_dir,
+                train_ratio=train_ratio,
+                split_seed=split_seed,
+                recursive_glob=recursive_glob,
+                auto_build=auto_build_split,
+            )
+        self.files = [p for p in resolved if os.path.isfile(p)]
         if not self.files:
             raise RuntimeError(
                 f"No edge npz files found for split={split!r} "
-                f"(split_path={split_path!r})")
+                f"(split_path={split_path!r}, files={files!r})")
 
     def __len__(self) -> int:
         return len(self.files)
@@ -651,6 +757,8 @@ class WireframeGraphDataset(Dataset):
         return _clean_point_cloud(points, self.format.max_pc_points)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        if self.target_seed is not None:
+            np.random.seed((int(self.target_seed) + int(idx)) % (2**32))
         n_files = len(self.files)
         max_tries = min(max(self.max_load_retries, 1), max(n_files * 2, 1))
         start_idx = int(idx) % n_files
@@ -721,8 +829,7 @@ class WireframeGraphDataset(Dataset):
         ``WireframePointDataset``) can reuse the file loading / normalization
         retry loop and only customise the emitted tensors.
         """
-        wf_points = _build_wf_target(
-            vertices, edge_points, self.format.wf_num_points)
+        wf_points = _build_wf_target(edge_points, self.format.wf_num_points)
         return {
             "shape_id": shape_id,
             "point_cloud": torch.from_numpy(np.ascontiguousarray(pc)),
@@ -736,36 +843,37 @@ class WireframeGraphDataset(Dataset):
 
 
 class WireframePointDataset(WireframeGraphDataset):
-    """Stage-2 dataset: the GT wireframe **point set** + per-point structure labels.
+    """Stage-2 dataset: the GT wireframe **anchor set** + per-point structure labels.
 
     Reuses :class:`WireframeGraphDataset`'s file resolution / normalization /
     retry loop and only changes the emitted sample: instead of the bare RF
     target ``wf_points`` it returns the labelled target from
-    :func:`_build_wf_target_labeled` (vertex/edge mask, edge id, arc-length,
-    endpoints, vertex-center target) so the stage-2 grouper network can be
-    trained directly on GT point sets.
+    :func:`_build_wf_target_labeled` (edge id, arc-length, endpoints, curve type,
+    anchors) so the stage-2 grouper network can be trained directly on GT anchor
+    point sets. Every point is an edge point (vertices are recovered downstream
+    by endpoint voting); the point set is pure xyz ``(N, 3)``.
 
     To bridge the gap between the clean GT point set (training) and the noisy
-    stage-1 RF output (inference), the *input* point set is optionally
-    augmented while the *labels stay clean*:
+    stage-1 RF output (inference), the *input* point set is optionally augmented
+    with per-point Gaussian xyz ``jitter_std`` (normalized frame) while the
+    *labels stay clean*. Augmentation is label-preserving (point count and
+    per-point identity are unchanged), so the fixed-size tensors still stack
+    cleanly in the collate.
 
-      * ``jitter_std``     -- per-point Gaussian xyz jitter (normalized frame);
-      * ``type_noise_std`` -- Gaussian noise added to the ``type`` channel.
-
-    Augmentation is label-preserving (point count and per-point identity are
-    unchanged), so the fixed-size tensors still stack cleanly in the collate.
+    ``min_pts_per_edge`` guarantees each GT edge receives at least that many
+    sampled points so short edges are never lost under pure arc-length sampling.
     """
 
     def __init__(
         self,
         *,
         jitter_std: float = 0.0,
-        type_noise_std: float = 0.0,
+        min_pts_per_edge: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.jitter_std = float(jitter_std)
-        self.type_noise_std = float(type_noise_std)
+        self.min_pts_per_edge = int(min_pts_per_edge)
 
     def _make_item(
         self,
@@ -779,22 +887,14 @@ class WireframePointDataset(WireframeGraphDataset):
         edge_points: np.ndarray,
     ) -> dict[str, Any]:
         lab = _build_wf_target_labeled(
-            vertices, edge_points, self.format.wf_num_points)
-        wf_points = lab["points"].copy()  # (N, 4) -- the (augmentable) input
+            edge_points, self.format.wf_num_points,
+            min_pts_per_edge=self.min_pts_per_edge)
+        wf_points = lab["points"].copy()  # (N, 3) -- the (augmentable) input
 
         if self.jitter_std > 0.0:
-            wf_points[:, :3] += np.random.normal(
-                0.0, self.jitter_std, size=wf_points[:, :3].shape
+            wf_points += np.random.normal(
+                0.0, self.jitter_std, size=wf_points.shape
             ).astype(np.float32)
-        if self.type_noise_std > 0.0:
-            wf_points[:, 3] = np.clip(
-                wf_points[:, 3]
-                + np.random.normal(
-                    0.0, self.type_noise_std, size=wf_points.shape[0]
-                ).astype(np.float32),
-                0.0,
-                1.0,
-            )
 
         def _t(a: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(np.ascontiguousarray(a))
@@ -805,13 +905,14 @@ class WireframePointDataset(WireframeGraphDataset):
             "pc_scale": torch.tensor(scale, dtype=torch.float32),
             "wf_points": _t(wf_points),
             # per-point stage-2 labels (clean)
-            "lbl_is_vertex": _t(lab["is_vertex"]),
             "lbl_edge_id": _t(lab["edge_id"]),
             "lbl_arclen": _t(lab["arclen"]),
             "lbl_endpoint_a": _t(lab["endpoint_a"]),
             "lbl_endpoint_b": _t(lab["endpoint_b"]),
-            "lbl_vertex_target": _t(lab["vertex_target"]),
-            # native GT graph (for decode-time metrics)
+            "lbl_curve_type": _t(lab["curve_type"]),
+            "lbl_anchor1": _t(lab["anchor1"]),
+            "lbl_anchor2": _t(lab["anchor2"]),
+            # native GT graph (for decode-time metrics + topo loss)
             "vertices": _t(vertices),
             "edge_index": _t(edge_index),
             "edge_points": _t(edge_points),
@@ -880,7 +981,7 @@ def collate_rf_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         pc_offset:     (B,)                     int64    cumsum of per-sample N
         pc_center:     (B, 3)                   float32
         pc_scale:      (B,)                     float32
-        wf_points:     (B, wf_num_points, 4)    float32  (if present)
+        wf_points:     (B, wf_num_points, 3)    float32  (if present)
         gt_wireframes: list[dict]               length B (if present)
         num_graphs:    int                      == B
     """
@@ -923,8 +1024,9 @@ def collate_grouper_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     Python list under ``gt_wireframes`` for decode-time metrics.
     """
     stack_keys = [
-        "wf_points", "lbl_is_vertex", "lbl_edge_id", "lbl_arclen",
-        "lbl_endpoint_a", "lbl_endpoint_b", "lbl_vertex_target",
+        "wf_points", "lbl_edge_id", "lbl_arclen",
+        "lbl_endpoint_a", "lbl_endpoint_b",
+        "lbl_curve_type", "lbl_anchor1", "lbl_anchor2",
     ]
     batch: dict[str, Any] = {
         "shape_id": [str(s["shape_id"]) for s in samples],

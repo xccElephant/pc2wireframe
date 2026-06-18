@@ -1,18 +1,18 @@
 """Permutation-equivariant point-set velocity network (DiT) for Rectified Flow.
 
-Predicts the flow-matching velocity ``v (B, N, 4)`` of a noised point set
-``xt (B, N, 4)`` at time ``t (B,)``, conditioned on the point-cloud latent
+Predicts the flow-matching velocity ``v (B, N, 3)`` of a noised point set
+``xt (B, N, 3)`` at time ``t (B,)``, conditioned on the point-cloud latent
 ``z (B, K, D)`` (here ``K=64`` tokens of ``D=64``).
 
 Design (a point-set DiT, in the spirit of DiT / Point-E):
 
-  * a per-point input projection ``4 -> d_model`` (no positional encoding -- the
+  * a per-point input projection ``3 -> d_model`` (no positional encoding -- the
     set is permutation-equivariant, the network must be too);
   * ``depth`` transformer blocks, each = global **self-attention** over the
     ``N`` points + **cross-attention** to the ``K`` latent tokens + an MLP, all
     modulated by **AdaLN-Zero** from a per-sample conditioning vector built from
     the sinusoidal time embedding plus the mean-pooled latent;
-  * a final AdaLN + zero-initialised linear head projecting back to ``4``.
+  * a final AdaLN + zero-initialised linear head projecting back to ``3``.
 
 Attention uses ``torch.nn.MultiheadAttention`` with ``need_weights=False``,
 which dispatches internally to ``scaled_dot_product_attention`` (Flash /
@@ -120,7 +120,7 @@ class RFPointSetVelocity(nn.Module):
     """Point-set DiT velocity field ``v(t, xt, z)``.
 
     Args:
-        point_dim: per-point channels (``4`` = xyz + type).
+        point_dim: per-point channels (``3`` = xyz).
         cond_dim: per-token latent channels ``D`` (default 256).
         d_model: transformer width.
         depth: number of DiT blocks.
@@ -133,7 +133,7 @@ class RFPointSetVelocity(nn.Module):
 
     def __init__(
         self,
-        point_dim: int = 4,
+        point_dim: int = 3,
         cond_dim: int = 256,
         d_model: int = 384,
         depth: int = 8,

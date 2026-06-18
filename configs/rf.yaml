@@ -23,7 +23,7 @@ model:
 
     # ----- RF velocity network (point-set DiT) -----
     rf_net:
-      point_dim: 4              # (x, y, z, type)
+      point_dim: 3              # (x, y, z) anchor points
       cond_dim: 64              # = pc_encoder.latent_dim
       d_model: 384
       depth: 8
@@ -37,29 +37,21 @@ model:
     # ----- RF target / flow -----
     wf_num_points: 8192         # MUST match data.wf_num_points
     flow_sigma: 0.0             # 1-rectified flow (TorchCFM sigma=0)
-    coupling: ot                # ot = minibatch-OT (xyz cost) | independent
     w_xyz: 1.0                  # weight on the xyz velocity-MSE loss
-    w_type: 1.0                 # weight on the type x1-prediction BCE loss
-    type_pos_weight: 10.0       # BCE pos_weight ~ vertex inverse frequency
 
-    # ----- ODE sampling (validation / prediction) -----
+    # ----- noise<->target coupling -----
+    # Per-sample entropic-OT coupling: matches the N noise points to the N
+    # target points WITHIN each sample so the velocity target is consistent on
+    # the permutation-invariant set. "independent" reverts to random pairing
+    # (which collapses to a centroid blob -- see module docstring).
+    coupling: ot
+    ot_reg: 0.05                # entropic reg (relative to mean cost); lower=sharper
+    ot_iters: 50                # Sinkhorn iterations
+
+    # ----- ODE sampling (prediction: emits the point set for stage-2) -----
     ode_steps: 50               # RF paths are ~straight; 50 euler steps
     ode_method: euler           # fixed-step torchdiffeq solver
-    sample_seed: 0              # fixed x0 seed -> deterministic reconstruction
-
-    # ----- traditional reconstruction -----
-    type_threshold: 0.5         # type >= thr -> vertex point
-    merge_radius: 0.03          # vertex-point cluster merge radius
-    min_votes: 3                # min nearest-two votes for an edge
-
-    # ----- eval metric: CCD / TA / VPE -> weighted final score (val/score) -----
-    eval_w_ccd: 0.3
-    eval_w_ta: 0.4
-    eval_w_vpe: 0.3
-    eval_ccd_tau: 0.1
-    eval_vpe_tau: 0.1
-    eval_match_thresh: 0.1
-    eval_num_per_edge: 32
+    sample_seed: 0              # fixed x0 seed -> deterministic sampling
 
     # ----- optimization -----
     lr: 1.5e-4
@@ -91,12 +83,12 @@ trainer:
   callbacks:
     - class_path: ModelCheckpoint
       init_args:
-        filename: epoch={epoch:03d}-val_score={val/score:.4f}
-        monitor: val/score
+        filename: epoch={epoch:03d}-val_loss={val/loss:.4f}
+        monitor: val/loss
         verbose: false
         save_last: true
         save_top_k: 3
-        mode: max
+        mode: min
         auto_insert_metric_name: false
     - class_path: LearningRateMonitor
       init_args:

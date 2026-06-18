@@ -3,15 +3,15 @@
 
 The stage-2 grouper (``src/module.py::WireframeGrouperModule`` /
 ``src/models/wireframe_grouper.py``) is the learned read-out that replaces the
-fragile traditional reconstruction: a point set ``(N, 4) = (xyz, type)`` ->
-per-point ``{vertex_score, vertex_offset, endpoint_offset, embedding, arclen}``
+fragile traditional reconstruction: an anchor set ``(N, 3) = xyz`` ->
+per-point ``{endpoint_offset, embedding, curve_type, anchor, arclen}``
 -> :func:`src.recon.group_wireframe` -> explicit wireframe.
 
 This script checks the trained grouper's reconstruction quality the same way
 the training loop's ``validation_step`` does, but renders the result so it can
 be eyeballed. For a handful of randomly sampled **validation** shapes it:
 
-  1. builds the *clean* GT-derived point set ``wf_points (N, 4)`` via the real
+  1. builds the *clean* GT-derived anchor set ``wf_points (N, 3)`` via the real
      dataset code path (``WireframePointDataset``, val split, no augmentation --
      exactly what training validates on);
   2. runs the trained grouper net on it and decodes with ``group_wireframe``
@@ -20,7 +20,7 @@ be eyeballed. For a handful of randomly sampled **validation** shapes it:
   3. scores Pred vs GT with the same CCD / TA / VPE proxies the training metric
      uses (numpy/scipy port -- no GPU, no pytorch3d, no pytorch-lightning);
   4. renders a 3-column comparison per shape:
-     ``GT wireframe | Pred wireframe (grouper) | input point set (by type)``.
+     ``GT wireframe | Pred wireframe (grouper) | input anchor set``.
 
 Usage (from the project root)::
 
@@ -93,7 +93,7 @@ def _resolve_ckpt(path: str) -> str:
 def load_grouper(ckpt_path: str, device: str) -> tuple[WireframeGrouper, dict[str, Any]]:
     """Build the grouper net from a checkpoint and return ``(net, hparams)``.
 
-    The net config (``grouper``) and the decode knobs (``vertex_thresh`` etc.)
+    The net config (``grouper``) and the decode knobs (``vertex_merge_radius`` etc.)
     are read straight from the checkpoint's ``hyper_parameters`` so this matches
     the trained run with no manual config plumbing.
     """
@@ -127,21 +127,19 @@ def decode_sample(
     hp: dict[str, Any],
     device: str,
 ) -> dict[str, np.ndarray]:
-    """Run the grouper on one point set and decode it into a wireframe."""
-    pts = wf_points.unsqueeze(0).to(device)  # (1, N, 4)
+    """Run the grouper on one anchor set and decode it into a wireframe."""
+    pts = wf_points.unsqueeze(0).to(device)  # (1, N, 3)
     out = net(pts)
     xyz = pts[0, :, :3].detach().cpu().numpy()
     fields = {
         "xyz": xyz,
-        "vertex_score": out["vertex_score"][0].detach().cpu().numpy(),
-        "vertex_offset": out["vertex_offset"][0].detach().cpu().numpy(),
         "endpoint_offset": out["endpoint_offset"][0].detach().cpu().numpy(),
         "embedding": out["embedding"][0].detach().cpu().numpy(),
-        "arclen": out["arclen"][0].detach().cpu().numpy(),
+        "curve_type": out["curve_type"][0].detach().cpu().numpy(),
+        "anchor": out["anchor"][0].detach().cpu().numpy(),
     }
     return group_wireframe(
         fields,
-        vertex_thresh=float(hp.get("vertex_thresh", 0.5)),
         vertex_merge_radius=float(hp.get("vertex_merge_radius", 0.01)),
         merge_relative=bool(hp.get("vertex_merge_relative", True)),
         split_by_embedding=bool(hp.get("split_by_embedding", True)),
@@ -153,8 +151,7 @@ def decode_sample(
 
 # ----------------------------------------------------------------------
 # Lightweight numpy/scipy metrics (same definitions / tau / weights as the
-# training metric -- a CPU port that needs neither a GPU nor pytorch3d). This
-# is the exact port used by scripts/recon_from_gt.py.
+# training metric -- a CPU port that needs neither a GPU nor pytorch3d).
 # ----------------------------------------------------------------------
 def _flatten_curves(wf: dict[str, np.ndarray], num_per_edge: int) -> np.ndarray:
     ep = wf.get("edge_points")
@@ -281,8 +278,39 @@ def _to_np_wf(sample: dict[str, Any]) -> dict[str, np.ndarray]:
 
 
 # ----------------------------------------------------------------------
-# Visualization: GT wireframe | Pred wireframe | input point set (by type)
+# Visualization: GT wireframe | Pred wireframe | input anchor set
+#
+# Styled to match scripts/render_wireframe.py (matplotlib + 'warmsoft'): each
+# edge is drawn as a thick, round-capped, height-gradient stroke on a clean
+# white background. All shapes are tiled into one big comparison image.
 # ----------------------------------------------------------------------
+_AXIS = {"x": 0, "y": 1, "z": 2}
+
+# built-in low-contrast palettes (mirrors render_wireframe.py)
+_CUSTOM_CMAPS = {
+    "soft": ["#6b8fd6", "#56b6c2", "#86d6a8"],
+    "warmsoft": ["#e8c98a", "#e09b7d", "#cf8aa6"],
+}
+
+
+def _get_cmap(name: str):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    if name in _CUSTOM_CMAPS:
+        return LinearSegmentedColormap.from_list(name, _CUSTOM_CMAPS[name])
+    return plt.get_cmap(name)
+
+
+def _gradient_rgb(t, args) -> np.ndarray:
+    """Map normalized scalars in [0,1] to softened sRGB colors (see render_wireframe)."""
+    t = np.clip(np.asarray(t, dtype=np.float64), 0.0, 1.0)
+    tt = args.color_lo + t * (args.color_hi - args.color_lo)
+    rgb = np.asarray(_get_cmap(args.cmap)(tt))[..., :3]
+    lum = np.tensordot(rgb, np.array([0.2126, 0.7152, 0.0722]), axes=([-1], [0]))
+    return lum[..., None] + args.sat * (rgb - lum[..., None])
+
+
 def _equal_box(ax, pts_list: list[np.ndarray]) -> None:
     allp = [p.reshape(-1, 3) for p in pts_list if p is not None and np.asarray(p).size]
     if not allp:
@@ -299,48 +327,80 @@ def _equal_box(ax, pts_list: list[np.ndarray]) -> None:
     ax.set_box_aspect((1, 1, 1))
 
 
-def _draw_wireframe(ax, wf: dict[str, np.ndarray]) -> None:
+def _draw_wireframe(ax, wf: dict[str, np.ndarray], args) -> None:
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+    axis = _AXIS[args.color_axis]
     ep = np.asarray(wf.get("edge_points"))
     if ep.size:
-        for i in range(ep.shape[0]):
-            p = ep[i].reshape(-1, 3)
-            ax.plot(p[:, 0], p[:, 1], p[:, 2], lw=0.7, color="#1f77b4")
-    v = np.asarray(wf.get("vertices")).reshape(-1, 3)
-    if v.size:
-        ax.scatter(v[:, 0], v[:, 1], v[:, 2], s=10, color="#d62728",
-                   depthshade=False)
+        polys = [ep[i].reshape(-1, 3) for i in range(ep.shape[0])]
+        polys = [p for p in polys if p.shape[0] >= 2]
+        if polys:
+            cat = np.concatenate(polys, axis=0)
+            vmin, vmax = float(cat[:, axis].min()), float(cat[:, axis].max())
+            seg_list, val_list = [], []
+            for p in polys:
+                seg_list.append(np.stack([p[:-1], p[1:]], axis=1))
+                mid = (p[:-1] + p[1:]) * 0.5
+                val_list.append(mid[:, axis])
+            segs = np.concatenate(seg_list, 0)
+            vals = np.concatenate(val_list, 0)
+            t = (vals - vmin) / (vmax - vmin + 1e-12)
+            lc = Line3DCollection(
+                segs, colors=_gradient_rgb(t, args),
+                linewidths=args.linewidth)
+            ax.add_collection3d(lc)
+    if args.show_vertices:
+        v = np.asarray(wf.get("vertices")).reshape(-1, 3)
+        if v.size:
+            ax.scatter(v[:, 0], v[:, 1], v[:, 2], s=6, color="#555555",
+                       depthshade=False)
 
 
-def _visualize(rows: list[dict[str, Any]], out_path: str) -> None:
+def _style_ax(ax, args) -> None:
+    ax.view_init(elev=args.elevation, azim=args.azimuth)
+    # fill the panel: shrink the 3D margins so the shape isn't a tiny blob
+    try:
+        ax.set_box_aspect((1, 1, 1), zoom=args.zoom)
+    except TypeError:  # older matplotlib without the zoom kwarg
+        ax.set_box_aspect((1, 1, 1))
+    ax.set_axis_off()
+    ax.patch.set_alpha(0.0)
+
+
+def _visualize(rows: list[dict[str, Any]], out_path: str, args) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     n = len(rows)
-    fig = plt.figure(figsize=(11.5, 3.6 * n))
-    col_titles = ["GT wireframe", "Pred wireframe (grouper)", "input point set (type)"]
+    panel = args.panel
+    fig = plt.figure(figsize=(3 * panel, n * panel))
+    fig.patch.set_facecolor("white")
+    col_titles = ["GT wireframe", "Pred wireframe (grouper)", "input anchor set"]
+    point_c = "#888888"  # single neutral gray for the point cloud
     for r, row in enumerate(rows):
         gt = row["gt"]
         pred = row["pred"]
-        pts = row["wf_points"]  # (N, 4)
-        is_v = pts[:, 3] >= row["type_threshold"]
+        pts = row["wf_points"]  # (N, 3)
         bounds = [gt.get("edge_points"), gt.get("vertices"),
                   pred.get("edge_points"), pred.get("vertices"), pts[:, :3]]
 
         # col 0: GT wireframe
         ax = fig.add_subplot(n, 3, r * 3 + 1, projection="3d")
-        _draw_wireframe(ax, gt)
+        _draw_wireframe(ax, gt, args)
         _equal_box(ax, bounds)
+        _style_ax(ax, args)
         ax.set_title(
             f"{row['name'][:24]}\n{col_titles[0]}: "
             f"{len(gt['vertices'])} V / {len(gt['edge_index'])} E",
             fontsize=8)
-        ax.tick_params(labelsize=5)
 
         # col 1: Pred wireframe + metrics
         ax = fig.add_subplot(n, 3, r * 3 + 2, projection="3d")
-        _draw_wireframe(ax, pred)
+        _draw_wireframe(ax, pred, args)
         _equal_box(ax, bounds)
+        _style_ax(ax, args)
         m = row["metrics"]
         ax.set_title(
             f"{col_titles[1]}: {len(pred['vertices'])} V / "
@@ -348,29 +408,22 @@ def _visualize(rows: list[dict[str, Any]], out_path: str) -> None:
             f"score={m['score']:.3f}  TA={m['ta']:.3f}  "
             f"CCD={m['ccd']:.3f}  VPE={m['vpe']:.3f}",
             fontsize=8)
-        ax.tick_params(labelsize=5)
 
-        # col 2: input point set colored by type
+        # col 2: input point set (single gray)
         ax = fig.add_subplot(n, 3, r * 3 + 3, projection="3d")
-        ep = pts[~is_v, :3]
-        vp = pts[is_v, :3]
-        if ep.size:
-            ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2], s=1.5,
-                       color="#1f77b4", alpha=0.35, depthshade=False)
-        if vp.size:
-            ax.scatter(vp[:, 0], vp[:, 1], vp[:, 2], s=14,
-                       color="#d62728", depthshade=False)
+        xyz = pts[:, :3]
+        if xyz.size:
+            ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=1.8,
+                       color=point_c, alpha=0.5, depthshade=False)
         _equal_box(ax, bounds)
-        ax.set_title(
-            f"{col_titles[2]}\n{int(is_v.sum())} vtx-pts / "
-            f"{int((~is_v).sum())} edge-pts",
-            fontsize=8)
-        ax.tick_params(labelsize=5)
+        _style_ax(ax, args)
+        ax.set_title(f"{col_titles[2]}\n{len(xyz)} pts", fontsize=8)
 
-    fig.subplots_adjust(top=0.97, bottom=0.02, left=0.02, right=0.98,
-                        hspace=0.28, wspace=0.06)
+    fig.subplots_adjust(top=0.97, bottom=0.01, left=0.01, right=0.99,
+                        hspace=0.12, wspace=0.02)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fig.savefig(out_path, dpi=120, bbox_inches="tight", pad_inches=0.2)
+    fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight", pad_inches=0.1,
+                facecolor="white")
     plt.close(fig)
 
 
@@ -404,8 +457,8 @@ def parse_args() -> argparse.Namespace:
     # RF target format (must match the trained run / grouper_data.yaml)
     p.add_argument("--wf-num-points", type=int, default=8192)
     p.add_argument("--num-edge-points", type=int, default=32)
-    p.add_argument("--type-threshold", type=float, default=0.5,
-                   help="only used to color the input point set")
+    p.add_argument("--min-pts-per-edge", type=int, default=2,
+                   help="min anchor points guaranteed per GT edge")
     # metric knobs (defaults match module.py / WireframeScore)
     p.add_argument("--ccd-tau", type=float, default=0.1)
     p.add_argument("--vpe-tau", type=float, default=0.1)
@@ -413,6 +466,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w-ccd", type=float, default=0.3)
     p.add_argument("--w-ta", type=float, default=0.4)
     p.add_argument("--w-vpe", type=float, default=0.3)
+    # visualization style (matches scripts/render_wireframe.py)
+    p.add_argument("--cmap", default="warmsoft",
+                   help="palette: built-in 'warmsoft'/'soft', or any matplotlib cmap")
+    p.add_argument("--color-axis", default="z", choices=["x", "y", "z"],
+                   help="axis whose value drives the gradient")
+    p.add_argument("--sat", type=float, default=0.9,
+                   help="color saturation (1=full, lower=calmer)")
+    p.add_argument("--color-lo", type=float, default=0.0,
+                   help="use the colormap only from this fraction")
+    p.add_argument("--color-hi", type=float, default=1.0,
+                   help="...up to this fraction (lower=less contrast)")
+    p.add_argument("--linewidth", type=float, default=1.2,
+                   help="line width")
+    p.add_argument("--azimuth", type=float, default=-60.0)
+    p.add_argument("--elevation", type=float, default=18.0)
+    p.add_argument("--show-vertices", action="store_true",
+                   help="overlay GT/Pred vertices as small dots")
+    p.add_argument("--panel", type=float, default=4.5,
+                   help="size (inches) of each subplot -- bigger = clearer")
+    p.add_argument("--zoom", type=float, default=1.2,
+                   help="3D fill factor (>1 zooms in; too high clips the shape)")
+    p.add_argument("--dpi", type=int, default=150, help="output resolution")
     # output
     p.add_argument("--out", default="logs/grouper_val.png")
     p.add_argument("--no-viz", action="store_true")
@@ -431,7 +506,7 @@ def _build_dataset(args: argparse.Namespace) -> WireframePointDataset:
         wf_num_points=args.wf_num_points,
         min_edges=1,
         jitter_std=0.0,
-        type_noise_std=0.0,
+        min_pts_per_edge=int(args.min_pts_per_edge),
     )
 
 
@@ -479,7 +554,7 @@ def main() -> None:
         sample = dataset[idx]
         name = str(sample["shape_id"])
         gt = _to_np_wf(sample)
-        wf_points = sample["wf_points"]  # torch (N, 4)
+        wf_points = sample["wf_points"]  # torch (N, 3)
 
         pred = decode_sample(net, wf_points, hp, args.device)
         m = score_reconstruction(
@@ -499,7 +574,6 @@ def main() -> None:
         rows.append({
             "name": name, "gt": gt, "pred": pred,
             "wf_points": wf_points.numpy(), "metrics": m,
-            "type_threshold": args.type_threshold,
         })
 
     print("-" * len(header))
@@ -513,7 +587,7 @@ def main() -> None:
           f"VPE={_ms(agg['vpe'])}  score={_ms(agg['score'])}")
 
     if not args.no_viz:
-        _visualize(rows, args.out)
+        _visualize(rows, args.out, args)
         print(f"\nSaved GT-vs-Pred comparison -> {args.out}")
 
 

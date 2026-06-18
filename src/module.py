@@ -6,19 +6,26 @@ A single trainable model is driven through ``LightningCLI`` (see
     packed point cloud (coord (P_sum, 3), offset (B,))   (native, variable size)
         -> UtoniaEncoder (frozen PTv3 + trainable latent compressor)
         -> latent z (B, 64, 64)                        (4096-float budget)
-    noise x0 ~ N(0, I) (B, N, 4)
+    noise x0 ~ N(0, I) (B, N, 3)
         -> RFPointSetVelocity (point-set DiT), conditioned on z
         -> ODE integrate t: 0 -> 1 (torchdiffeq)
-        -> wireframe point set x1_hat (B, N, 4) = (xyz, sigmoid(type))
-        -> traditional reconstruction -> wireframe {vertices, edge_index,
-           edge_points} -> CCD / TA / VPE score
+        -> wireframe anchor point set x1_hat (B, N, 3) = xyz
 
-Training uses minibatch-OT-coupled rectified flow (TorchCFM): OT matches the
-noise/target point sets on xyz, then ``ConditionalFlowMatcher`` gives
-``(t, xt, ut)``. The loss is split -- xyz is a velocity MSE while the type
-channel is an x1-prediction BCE (with ``pos_weight`` for the rare vertex class).
-Validation samples deterministically from a fixed noise seed so the metric is
-comparable across epochs.
+Stage-1 stops at the point set; turning it into an explicit wireframe graph is
+stage-2's (the grouper's) job.
+
+Training is 1-rectified flow (TorchCFM ``ConditionalFlowMatcher``) with
+**per-sample optimal-transport coupling**: within each sample the ``N`` noise
+points are matched to the ``N`` target points by entropic OT (``coupling="ot"``)
+so every target is paired with a nearby noise sample, giving ``(t, xt, ut)``.
+This is essential on a permutation-invariant point set -- random/independent
+coupling leaves the per-point velocity target inconsistent and collapses the
+model to the data-centroid mean (a blob). All three xyz channels regress the
+conditional-flow velocity ``ut`` with an MSE loss (so training and the
+velocity-integration sampler use one consistent parameterization). Stage-1
+validation logs only the flow-matching ``val/loss`` on the held-out split and
+selects the checkpoint by it; ``predict_step`` ODE-samples the point set for
+stage-2.
 """
 from __future__ import annotations
 
@@ -33,7 +40,7 @@ from .metrics import WireframeScore
 from .models.utonia_encoder import UtoniaEncoder
 from .models.rf_pointset import RFPointSetVelocity
 from .models.wireframe_grouper import WireframeGrouper, grouper_loss
-from .recon import group_wireframe, reconstruct_wireframe
+from .recon import group_wireframe
 
 
 # ----------------------------------------------------------------------
@@ -54,7 +61,7 @@ def _default_pc_encoder() -> dict[str, Any]:
 
 def _default_rf_net() -> dict[str, Any]:
     return dict(
-        point_dim=4,
+        point_dim=3,
         cond_dim=64,
         d_model=384,
         depth=8,
@@ -67,7 +74,7 @@ def _default_rf_net() -> dict[str, Any]:
 
 def _default_grouper() -> dict[str, Any]:
     return dict(
-        point_dim=4,
+        point_dim=3,
         d_model=256,
         depth=6,
         nhead=8,
@@ -75,6 +82,51 @@ def _default_grouper() -> dict[str, Any]:
         dropout=0.0,
         embed_dim=8,
     )
+
+
+# ----------------------------------------------------------------------
+# Per-sample optimal-transport coupling for the rectified-flow target
+# ----------------------------------------------------------------------
+@torch.no_grad()
+def ot_couple_noise(
+    x0: torch.Tensor, x1: torch.Tensor, *, reg: float, iters: int
+) -> torch.Tensor:
+    """Reorder the noise ``x0`` to align with the target ``x1``, per sample.
+
+    For each sample in the batch *independently*, solve an entropic optimal
+    transport between the ``N`` noise points ``x0`` and the ``N`` target points
+    ``x1`` (squared-Euclidean cost over all channels, uniform marginals) with a
+    numerically-stable log-domain Sinkhorn, then draw one noise index per target
+    row from the transport plan and gather the noise in that order.
+
+    Why: with independent (random) coupling each target point is paired with an
+    arbitrary noise point, so on a permutation-invariant point set the velocity
+    target ``ut = x1 - x0`` has no consistent per-point assignment and its
+    Bayes-optimal regressor is a mean-seeking field that contracts noise to the
+    data centroid (the model collapses to a blob). OT coupling pairs every
+    target with a *nearby* noise sample, turning ``ut`` into a coherent,
+    low-variance target that the network can actually fit. No gradients flow
+    through the coupling -- it only selects (x0, x1) pairs.
+    """
+    b, n, _ = x1.shape
+    out = torch.empty_like(x0)
+    log_n = math.log(max(n, 1))
+    for i in range(b):
+        # cost[r, c] between target row r and noise col c
+        cost = torch.cdist(x1[i], x0[i]) ** 2            # (N, N)
+        eps = float(reg) * cost.mean().clamp_min(1e-8)
+        neg_M = -cost / eps                              # (N, N) = log-kernel
+        f = x1.new_zeros(n)
+        g = x1.new_zeros(n)
+        for _ in range(int(iters)):
+            f = -log_n - torch.logsumexp(neg_M + g[None, :], dim=1)
+            g = -log_n - torch.logsumexp(neg_M + f[:, None], dim=0)
+        # log transport plan (row r sums to 1/N); pick one noise col per row.
+        log_pi = f[:, None] + neg_M + g[None, :]
+        probs = torch.softmax(log_pi, dim=1)             # row-normalized
+        idx = torch.multinomial(probs, 1).squeeze(1)     # (N,)
+        out[i] = x0[i][idx]
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -150,26 +202,18 @@ class RFWireframeModule(_BaseModule):
         # ----- RF target / flow -----
         wf_num_points: int = 8192,
         flow_sigma: float = 0.0,
-        coupling: str = "ot",
         w_xyz: float = 1.0,
-        w_type: float = 1.0,
-        type_pos_weight: float = 10.0,
-        # ----- ODE sampling (validation / prediction) -----
+        # ----- noise<->target coupling -----
+        # "ot": per-sample entropic-OT coupling (aligns each target point with a
+        # nearby noise sample so the velocity target is consistent on the
+        # permutation-invariant set). "independent": standard random pairing.
+        coupling: str = "ot",
+        ot_reg: float = 0.05,
+        ot_iters: int = 50,
+        # ----- ODE sampling (prediction: point set for stage-2) -----
         ode_steps: int = 50,
         ode_method: str = "euler",
         sample_seed: int = 0,
-        # ----- traditional reconstruction -----
-        type_threshold: float = 0.5,
-        merge_radius: float = 0.03,
-        min_votes: int = 3,
-        # ----- eval metric (CCD / TA / VPE -> weighted final score) -----
-        eval_w_ccd: float = 0.3,
-        eval_w_ta: float = 0.4,
-        eval_w_vpe: float = 0.3,
-        eval_ccd_tau: float = 0.1,
-        eval_vpe_tau: float = 0.1,
-        eval_match_thresh: float = 0.1,
-        eval_num_per_edge: int = 32,
         # ----- optimization -----
         lr: float = 1.5e-4,
         weight_decay: float = 1e-4,
@@ -187,23 +231,20 @@ class RFWireframeModule(_BaseModule):
 
         from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
 
+        # The flow matcher only turns a (x0, x1) pair into (t, xt, ut); the
+        # *coupling* (how x0 is paired with x1) is chosen in ``_flow_loss``.
+        # Per-sample OT coupling (``coupling="ot"``) is the important knob here:
+        # on a permutation-invariant point set, random/independent coupling
+        # leaves the per-point velocity target inconsistent and the model
+        # collapses to the data-centroid mean (a Gaussian blob). OT over the N
+        # points *within each sample* pairs every target with a nearby noise
+        # point, which is exactly what makes the velocity learnable.
         self.flow_matcher = ConditionalFlowMatcher(sigma=float(flow_sigma))
-        # Minibatch-OT coupling reorders the (noise, target) pairs so the
-        # regression target is well-posed and conditioning matters more. The
-        # transport cost is computed on xyz only (the type channel must not
-        # drive the geometric assignment).
-        if str(coupling) == "ot":
-            from torchcfm.optimal_transport import OTPlanSampler
 
-            self.ot_sampler = OTPlanSampler(method="exact")
-        else:
-            self.ot_sampler = None
-
-        self.val_metrics = WireframeScore(
-            w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
-            ccd_tau=eval_ccd_tau, vpe_tau=eval_vpe_tau,
-            match_thresh=eval_match_thresh, num_per_edge=eval_num_per_edge,
-        )
+        # Stage-1 validation selects the checkpoint purely by the flow-matching
+        # loss on the val split (no ODE sampling / traditional reconstruction /
+        # CCD-TA-VPE proxy here -- that scoring belongs to stage-2). The eval_*
+        # hparams are kept only for ``predict_step`` reconstruction at export.
 
     # ------------------------------------------------------------------
     def encode(self, batch: dict[str, Any]) -> torch.Tensor:
@@ -214,49 +255,38 @@ class RFWireframeModule(_BaseModule):
         """
         return self.encoder(batch["point_cloud"], batch["pc_offset"])
 
-    def _ot_couple(
-        self, x0: torch.Tensor, x1: torch.Tensor, z: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """OT-reorder the minibatch (transport cost on xyz only).
+    def _flow_loss(
+        self, z: torch.Tensor, x1: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Flow-matching loss (shared by train + val).
 
-        ``sample_map`` returns source/target indices ``(i, j)``. The target
-        ``x1`` and its conditioning latent ``z`` MUST be reordered by the same
-        ``j`` so each ``(x1, z)`` pair stays the same shape; only the noise is
-        matched via ``i``.
+        The xyz velocity target ``ut`` is regressed so training and the
+        velocity-integration sampler share ONE parameterization. The anchor
+        point set is pure xyz (3 channels), so the loss is a single MSE over
+        all three channels.
         """
-        c0 = x0[..., :3].reshape(x0.shape[0], -1)
-        c1 = x1[..., :3].reshape(x1.shape[0], -1)
-        pi = self.ot_sampler.get_map(c0, c1)
-        i, j = self.ot_sampler.sample_map(pi, x0.shape[0], replace=True)
-        return x0[i], x1[j], z[j]
-
-    def training_step(self, batch, batch_idx):
-        z = self.encode(batch)
-        x1 = batch["wf_points"]
         x0 = torch.randn_like(x1)
-        if self.ot_sampler is not None:
-            x0, x1, z = self._ot_couple(x0, x1, z)
+        if str(self.hparams.coupling) == "ot":
+            x0 = ot_couple_noise(
+                x0, x1,
+                reg=float(self.hparams.ot_reg),
+                iters=int(self.hparams.ot_iters),
+            )
         t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
         v = self.net(t, xt, z)
 
-        t_ = t.view(-1, 1, 1).to(xt.dtype)
+        loss_xyz = F.mse_loss(v, ut)
+        loss = self.hparams.w_xyz * loss_xyz
+        return {"loss": loss, "loss_xyz": loss_xyz}
 
-        # Geometry: regress the xyz velocity directly.
-        loss_xyz = F.mse_loss(v[..., :3], ut[..., :3])
-        # Type: x1-prediction classification. (xt + (1 - t) * v)[type] is the
-        # predicted endpoint, used as a logit against the {0,1} target type
-        # (x1 is the OT-aligned target, since x0/x1/z were permuted together).
-        x1_hat_type = (xt + (1.0 - t_) * v)[..., 3]
-        pos_weight = x1_hat_type.new_tensor(float(self.hparams.type_pos_weight))
-        loss_type = F.binary_cross_entropy_with_logits(
-            x1_hat_type, x1[..., 3], pos_weight=pos_weight)
-        loss = self.hparams.w_xyz * loss_xyz + self.hparams.w_type * loss_type
-
+    def training_step(self, batch, batch_idx):
+        z = self.encode(batch)
+        losses = self._flow_loss(z, batch["wf_points"])
         bs = z.shape[0]
-        self.log("train/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
-        self.log("train/loss_xyz", loss_xyz, batch_size=bs, sync_dist=True)
-        self.log("train/loss_type", loss_type, batch_size=bs, sync_dist=True)
-        return loss
+        self.log("train/loss", losses["loss"], batch_size=bs,
+                 prog_bar=True, sync_dist=True)
+        self.log("train/loss_xyz", losses["loss_xyz"], batch_size=bs, sync_dist=True)
+        return losses["loss"]
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -282,93 +312,59 @@ class RFWireframeModule(_BaseModule):
         t_span = torch.linspace(
             0.0, 1.0, int(self.hparams.ode_steps) + 1, device=z.device, dtype=z.dtype)
         traj = odeint(func, x0, t_span, method=str(self.hparams.ode_method))
-        x1_hat = traj[-1]
-        # The type channel is trained as a logit (x1-prediction BCE); squash it
-        # to [0, 1] so the downstream type_threshold and stage-2 input semantics
-        # stay valid for reconstruction / prediction.
-        return torch.cat(
-            [x1_hat[..., :3], torch.sigmoid(x1_hat[..., 3:])], dim=-1)
-
-    def _reconstruct_batch(self, x1_hat: torch.Tensor) -> list[dict[str, Any]]:
-        pts = x1_hat.detach().cpu().numpy()
-        out: list[dict[str, Any]] = []
-        for i in range(pts.shape[0]):
-            out.append(reconstruct_wireframe(
-                pts[i],
-                type_threshold=self.hparams.type_threshold,
-                merge_radius=self.hparams.merge_radius,
-                min_votes=self.hparams.min_votes,
-                num_per_edge=self.hparams.eval_num_per_edge,
-            ))
-        return out
-
-    @staticmethod
-    def _gt_to_numpy(gt_wireframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for g in gt_wireframes:
-            out.append({
-                "vertices": g["vertices"].detach().cpu().numpy(),
-                "edge_index": g["edge_index"].detach().cpu().numpy(),
-                "edge_points": g["edge_points"].detach().cpu().numpy(),
-            })
-        return out
+        # Pure-xyz anchor point set: the integrated endpoint already lives in
+        # the data frame, so just return it.
+        return traj[-1]
 
     def validation_step(self, batch, batch_idx):
-        z = self.encode(batch)
-        x1_hat = self.sample(z)
-        preds = self._reconstruct_batch(x1_hat)
-        self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
+        """Stage-1 validation = flow-matching loss only (drives checkpointing).
 
-    def on_validation_epoch_end(self) -> None:
-        res = self.val_metrics.compute()
-        self.log_dict(
-            {f"val/{k}": v for k, v in res.items() if k != "score"},
-            prog_bar=False, sync_dist=False,
-        )
-        self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
-        self.val_metrics.reset()
-
-    def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        """Per-shape latent + decoded wireframe for submission.
-
-        Predictions live in the per-shape *normalized* frame; they are mapped
-        back to raw CAD coordinates with the stored ``pc_center`` / ``pc_scale``.
+        No ODE sampling / reconstruction / CCD-TA-VPE here. ``val/loss`` is the
+        epoch-mean velocity-matching loss on the held-out split; the loss is
+        stochastic per call (random t / noise) but its mean over the whole val
+        set is stable enough to rank epochs.
         """
         z = self.encode(batch)
-        x1_hat = self.sample(z)
-        wireframes = self._reconstruct_batch(x1_hat)
-        if "pc_center" in batch:
-            center = batch["pc_center"].detach().cpu().numpy()
-            scale = batch["pc_scale"].detach().cpu().numpy()
-            for s, wf in enumerate(wireframes):
-                self._denormalize_wireframe(wf, center[s], float(scale[s]))
+        losses = self._flow_loss(z, batch["wf_points"])
+        bs = z.shape[0]
+        self.log("val/loss", losses["loss"], batch_size=bs, prog_bar=True,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_xyz", losses["loss_xyz"], batch_size=bs,
+                 on_step=False, on_epoch=True, sync_dist=True)
+
+    def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        """Per-shape latent + ODE-sampled wireframe point set.
+
+        Stage-1 stops at the anchor point set ``wf_points (B, N, 3) = xyz``;
+        turning it into an explicit wireframe is stage-2's (the grouper's) job.
+        The point set is emitted in the per-shape *normalized* frame together
+        with ``pc_center`` / ``pc_scale`` so downstream can map xyz back to raw
+        CAD coordinates.
+        """
+        z = self.encode(batch)
+        wf_points = self.sample(z)
         return {
             "shape_id": batch.get("shape_id"),
             "z": z,
-            "wireframes": wireframes,
+            "wf_points": wf_points,
+            "pc_center": batch.get("pc_center"),
+            "pc_scale": batch.get("pc_scale"),
         }
-
-    @staticmethod
-    def _denormalize_wireframe(wf: dict[str, Any], center, scale) -> None:
-        """Inverse of the dataset unit-cube transform (in place)."""
-        if wf.get("vertices") is not None and wf["vertices"].size:
-            wf["vertices"] = wf["vertices"] * scale + center
-        if wf.get("edge_points") is not None and wf["edge_points"].size:
-            wf["edge_points"] = wf["edge_points"] * scale + center
 
 
 # ----------------------------------------------------------------------
 # Wireframe grouper module (learned point-set -> wireframe read-out)
 # ----------------------------------------------------------------------
 class WireframeGrouperModule(_BaseModule):
-    """Learned read-out: a wireframe point set ``(N, 4)`` -> explicit wireframe.
+    """Learned read-out: a wireframe anchor set ``(N, 3)`` -> explicit wireframe.
 
-    Trains :class:`WireframeGrouper` on the labelled point set produced by
-    ``WireframeGrouperDataModule`` (per-point vertex/edge mask, edge id,
-    arc-length, endpoints, vertex target). Decoding at validation time uses
-    :func:`src.recon.group_wireframe` and scores against the native GT graph
-    with the same CCD / TA / VPE proxy as the RF stage, so ``val/score`` is
-    directly comparable to the traditional-reconstruction baseline.
+    Trains :class:`WireframeGrouper` on the labelled anchor set produced by
+    ``WireframeGrouperDataModule`` (per-point edge id, arc-length, endpoints,
+    curve type, anchors). All supervision is teacher-forced; decoding at
+    validation time uses :func:`src.recon.group_wireframe` and scores against
+    the native GT graph with the same CCD / TA / VPE proxy as the RF stage, so
+    ``val/score`` is directly comparable to the traditional-reconstruction
+    baseline.
 
     This module is standalone: it consumes wireframe point sets, not raw point
     clouds, so it can be trained on GT point sets without the RF encoder. At
@@ -380,15 +376,20 @@ class WireframeGrouperModule(_BaseModule):
         # ----- model -----
         grouper: dict[str, Any] | None = None,
         # ----- loss weights -----
-        w_score: float = 1.0,
-        w_vertex: float = 1.0,
         w_endpoint: float = 1.0,
+        w_anchor: float = 1.0,
+        w_curve_type: float = 1.0,
         w_arclen: float = 1.0,
         w_embed: float = 1.0,
+        w_topo: float = 1.0,
+        w_curve_geom: float = 0.1,
         embed_delta_var: float = 0.5,
         embed_delta_dist: float = 1.5,
+        # type CE class weights (line / arc / bezier); line tends to dominate.
+        curve_type_class_weights: list[float] | None = None,
+        topo_tau: float = 0.1,
+        geom_num_per_edge: int = 32,
         # ----- decode (validation) -----
-        vertex_thresh: float = 0.5,
         vertex_merge_radius: float = 0.01,
         vertex_merge_relative: bool = True,
         split_by_embedding: bool = True,
@@ -423,11 +424,17 @@ class WireframeGrouperModule(_BaseModule):
     def _loss(self, out, batch) -> dict[str, torch.Tensor]:
         return grouper_loss(
             out, batch,
-            w_score=self.hparams.w_score,
-            w_vertex=self.hparams.w_vertex,
+            gt_wireframes=batch.get("gt_wireframes"),
             w_endpoint=self.hparams.w_endpoint,
+            w_anchor=self.hparams.w_anchor,
+            w_curve_type=self.hparams.w_curve_type,
             w_arclen=self.hparams.w_arclen,
             w_embed=self.hparams.w_embed,
+            w_topo=self.hparams.w_topo,
+            w_curve_geom=self.hparams.w_curve_geom,
+            curve_type_class_weights=self.hparams.curve_type_class_weights,
+            topo_tau=self.hparams.topo_tau,
+            geom_num_per_edge=self.hparams.geom_num_per_edge,
             embed_kwargs=dict(
                 delta_var=self.hparams.embed_delta_var,
                 delta_dist=self.hparams.embed_delta_dist,
@@ -452,23 +459,20 @@ class WireframeGrouperModule(_BaseModule):
                ) -> list[dict[str, Any]]:
         """Decode a batch of per-point fields into wireframes (numpy)."""
         xyz = pts[..., :3].detach().cpu().numpy()
-        vs = out["vertex_score"].detach().cpu().numpy()
-        voff = out["vertex_offset"].detach().cpu().numpy()
         eoff = out["endpoint_offset"].detach().cpu().numpy()
         emb = out["embedding"].detach().cpu().numpy()
-        arclen = out["arclen"].detach().cpu().numpy()
+        ctype = out["curve_type"].detach().cpu().numpy()
+        anchor = out["anchor"].detach().cpu().numpy()
         wfs: list[dict[str, Any]] = []
         for i in range(xyz.shape[0]):
             wfs.append(group_wireframe(
                 {
                     "xyz": xyz[i],
-                    "vertex_score": vs[i],
-                    "vertex_offset": voff[i],
                     "endpoint_offset": eoff[i],
                     "embedding": emb[i],
-                    "arclen": arclen[i],
+                    "curve_type": ctype[i],
+                    "anchor": anchor[i],
                 },
-                vertex_thresh=self.hparams.vertex_thresh,
                 vertex_merge_radius=self.hparams.vertex_merge_radius,
                 merge_relative=self.hparams.vertex_merge_relative,
                 split_by_embedding=self.hparams.split_by_embedding,

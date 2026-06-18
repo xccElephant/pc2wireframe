@@ -1,10 +1,9 @@
-"""Traditional (non-learned, deterministic) wireframe reconstruction.
+"""Wireframe reconstruction from the stage-2 grouper's per-point fields.
 
-Turns a generated point set ``(N, 4) = (x, y, z, type)`` into an explicit
-wireframe ``{vertices, edge_index, edge_points}`` via vertex clustering plus a
-nearest-two-vertices voting scheme. See :mod:`src.recon.traditional`.
+Turns the learned per-point fields (endpoint offsets / embedding / curve type /
+anchors / arclen) into an explicit wireframe
+``{vertices, edge_index, edge_points}``. See :mod:`src.recon.grouped`.
 """
 from .grouped import group_wireframe
-from .traditional import reconstruct_wireframe
 
-__all__ = ["reconstruct_wireframe", "group_wireframe"]
+__all__ = ["group_wireframe"]
