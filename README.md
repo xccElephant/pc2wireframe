@@ -15,25 +15,36 @@
 
 ## 框架概览
 
-`点云 -> PTv3 -> z(16×256=4096) -> Rectified Flow 去噪点集(xyz,type) -> 传统方法重建 wireframe`。
-**单一可训练模型**(编码器 + RF 速度网络)、**单一 config**、**单阶段训练**:
+`点云 -> PTv3 -> z(16×256=4096) -> Rectified Flow 去噪点集(xyz,type) -> Wireframe Grouper 重建 wireframe`。
+两个**独立训练**的阶段拼成完整流水线:**Stage 1** 把点云压成 latent 再用 rectified flow 解码出一个固定尺寸的
+wireframe 点集;**Stage 2** 用一个学习式 grouper(点云 Transformer)把这堆带噪点集重建成结构化的 wireframe 图,
+取代脆弱的手写规则重建。
 
-| 模块 | 作用 |
-| --- | --- |
-| **PCEncoder** (`PTv3` + `LatentCompressor`) | **原始变长点云**(打包成 `coord (ΣN,3)` + `offset (B,)`,PTv3 原生格式,不再下采样到固定点数) → 确定性 latent `z (B,16,256)`(`variational=false`,`z=mu`,无 KL)。`16×256=4096` floats 正好是比赛 latent 预算上限。 |
-| **RFPointSetVelocity** (点集 DiT) | 以 `z` 为条件的置换等变速度场:对 `8192` 个点做全局 self-attention + 对 16 个 latent token 的 cross-attention,时间步用正弦嵌入 + AdaLN-Zero 注入。注意力走 `scaled_dot_product_attention`(Flash / memory-efficient),`8192` 点自注意力显存 `O(N)` 而非 `O(N²)`,可选 gradient checkpointing。 |
-| **传统重建** (`src/recon/traditional.py`) | RF 采样出的点集 `(N,4)` → wireframe:顶点 = 对 `type≈1` 的点做半径合并聚类;边 = "最近两顶点投票";边曲线 = 其支撑点按投影排序后重采样。纯确定性,无学习。 |
+![pipeline](assets/pipeline.png)
+
+| 模块 | 阶段 | 作用 |
+| --- | --- | --- |
+| **PCEncoder** (`PTv3` + `LatentCompressor`) | Stage 1 | **原始变长点云**(打包成 `coord (ΣN,3)` + `offset (B,)`,PTv3 原生格式,不再下采样到固定点数) → 确定性 latent `z (B,16,256)`(`variational=false`,`z=mu`,无 KL)。`16×256=4096` floats 正好是比赛 latent 预算上限。 |
+| **RFPointSetVelocity** (点集 DiT) | Stage 1 | 以 `z` 为条件的置换等变速度场:对 `8192` 个点做全局 self-attention + 对 16 个 latent token 的 cross-attention,时间步用正弦嵌入 + AdaLN-Zero 注入。注意力走 `scaled_dot_product_attention`(Flash / memory-efficient),`8192` 点自注意力显存 `O(N)` 而非 `O(N²)`,可选 gradient checkpointing。 |
+| **WireframeGrouper** (点集 Transformer) | Stage 2 | 学习式重建,取代手写规则。对每个点回归 `vertex_score / vertex_offset / endpoint_offset / embedding / arclen`(VoteNet 投票 + associative-embedding 风格),解码即 DBSCAN 聚类顶点中心 + 把每条边的两个投票端点 snap 到顶点恢复 `edge_index` + 按 `arclen` 排序恢复曲线。详见 `src/models/wireframe_grouper.py`、`src/recon/grouped.py`。 |
+| **传统重建** (`src/recon/traditional.py`) | (legacy) | RF 采样出的点集 `(N,4)` → wireframe 的纯确定性 baseline:顶点 = 对 `type≈1` 的点做半径合并聚类;边 = "最近两顶点投票";边曲线 = 其支撑点按投影排序后重采样。无学习,作为 grouper 的对照与 fallback 保留。 |
 
 ```mermaid
 flowchart LR
-  PC["raw point cloud (coord ΣN×3, offset B)"] --> ENC["PCEncoder PTv3 + LatentCompressor"]
-  ENC --> Z["latent z (B,16,256) = 4096 floats"]
-  X0["noise x0 ~ N(0,I) (B,N,4)"] --> VEL
-  Z --> VEL["RF velocity net (point-set DiT)"]
-  VEL --> ODE["ODE integrate t:0->1 (torchdiffeq)"]
-  ODE --> WP["wireframe points (B,N,4)=(xyz,type)"]
-  WP --> REC["traditional reconstruction"]
-  REC --> WF["wireframe {vertices, edge_index, edge_points}"]
+  subgraph S1["Stage 1 — Rectified Flow"]
+    PC["raw point cloud (coord ΣN×3, offset B)"] --> ENC["PCEncoder PTv3 + LatentCompressor"]
+    ENC --> Z["latent z (B,16,256) = 4096 floats"]
+    X0["noise x0 ~ N(0,I) (B,N,4)"] --> VEL
+    Z --> VEL["RF velocity net (point-set DiT)"]
+    VEL --> ODE["ODE integrate t:0->1 (torchdiffeq)"]
+    ODE --> WP["wireframe points (B,N,4)=(xyz,type)"]
+  end
+  subgraph S2["Stage 2 — Wireframe Grouper"]
+    WP --> GRP["WireframeGrouper (point transformer)"]
+    GRP --> HEADS["per-point: vertex_score / offsets / embedding / arclen"]
+    HEADS --> DEC["group & decode (DBSCAN + snap + sort)"]
+  end
+  DEC --> WF["wireframe {vertices, edge_index, edge_points}"]
   WF --> MET["CCD / TA / VPE"]
 ```
 
@@ -50,12 +61,16 @@ flowchart LR
 
 ## 训练
 
+两个阶段各自独立训练(不共享权重、不端到端联合)。
+
+### Stage 1 — Rectified Flow
+
 依赖:除点云栈外,RF 分支还需 [`torchcfm`](https://github.com/atong01/conditional-flow-matching)
 (`ConditionalFlowMatcher`)与 [`torchdiffeq`](https://github.com/rtqichen/torchdiffeq)(`odeint`)。
 
 训练即 1-rectified flow:`x1=wf_points`、`x0~N(0,I)`,TorchCFM `ConditionalFlowMatcher(sigma=0)` 给出
 `(t, xt, ut)`,网络回归速度 `v=net(t,xt,z)`,损失为 `MSE(v, ut)`。验证用固定噪声种子做确定性 ODE 采样,
-再走传统重建并计算 `val/{score,ccd,ta,vpe}`。
+再走重建并计算 `val/{score,ccd,ta,vpe}`。
 
 ```bash
 # 单 GPU
@@ -68,6 +83,27 @@ python -m src.main fit --config configs/data.yaml --config configs/rf_ddp.yaml
 ```
 
 显存/速度杠杆:`rf_net.{depth,d_model,nhead}`、`data.batch_size`、`wf_num_points (N)`、`rf_net.grad_checkpoint`。
+
+### Stage 2 — Wireframe Grouper
+
+Grouper 不接触点云编码器:它**直接在 GT wireframe 点集上训练**,并对输入加噪(`jitter_std` 抖动 xyz、
+`type_noise_std` 扰动 type 通道)来模拟 Stage 1 输出的带噪点集。每点回归 5 组监督量(顶点/边分类 BCE、
+顶点中心投票 smooth-L1、端点投票 order-invariant smooth-L1、弧长 MSE、判别式实例 embedding),验证时做
+group & decode 并计算同一套 `val/{score,ccd,ta,vpe}`,与传统重建直接可比。
+
+```bash
+# 单 GPU
+python -m src.main fit --config configs/grouper_data.yaml --config configs/grouper.yaml
+# 也可以： bash scripts/run.sh train_grouper
+
+# 8x A800 DDP
+python -m src.main fit --config configs/grouper_data.yaml --config configs/grouper_ddp.yaml
+# 也可以： bash scripts/run.sh train_grouper_ddp
+```
+
+下图为 grouper 验证集重建示例(左:GT wireframe;中:grouper 预测 + 逐样本 `score/ccd/ta/vpe`;右:输入带噪点集):
+
+![grouper validation](assets/grouper_val.png)
 
 ## 推理 / 提交
 

@@ -45,7 +45,7 @@ model:
     flow_sigma: 0.0
 
     # ----- ODE sampling (validation / prediction) -----
-    ode_steps: 50
+    ode_steps: 20               # RF paths are ~straight; 20 euler steps suffice
     ode_method: euler
     sample_seed: 0
 
@@ -73,7 +73,7 @@ model:
     grad_clip: 1.0
 
 trainer:
-  max_epochs: 200
+  max_epochs: 100
   check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/rf.yaml
