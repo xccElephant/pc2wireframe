@@ -66,6 +66,12 @@ def _unit_cube_transform(
     space-filling-curve depth.
     """
     pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        # Degenerate (all points dropped as NaN/Inf/out-of-range): return an
+        # identity transform so callers get a valid (empty) sample instead of
+        # a ``zero-size array`` reduction error. The empty cloud is handled
+        # downstream (e.g. skipped / fallback) by the consumer.
+        return np.zeros(3, dtype=np.float32), 1.0
     lo = pts.min(0)
     hi = pts.max(0)
     center = ((lo + hi) * 0.5).astype(np.float32)
