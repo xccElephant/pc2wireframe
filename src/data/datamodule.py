@@ -33,9 +33,7 @@ from torch.utils.data import DataLoader
 from .dataset import (
     PointCloudDataset,
     WireframeGraphDataset,
-    WireframePointDataset,
     collate_rf_batch,
-    collate_grouper_batch,
 )
 
 
@@ -71,7 +69,7 @@ class WireframeDataModule(pl.LightningDataModule):
         num_edge_points: int = 32,
         # Input point cloud is variable size (packed for PTv3); 0 = keep all.
         max_pc_points: int = 0,
-        wf_num_points: int = 8192,
+        wf_num_points: int = 1024,
         min_edges: int = 1,
         max_load_retries: int = 64,
         # ----- data loader -----
@@ -152,8 +150,8 @@ class WireframeDataModule(pl.LightningDataModule):
     def _seed_worker(worker_id: int) -> None:
         """Give each DataLoader worker a distinct numpy seed.
 
-        The datasets draw arc-length samples / augmentation noise with numpy's
-        global RNG; forked workers otherwise inherit one identical seed and
+        The datasets draw the random vertex upsampling with numpy's global RNG;
+        forked workers otherwise inherit one identical seed and
         produce correlated "random" draws. Re-seeding from the worker's torch
         seed (which Lightning advances per epoch) decorrelates them.
         """
@@ -210,61 +208,4 @@ class WireframeDataModule(pl.LightningDataModule):
         return self.predict_dataloader()
 
 
-class WireframeGrouperDataModule(WireframeDataModule):
-    """Data module for the wireframe grouper: GT wireframe point sets + labels.
-
-    Identical split / path handling to :class:`WireframeDataModule`, but the
-    train / val datasets emit the *labelled* point set
-    (:class:`WireframePointDataset`) and use :func:`collate_grouper_batch`.
-    The ``jitter_std`` knob controls the input xyz augmentation that bridges
-    the gap to the noisy RF-stage output; augmentation is applied to the train
-    split only (val stays clean for honest metrics). ``min_pts_per_edge``
-    guarantees every GT edge keeps a minimum number of sampled points.
-
-    The ``predict`` dataloader is inherited unchanged (point-cloud-only); the
-    grouper is normally run on the RF stage's emitted point sets rather than
-    from raw point clouds, so prediction wiring is left to the caller.
-    """
-
-    collate_fn = staticmethod(collate_grouper_batch)
-
-    def __init__(
-        self,
-        *,
-        jitter_std: float = 0.005,
-        min_pts_per_edge: int = 0,
-        **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-        # The parent's __init__ already saved all shared hparams; only add the
-        # two grouper-specific ones (avoid recapturing **kwargs as a dict).
-        self.save_hyperparameters("jitter_std", "min_pts_per_edge")
-
-    def _make_graph_dataset(self, split: str) -> WireframePointDataset:
-        # Augment the train split only; keep val clean.
-        aug = split in ("train", "all", "trainval")
-        return WireframePointDataset(
-            split=split,
-            split_path=self.hparams.split_path,
-            edge_dir=self._path(self.hparams.train_edge_subdir),
-            pointcloud_dirs=self._pointcloud_dirs,
-            files=self.hparams.overfit_files,
-            train_ratio=self.hparams.train_ratio,
-            split_seed=self.hparams.split_seed,
-            recursive_glob=self.hparams.recursive_glob,
-            auto_build_split=self.hparams.auto_build_split,
-            vertex_merge_tol=self.hparams.vertex_merge_tol,
-            max_vertices=self.hparams.max_vertices,
-            max_edges=self.hparams.max_edges,
-            num_edge_points=self.hparams.num_edge_points,
-            max_pc_points=self.hparams.max_pc_points,
-            wf_num_points=self.hparams.wf_num_points,
-            min_edges=self.hparams.min_edges,
-            max_load_retries=self.hparams.max_load_retries,
-            jitter_std=self.hparams.jitter_std if aug else 0.0,
-            min_pts_per_edge=self.hparams.min_pts_per_edge,
-            target_seed=self.hparams.target_seed,
-        )
-
-
-__all__ = ["WireframeDataModule", "WireframeGrouperDataModule"]
+__all__ = ["WireframeDataModule"]

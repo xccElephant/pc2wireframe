@@ -16,7 +16,7 @@ Design (a point-set DiT, in the spirit of DiT / Point-E):
 
 Attention uses ``torch.nn.MultiheadAttention`` with ``need_weights=False``,
 which dispatches internally to ``scaled_dot_product_attention`` (Flash /
-memory-efficient kernels). Self-attention over ``N=8192`` points therefore
+memory-efficient kernels). Self-attention over the ``N`` points therefore
 costs ``O(N)`` memory rather than materialising the ``O(N^2)`` score matrix.
 Optional ``grad_checkpoint`` trades compute for activation memory.
 """

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize the stage-1 **Rectified-Flow** point set on held-out val shapes.
+"""Visualize the stage-1 **corner Rectified-Flow** output on held-out val shapes.
 
 Stage 1 (``src/module.py::RFWireframeModule``) is
 
@@ -7,7 +7,8 @@ Stage 1 (``src/module.py::RFWireframeModule``) is
         -> UtoniaEncoder (frozen PTv3 + trainable compressor) -> latent z
     noise x0 ~ N(0,I) (B,N,3)
         -> RFPointSetVelocity (point-set DiT), conditioned on z
-        -> ODE integrate t:0->1 -> wireframe anchor point set x1_hat (B,N,3)=xyz
+        -> ODE integrate t:0->1 -> corner point set x1_hat (B,N,3)
+        -> DBSCAN dedup -> recovered vertices
 
 The training loop only logs the flow-matching ``val/loss`` -- it never actually
 *looks* at what the ODE samples. This script does: for a handful of randomly
@@ -15,18 +16,19 @@ sampled **validation** shapes it
 
   1. builds the real dataset sample (``WireframeGraphDataset``, val split, raw
      data, no augmentation -- exactly what training validates on), giving the
-     input point cloud + the **GT anchor point set** ``wf_points (N,3)``;
-  2. runs the trained encoder + RF velocity net and ODE-samples the **predicted
-     anchor set** with the *exact* sampler / hyper-parameters stored in the
-     checkpoint (``ode_steps`` / ``ode_method`` / ``sample_seed``);
-  3. reports per-shape diagnostics (xyz Chamfer between GT & Pred anchor sets,
-     plus the xyz spread to spot a collapsed/blob RF) so a broken stage 1 is
-     obvious from the numbers, not just the picture;
+     input point cloud + the **GT corners** ``vertices (V,3)``;
+  2. runs the trained encoder + RF velocity net and ODE-samples the predicted
+     corner cloud with the *exact* sampler / hyper-parameters stored in the
+     checkpoint (``ode_steps`` / ``ode_method`` / ``sample_seed``), then
+     DBSCAN-dedups it into recovered vertices;
+  3. reports per-shape diagnostics (vertex Chamfer between GT & recovered
+     corners, recovered vs GT corner counts, and the xyz spread to spot a
+     collapsed/blob RF) so a broken stage 1 is obvious from the numbers;
   4. renders a 3-column comparison per shape:
-     ``input point cloud | GT anchor set | Pred anchor set``.
+     ``input point cloud | GT corners | recovered corners (dedup'd RF)``.
 
 Only the light parts of ``src`` are imported (the encoder, the velocity net,
-the dataset); the LightningModule / metric stack (pytorch3d, pytorch-lightning)
+the dataset, the dedup helper); the metric stack (pytorch3d, pytorch-lightning)
 is NOT pulled in. The encoder still needs the Utonia PTv3 backbone deps (spconv
 / flash-attn / torch_scatter), since stage 1 cannot run without encoding the
 point cloud.
@@ -67,6 +69,7 @@ if _PROJECT_ROOT not in sys.path:
 from src.data.dataset import WireframeGraphDataset, collate_rf_batch  # noqa: E402
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
 from src.models.rf_pointset import RFPointSetVelocity  # noqa: E402
+from src.models.edge_predictor import dedup_vertices  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -192,15 +195,19 @@ def _chamfer(a: np.ndarray, b: np.ndarray) -> float:
     return 0.5 * (float(np.mean(da)) + float(np.mean(db)))
 
 
-def diagnose(gt_pts: np.ndarray, pred_pts: np.ndarray) -> dict[str, float]:
-    """Per-shape stage-1 diagnostics comparing GT vs Pred anchor sets ``(N,3)``."""
-    gt_xyz, pred_xyz = gt_pts[:, :3], pred_pts[:, :3]
+def diagnose(
+    gt_verts: np.ndarray, pred_verts: np.ndarray, pred_cloud: np.ndarray
+) -> dict[str, float]:
+    """Per-shape stage-1 diagnostics comparing GT vs recovered corners."""
     return {
-        "cd_all": _chamfer(gt_xyz, pred_xyz),
-        # spread of the predicted xyz vs the GT (a collapsed RF often shrinks
-        # the cloud toward the mean / a blob -> much smaller std).
-        "gt_xyz_std": float(gt_xyz.std()),
-        "pred_xyz_std": float(pred_xyz.std()),
+        # vertex chamfer between the GT corners and the dedup'd RF corners.
+        "vpe": _chamfer(gt_verts, pred_verts),
+        "n_gt": int(gt_verts.shape[0]),
+        "n_pred": int(pred_verts.shape[0]),
+        # spread of the predicted xyz cloud vs the GT corners (a collapsed RF
+        # often shrinks the cloud toward the mean / a blob -> much smaller std).
+        "gt_xyz_std": float(gt_verts.std()) if gt_verts.size else 0.0,
+        "pred_xyz_std": float(pred_cloud.std()) if pred_cloud.size else 0.0,
     }
 
 
@@ -232,12 +239,11 @@ def _resolve_file_indices(dataset: Any, files: list[str]) -> list[int]:
 
 
 # ----------------------------------------------------------------------
-# Visualization: input point cloud | GT anchor set | Pred anchor set
+# Visualization: input point cloud | GT corners | recovered corners (RF dedup)
 #
-# The stage-1 target is a pure-xyz anchor cloud, so anchor points are drawn in
-# a single color (no vertex/edge type split).
+# Corners are drawn as a single-color point set (no vertex/edge type split).
 # ----------------------------------------------------------------------
-_ANCHOR_C = "#3a7ca5"   # anchor points -- cool blue
+_ANCHOR_C = "#d1495b"   # corner points -- warm red
 _PC_C = "#9aa0a6"       # input surface cloud -- neutral gray
 
 
@@ -283,11 +289,11 @@ def _visualize(rows: list[dict[str, Any]], out_path: str, args) -> None:
     panel = args.panel
     fig = plt.figure(figsize=(3 * panel, n * panel))
     fig.patch.set_facecolor("white")
-    col_titles = ["input point cloud", "GT anchor set", "Pred anchor set (RF)"]
+    col_titles = ["input point cloud", "GT corners", "recovered corners (RF dedup)"]
     for r, row in enumerate(rows):
         pc = row["point_cloud"]      # (P, 3)
-        gt = row["gt_points"]        # (N, 3)
-        pred = row["pred_points"]    # (N, 3)
+        gt = row["gt_verts"]         # (V, 3)
+        pred = row["pred_verts"]     # (K, 3)
         d = row["diag"]
         bounds = [pc, gt[:, :3], pred[:, :3]]
 
@@ -302,23 +308,22 @@ def _visualize(rows: list[dict[str, Any]], out_path: str, args) -> None:
         ax.set_title(f"{row['name'][:26]}\n{col_titles[0]}: {len(pc)} pts",
                      fontsize=8)
 
-        # col 1: GT anchor point set
+        # col 1: GT corners
         ax = fig.add_subplot(n, 3, r * 3 + 2, projection="3d")
         _scatter_anchors(ax, gt, args)
         _equal_box(ax, bounds)
         _style_ax(ax, args)
         ax.set_title(
-            f"{col_titles[1]}\n{len(gt)} pts  (std={d['gt_xyz_std']:.3f})",
+            f"{col_titles[1]}\n{d['n_gt']} corners",
             fontsize=8)
 
-        # col 2: Pred anchor point set + diagnostics
+        # col 2: recovered corners + diagnostics
         ax = fig.add_subplot(n, 3, r * 3 + 3, projection="3d")
         _scatter_anchors(ax, pred, args)
         _equal_box(ax, bounds)
         _style_ax(ax, args)
         ax.set_title(
-            f"{col_titles[2]}\n{len(pred)} pts  (std={d['pred_xyz_std']:.3f})\n"
-            f"CD={d['cd_all']:.4f}",
+            f"{col_titles[2]}\n{d['n_pred']} corners  VPE={d['vpe']:.4f}",
             fontsize=8)
 
     fig.subplots_adjust(top=0.96, bottom=0.01, left=0.01, right=0.99,
@@ -358,10 +363,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4,
                    help="shapes encoded/sampled per forward pass")
     # RF target format (must match the trained run / data.yaml)
-    p.add_argument("--wf-num-points", type=int, default=8192)
+    p.add_argument("--wf-num-points", type=int, default=1024)
     p.add_argument("--num-edge-points", type=int, default=32)
     p.add_argument("--max-pc-points", type=int, default=0,
                    help="cap input cloud size (0 = native); only a memory knob")
+    # corner dedup (sampled cloud -> vertices)
+    p.add_argument("--dedup-eps", type=float, default=0.02,
+                   help="DBSCAN eps; fraction of bbox diag when --dedup-relative")
+    p.add_argument("--dedup-absolute", action="store_true",
+                   help="treat --dedup-eps as an absolute distance")
     # sampler overrides (default: read from ckpt hyper-parameters)
     p.add_argument("--ode-steps", type=int, default=None)
     p.add_argument("--ode-method", default=None)
@@ -399,7 +409,7 @@ def _build_dataset(args: argparse.Namespace) -> WireframeGraphDataset:
 
 def main() -> None:
     args = parse_args()
-    np.random.seed(args.seed)  # arc-length / vertex sampling reproducibility
+    np.random.seed(args.seed)  # vertex upsampling reproducibility
 
     ckpt_path = _resolve_ckpt(args.ckpt)
     print(f"Loading stage-1 checkpoint: {ckpt_path}")
@@ -423,12 +433,13 @@ def main() -> None:
     if not indices:
         raise SystemExit("No shapes selected.")
 
-    header = (f"{'shape':<42} {'CD':>7} | {'gStd':>6} {'pStd':>6}")
+    header = (f"{'shape':<42} {'VPE':>7} | {'nGT':>5} {'nPred':>5} | "
+              f"{'gStd':>6} {'pStd':>6}")
     print(header)
     print("-" * len(header))
 
     rows: list[dict[str, Any]] = []
-    agg: dict[str, list[float]] = {k: [] for k in ("cd_all",)}
+    agg: dict[str, list[float]] = {k: [] for k in ("vpe",)}
 
     # Process in small batches: encode the packed point cloud + ODE-sample.
     for start in range(0, len(indices), max(1, args.batch_size)):
@@ -447,19 +458,23 @@ def main() -> None:
 
         for j, s in enumerate(samples):
             name = str(s["shape_id"])
-            gt_pts = s["wf_points"].numpy()        # (N, 3)
-            pred_pts = pred[j]                     # (N, 3)
+            gt_verts = s["vertices"].numpy()       # (V, 3) GT corners
+            pred_cloud = pred[j]                   # (N, 3) sampled corner cloud
+            pred_verts = dedup_vertices(
+                pred_cloud, eps=args.dedup_eps,
+                relative=not args.dedup_absolute)  # (K, 3)
             pc_np = s["point_cloud"].numpy()       # (P, 3)
-            d = diagnose(gt_pts, pred_pts)
+            d = diagnose(gt_verts, pred_verts, pred_cloud)
             for k in agg:
                 agg[k].append(d[k])
 
-            print(f"{name[:42]:<42} {d['cd_all']:>7.4f} | "
+            print(f"{name[:42]:<42} {d['vpe']:>7.4f} | "
+                  f"{d['n_gt']:>5d} {d['n_pred']:>5d} | "
                   f"{d['gt_xyz_std']:>6.3f} {d['pred_xyz_std']:>6.3f}")
 
             rows.append({
                 "name": name, "point_cloud": pc_np,
-                "gt_points": gt_pts, "pred_points": pred_pts, "diag": d,
+                "gt_verts": gt_verts, "pred_verts": pred_verts, "diag": d,
             })
 
     print("-" * len(header))
@@ -471,11 +486,11 @@ def main() -> None:
             return "n/a"
         return f"{arr.mean():.4f}±{arr.std():.4f}"
 
-    print(f"mean±std over {len(rows)} shapes:  CD={_ms(agg['cd_all'])}")
+    print(f"mean±std over {len(rows)} shapes:  VPE={_ms(agg['vpe'])}")
 
     if not args.no_viz:
         _visualize(rows, args.out, args)
-        print(f"\nSaved GT-vs-Pred point-set comparison -> {args.out}")
+        print(f"\nSaved GT-vs-recovered corner comparison -> {args.out}")
 
 
 if __name__ == "__main__":

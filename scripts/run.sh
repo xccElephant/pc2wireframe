@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# Rectified-Flow PC2Wireframe training driver -- a single trainable model
-# (PTv3 encoder + RF velocity net), single config, single stage.
+# Two-stage PC2Wireframe training driver:
+#   stage 1 = corner Rectified Flow (PTv3 encoder + RF velocity net)
+#   stage 2 = edge predictor (vertices + latent z -> connectivity + curves)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 DATA=configs/data.yaml
 
-# ----- train (single GPU) -----
+# ----- stage 1: corner RF (single GPU) -----
 train() {
   python -m src.main fit --config "$DATA" --config configs/rf.yaml
 }
 
-# ----- train (8x A800 DDP) -----
+# ----- stage 1: corner RF (8x A800 DDP) -----
 train_ddp() {
   python -m src.main fit --config "$DATA" --config configs/rf_ddp.yaml
 }
 
-# ----- wireframe grouper (learned reconstruction; trains on GT point sets) -----
-train_grouper() {
-  python -m src.main fit \
-    --config configs/grouper_data.yaml --config configs/grouper.yaml
+# ----- stage 2: edge predictor (single GPU) -----
+train_edge() {
+  python -m src.main fit --config configs/edge.yaml
 }
 
-# ----- wireframe grouper (8x A800 DDP) -----
-train_grouper_ddp() {
+# ----- stage 2: edge predictor (8x A800 DDP) -----
+train_edge_ddp() {
   python -m src.main fit \
-    --config configs/grouper_data.yaml --config configs/grouper_ddp.yaml
+    --config configs/edge.yaml --config configs/edge_ddp.yaml
 }
 
-# ----- inference / submission (pass CKPT=<rf.ckpt>) -----
+# ----- stage-1 inference (corner cloud + dedup'd vertices; pass CKPT=<rf.ckpt>) -----
 predict() {
   python -m src.main predict --config "$DATA" --config configs/rf.yaml \
     --ckpt_path "${CKPT:?set CKPT to the trained RF checkpoint}"

@@ -1,0 +1,153 @@
+# Stage 2 -- edge predictor. GT corners + latent z -> pairwise edge logits +
+# per-edge curves. Self-contained (data + model + single-GPU trainer).
+# Run with:
+#   python -m src.main fit --config configs/edge.yaml
+#
+# point cloud -> UtoniaEncoder (own compressor) -> z
+# GT vertices (+ aug) -> EdgePredictor(z) -> edge logits (VxV) + U x 3 curves
+# -> threshold + assemble -> wireframe -> CCD / TA / VPE.
+# For 8x A800 DDP add: --config configs/edge_ddp.yaml
+seed_everything: 3407
+
+data:
+  class_path: src.data.WireframeDataModule
+  init_args:
+    # ----- paths (relative to project root); shared with the RF stage -----
+    data_root: data
+    train_edge_subdir: train/sample_edge
+    train_pointcloud_subdir: train/sample_pointcloud
+    predict_pointcloud_subdir: test/sample_pointcloud
+    split_path: data/split.json
+    recursive_glob: false
+
+    # ----- train/val split (reuses the RF-stage split file) -----
+    use_val: true
+    auto_build_split: true
+    train_ratio: 0.9
+    split_seed: 42
+
+    # ----- graph / point-cloud format -----
+    vertex_merge_tol: 0.0001
+    # Cap corners at the predictor's Vmax so the padded V x V adjacency fits
+    # (a shape with more corners than model.vmax is dropped). Matches stage 1's
+    # max_vertices.
+    max_vertices: 512
+    max_edges: 1024
+    num_edge_points: 32         # U; MUST match model.edge_predictor.num_edge_points
+    max_pc_points: 0
+    wf_num_points: 1024         # stage-1 corner target (unused by stage 2, kept for collate)
+    min_edges: 1
+    max_load_retries: 64
+
+    # ----- data loader -----
+    shuffle: true
+    num_workers: 8
+    # V^2 pairwise + along-edge evidence are memory heavy and grow as vmax^2;
+    # at vmax=512 a batch of 8 is reasonable (lower it if you raise vmax / hit OOM).
+    batch_size: 8
+    pin_memory: true
+    prefetch_factor: 2
+    persistent_workers: true
+
+model:
+  class_path: src.module.EdgePredictorModule
+  init_args:
+    # ----- point-cloud encoder: frozen Utonia PTv3 + INDEPENDENT compressor -----
+    # (decoupled from stage 1; trained from scratch -- only PTv3 is shared+frozen)
+    pc_encoder:
+      utonia: logs/utonia/utonia.pth
+      grid_size: 0.01
+      freeze: true
+      latent_num: 64
+      latent_dim: 64
+      compressor_heads: 8
+      compressor_layers: 1
+
+    # ----- edge predictor -----
+    edge_predictor:
+      point_dim: 3
+      z_dim: 64                 # = pc_encoder.latent_dim
+      d_model: 256
+      depth: 6
+      nhead: 8
+      mlp_ratio: 4.0
+      dropout: 0.0
+      pair_dim: 64              # bounds the V x V pairwise feature memory
+      num_edge_points: 32       # U; MUST match data.num_edge_points
+      use_edge_evidence: true   # PC2WF-style along-edge z evidence
+      edge_evidence_points: 4   # M samples per candidate segment
+      evidence_dim: 64
+
+    vmax: 512                   # MUST be >= data.max_vertices (matches stage 1)
+
+    # ----- loss -----
+    w_edge: 1.0
+    w_curve: 1.0
+    # Negatives dominate the V^2 pairs; "focal" balances them, or use "bce" with
+    # edge_pos_weight > 1.
+    edge_loss: focal
+    focal_alpha: 0.75
+    focal_gamma: 2.0
+    edge_pos_weight: 0.0
+
+    # ----- train-time augmentation (bridge to noisy stage-1 corners) -----
+    jitter_std: 0.01            # per-corner xyz jitter (normalized frame)
+    fake_vertex_frac: 0.1       # add ~10% spurious corners (all-zero adjacency)
+    fake_vertex_jitter: 0.05    # spurious corners = jittered copies of real ones
+    vertex_dropout: 0.0         # optionally drop real corners (+ their edges)
+
+    # ----- decode (validation / predict) -----
+    # focal / pos_weight pushes the optimal cut away from 0.5; each val epoch
+    # sweeps edge_thresholds and persists the score-maximising one
+    # (best_edge_threshold) for inference. edge_threshold is only the initial
+    # fallback used before the first validation.
+    edge_threshold: 0.5
+    edge_thresholds: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    num_per_edge: 32
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+
+    # ----- optimization -----
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1                    # single GPU; add configs/edge_ddp.yaml for 8x A800
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: edge_predictor
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

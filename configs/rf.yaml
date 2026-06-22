@@ -1,10 +1,11 @@
-# Rectified-Flow PC2Wireframe -- single-stage, single trainable model.
+# Stage 1 -- corner Rectified Flow. Single trainable model (PTv3 encoder + RF
+# velocity net).
 # Run with:
 #   python -m src.main fit --config configs/data.yaml --config configs/rf.yaml
 #
 # point cloud -> UtoniaEncoder (frozen PTv3 + trainable latent compressor)
-# -> RFPointSetVelocity (point-set DiT) -> ODE-sampled point set (xyz, type)
-# -> traditional reconstruction -> wireframe. For 8x A800 DDP use rf_ddp.yaml.
+# -> RFPointSetVelocity (point-set DiT) -> ODE-sampled corner point set (xyz)
+# -> DBSCAN dedup -> vertices. For 8x A800 DDP use rf_ddp.yaml.
 seed_everything: 3407
 
 model:
@@ -23,38 +24,48 @@ model:
 
     # ----- RF velocity network (point-set DiT) -----
     rf_net:
-      point_dim: 3              # (x, y, z) anchor points
+      point_dim: 3              # (x, y, z) corner points
       cond_dim: 64              # = pc_encoder.latent_dim
       d_model: 384
       depth: 8
       nhead: 6
       mlp_ratio: 4.0
       dropout: 0.0
-      # Flash/mem-efficient attention keeps 8192-point self-attn at O(N) memory;
-      # flip this on if you raise depth / d_model / batch_size and hit OOM.
+      # Flash/mem-efficient attention keeps the self-attn at O(N) memory; flip
+      # this on if you raise depth / d_model / batch_size and hit OOM.
       grad_checkpoint: false
 
     # ----- RF target / flow -----
-    wf_num_points: 8192         # MUST match data.wf_num_points
+    wf_num_points: 1024         # MUST match data.wf_num_points (corner budget N)
     flow_sigma: 0.0             # 1-rectified flow (TorchCFM sigma=0)
     w_xyz: 1.0                  # weight on the xyz velocity-MSE loss
 
     # ----- noise<->target coupling -----
     # Per-sample entropic-OT coupling: matches the N noise points to the N
-    # target points WITHIN each sample so the velocity target is consistent on
-    # the permutation-invariant set. "independent" reverts to random pairing
-    # (which collapses to a centroid blob -- see module docstring).
+    # corner-target points WITHIN each sample so the velocity target is
+    # consistent on the permutation-invariant set. "independent" reverts to
+    # random pairing (which collapses to a centroid blob -- see module docstring).
     coupling: ot
     ot_reg: 0.05                # entropic reg (relative to mean cost); lower=sharper
     ot_iters: 50                # Sinkhorn iterations
 
-    # ----- ODE sampling (prediction: emits the point set for stage-2) -----
+    # ----- ODE sampling (prediction: corner cloud -> vertices) -----
     ode_steps: 50               # RF paths are ~straight; 50 euler steps
     ode_method: euler           # fixed-step torchdiffeq solver
     sample_seed: 0              # fixed x0 seed -> deterministic sampling
 
+    # ----- corner dedup (sampled cloud -> vertices) -----
+    dedup_eps: 0.02             # DBSCAN eps; with dedup_relative = fraction of bbox diag
+    dedup_relative: true
+    dedup_min_samples: 1
+    # ODE-sample + dedup at validation and log val/vpe (vertex chamfer vs GT
+    # corners). Required because the checkpoint monitor is val/vpe (slower val).
+    val_vpe: true
+
     # ----- optimization -----
-    lr: 1.5e-4
+    # Single-GPU base. lr ~sqrt(batch/16) from the old 1.5e-4@batch16 reference;
+    # at batch 96 that is 1.5e-4 * sqrt(6) ~= 3.7e-4.
+    lr: 3.7e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     warmup_steps: 500
@@ -83,8 +94,8 @@ trainer:
   callbacks:
     - class_path: ModelCheckpoint
       init_args:
-        filename: epoch={epoch:03d}-val_loss={val/loss:.4f}
-        monitor: val/loss
+        filename: epoch={epoch:03d}-val_vpe={val/vpe:.4f}
+        monitor: val/vpe
         verbose: false
         save_last: true
         save_top_k: 3

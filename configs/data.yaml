@@ -3,8 +3,8 @@ data:
   init_args:
     # ----- paths (relative to project root) -----
     data_root: data
-    # RF branch trains on the RAW (uncleaned) wireframes -- the arc-length RF
-    # target tolerates dense / messy edges, so no cleaning step is needed.
+    # RF branch trains on the RAW (uncleaned) wireframes -- the corner RF target
+    # depends only on the GT vertices, so no edge-cleaning step is needed.
     train_edge_subdir: train/sample_edge
     train_pointcloud_subdir: train/sample_pointcloud
     predict_pointcloud_subdir: test/sample_pointcloud
@@ -23,25 +23,29 @@ data:
 
     # ----- graph / point-cloud / RF-target format -----
     vertex_merge_tol: 0.0001
-    # Skip pathologically large wireframes (the dataset drops a sample when
-    # nv > max_vertices or ne > max_edges); keeps the RF target distribution
-    # within a sane size envelope.
-    max_vertices: 1024
+    # The stage-1 RF target upsamples the GT corners to wf_num_points, so a
+    # shape with more than wf_num_points corners cannot be represented; keep
+    # max_vertices <= wf_num_points (the dataset drops a sample when
+    # nv > max_vertices or ne > max_edges). Kept at 512 to match stage 2's vmax.
+    max_vertices: 512
     max_edges: 1024
     num_edge_points: 32
     # Input point cloud is kept at its NATIVE size and packed for PTv3
     # (coord + offset); 0 = keep all points (no detail loss). Set a positive
     # value only as a memory safety cap (random subsample above it).
     max_pc_points: 0
-    # RF target point budget N: every sample yields wf_points (8192, 3).
-    wf_num_points: 8192
+    # RF corner-target point budget N: every sample yields wf_points (1024, 3)
+    # by upsampling the GT vertices with replacement.
+    wf_num_points: 1024
     min_edges: 1
     max_load_retries: 64
 
     # ----- data loader -----
     shuffle: true
     num_workers: 8
-    batch_size: 16
+    # Per-GPU batch. Stage-1 global batch = batch_size * num_devices (8x A800 ->
+    # 768); the RF-stage LR in rf*.yaml is sqrt-scaled from this.
+    batch_size: 96
     pin_memory: true
     prefetch_factor: 2
     persistent_workers: true

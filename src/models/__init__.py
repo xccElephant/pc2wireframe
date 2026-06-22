@@ -8,11 +8,11 @@ imported without the full dependency set installed.
 from .latent_compressor import LatentCompressor
 from .utonia_encoder import UtoniaEncoder
 from .rf_pointset import RFPointSetVelocity
-from .wireframe_grouper import WireframeGrouper
+from .edge_predictor import EdgePredictor
 
 __all__ = [
     "LatentCompressor",
     "UtoniaEncoder",
     "RFPointSetVelocity",
-    "WireframeGrouper",
+    "EdgePredictor",
 ]

@@ -1,0 +1,99 @@
+# Stage 2 -- edge predictor (8x A800 DDP). Multi-GPU twin of edge.yaml: identical
+# model, DDP trainer + an LR scaled for the larger global batch. The data block
+# comes from edge.yaml, so combine both:
+#   python -m src.main fit --config configs/edge.yaml --config configs/edge_ddp.yaml
+seed_everything: 3407
+
+model:
+  class_path: src.module.EdgePredictorModule
+  init_args:
+    pc_encoder:
+      utonia: logs/utonia/utonia.pth
+      grid_size: 0.01
+      freeze: true
+      latent_num: 64
+      latent_dim: 64
+      compressor_heads: 8
+      compressor_layers: 1
+
+    edge_predictor:
+      point_dim: 3
+      z_dim: 64
+      d_model: 256
+      depth: 6
+      nhead: 8
+      mlp_ratio: 4.0
+      dropout: 0.0
+      pair_dim: 64
+      num_edge_points: 32
+      use_edge_evidence: true
+      edge_evidence_points: 4
+      evidence_dim: 64
+
+    vmax: 512
+
+    w_edge: 1.0
+    w_curve: 1.0
+    edge_loss: focal
+    focal_alpha: 0.75
+    focal_gamma: 2.0
+    edge_pos_weight: 0.0
+
+    jitter_std: 0.01
+    fake_vertex_frac: 0.1
+    fake_vertex_jitter: 0.05
+    vertex_dropout: 0.0
+
+    edge_threshold: 0.5
+    edge_thresholds: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    num_per_edge: 32
+
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+
+    # global batch = 8 * 8 = 64; LR ~sqrt-scaled from the batch-8 base (3e-4).
+    lr: 8.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 8                    # 8x A800; for single GPU use configs/edge.yaml alone
+  num_nodes: 1
+  # All trainable params (compressor + edge predictor) contribute to the loss
+  # each step, so plain DDP is safe (no find_unused_parameters pass).
+  strategy: ddp
+  sync_batchnorm: false         # model uses LayerNorm, not BatchNorm
+  use_distributed_sampler: true
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: edge_predictor_ddp
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

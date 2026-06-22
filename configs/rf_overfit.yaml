@@ -2,7 +2,7 @@
 #
 # Pin the whole pipeline to ONE shape and use it for both train and val, then
 # train for many steps: if the RF stage is healthy it must be able to memorize
-# that single wireframe point set (Pred ~ GT). If it still collapses to a blob,
+# that single corner point set (Pred ~ GT). If it still collapses to a blob,
 # the problem is the objective/coupling, not data scale or training length.
 #
 # Append this AFTER data.yaml + rf.yaml so it overrides the relevant knobs:
@@ -27,8 +27,8 @@ data:
     max_vertices: 0
     max_edges: 0
     # Fix the RF target so the SAME wf_points is seen every epoch -- otherwise
-    # the arc-length resampling changes the target each step and the sample can
-    # never be memorized crisply (residual blur).
+    # the vertex upsampling (random with replacement) reshuffles the target each
+    # step and the sample can never be memorized crisply (residual blur).
     target_seed: 0
     use_val: true
     batch_size: 1
