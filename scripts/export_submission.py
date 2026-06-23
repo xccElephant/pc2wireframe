@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Export a competition submission zip from the **two-stage** PC2Wireframe model.
+"""Export a competition submission zip from the single-stage WireframeAE model.
 
-This stitches the two trained checkpoints together exactly like
-``scripts/vis_pipeline_val.py`` -- only instead of rendering a comparison figure
-it serialises every test shape into the layout the official evaluator (and the
+Serialises every test shape into the layout the official evaluator (and the
 ``pc2wireframe_baseline`` submission) expect::
 
     submission/
@@ -18,48 +16,37 @@ it serialises every test shape into the layout the official evaluator (and the
 
 and finally zips ``submission/`` into ``submission.zip``.
 
-Pipeline per shape (identical to ``vis_pipeline_val.py``)::
+Pipeline per shape::
 
     raw test point cloud
-        --[stage 1: UtoniaEncoder -> latent z; RFPointSetVelocity ODE 0->1]-->
-    predicted anchor set x1_hat (N, 3)
-        --[stage 2: WireframeGrouper -> src.recon.group_wireframe]-->
+        --[UtoniaEncoder -> latent z (16x256)]-->
+    latent z
+        --[WireframeAE decoder -> src.recon.decode_wireframe]-->
     wireframe {vertices, edge_index, edge_points}
 
 Coordinate frame
 ----------------
-The dataset normalises every shape into a unit cube (``(x - center) / scale``).
-The grouper therefore predicts in that normalised frame, so before writing we
-**de-normalise back** to the on-disk test frame via ``x * pc_scale + pc_center``
--- the same frame the released baseline submission lives in (and the frame the
-server-side evaluator scores against).
+The WireframeAE works directly in the **raw** point-cloud frame (no per-shape
+normalization), so vertices / curves are written as decoded -- there is no
+de-normalization step.
 
-The per-sample ``latent`` is the stage-1 encoder latent ``z`` flattened to
-``(K,) = latent_num * latent_dim`` floats (must be <= 4096, which the
-``LatentCompressor`` budget already guarantees).
+The per-sample ``latent`` is the encoder latent ``z`` flattened to
+``(K,) = latent_num * latent_dim`` floats (<= 4096, guaranteed by the
+``LatentCompressor`` budget).
 
 Usage (from the project root)::
 
-    # single GPU (defaults mirror scripts/vis_pipeline_val.py)
+    # single GPU
     python scripts/export_submission.py \
-        --stage1-ckpt logs/pc2wireframe/f2yry4qc/checkpoints \
-        --stage2-ckpt logs/pc2wireframe/ro1tlty1/checkpoints \
+        --ckpt logs/pc2wireframe/<run>/checkpoints \
         --test-pc-dir data/test/sample_pointcloud \
         --out-dir logs/submission
 
     # 8-GPU data-parallel (one worker process per GPU, then auto-merge + zip)
     python scripts/export_submission.py --spawn 8 --out-dir logs/submission
 
-Multi-GPU layout: each worker handles a strided shard
-(``indices[rank::world_size]``) and writes loose ``submission/sample_edge/*.npz``
-files; the merge step rebuilds ``latent_pack.npz`` by scanning those files and
-zips the folder. The per-shape result is seeded by stem, so it is identical no
-matter how many GPUs are used.
-
 Resume an interrupted run with ``--resume`` (skips shapes that already have an
-output npz and does NOT wipe the out-dir)::
-
-    python scripts/export_submission.py --spawn 8 --out-dir logs/submission --resume
+output npz and does NOT wipe the out-dir).
 
 Manual launch (instead of ``--spawn``)::
 
@@ -70,8 +57,9 @@ Manual launch (instead of ``--spawn``)::
 from __future__ import annotations
 
 import argparse
-import io
+import glob
 import os
+import re
 import sys
 import zipfile
 from typing import Any
@@ -79,25 +67,132 @@ from typing import Any
 import numpy as np
 import torch
 
-# Make the project importable as a package (``src.*``) and let us reuse the
-# proven stage-stitching helpers from the visualisation script.
+# Make the project importable as a package (``src.*``).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-for _p in (_PROJECT_ROOT, _SCRIPTS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-from src.data.dataset import PointCloudDataset, collate_rf_batch  # noqa: E402
-from vis_pipeline_val import (  # noqa: E402
-    _resolve_ckpt,
-    decode_grouper,
-    load_stage1,
-    load_stage2,
-    rf_sample,
-)
+from src.data.dataset import PointCloudDataset, collate_ae_batch  # noqa: E402
+from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
+from src.models.wireframe_ae import WireframeAE  # noqa: E402
+from src.recon import decode_wireframe  # noqa: E402
 
 NUM_EDGE_POINTS = 32
 LATENT_BUDGET = 4096
+
+
+# ----------------------------------------------------------------------
+# Checkpoint loading (build encoder + decoder directly; no pytorch3d import)
+# ----------------------------------------------------------------------
+def _resolve_ckpt(path: str, metric: str = "val_score", best: str = "max") -> str:
+    """Resolve a checkpoint file or pick the best one in a directory."""
+    if os.path.isfile(path):
+        return path
+    if os.path.isdir(path):
+        cands = glob.glob(os.path.join(path, "*.ckpt"))
+        if not cands:
+            raise FileNotFoundError(f"No .ckpt files under {path!r}")
+        scored: list[tuple[float, str]] = []
+        pat = re.compile(rf"{re.escape(metric)}=([0-9]*\.?[0-9]+)")
+        for c in cands:
+            m = pat.search(os.path.basename(c))
+            if m:
+                scored.append((float(m.group(1)), c))
+        if scored:
+            scored.sort()
+            return scored[0][1] if best == "min" else scored[-1][1]
+        last = os.path.join(path, "last.ckpt")
+        return last if os.path.isfile(last) else cands[0]
+    raise FileNotFoundError(f"Checkpoint path not found: {path!r}")
+
+
+def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
+                  ) -> dict[str, torch.Tensor]:
+    return {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+
+
+def load_model(ckpt_path: str, device: str
+               ) -> tuple[UtoniaEncoder, WireframeAE, dict[str, Any]]:
+    """Build the WireframeAE encoder + decoder from a checkpoint."""
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hp = ck.get("hyper_parameters", {}) or {}
+
+    encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
+    decoder = WireframeAE(**(hp.get("decoder") or {}))
+
+    state = ck["state_dict"] if "state_dict" in ck else ck
+    miss_e, unexp_e = encoder.load_state_dict(
+        _strip_prefix(state, "encoder."), strict=False)
+    miss_d, unexp_d = decoder.load_state_dict(
+        _strip_prefix(state, "decoder."), strict=False)
+
+    comp_missing = [k for k in miss_e if not k.startswith("backbone.")]
+    if comp_missing:
+        print(f"[warn] missing encoder (compressor) keys: {comp_missing}")
+    if unexp_e:
+        print(f"[warn] unexpected encoder keys: {unexp_e[:8]}"
+              f"{' ...' if len(unexp_e) > 8 else ''}")
+    if miss_d:
+        print(f"[warn] missing decoder keys: {miss_d}")
+    if unexp_d:
+        print(f"[warn] unexpected decoder keys: {unexp_d}")
+
+    encoder.eval().to(device)
+    decoder.eval().to(device)
+    return encoder, decoder, hp
+
+
+# ----------------------------------------------------------------------
+# Decode: encoder latent + decoder fields -> wireframe (mirrors module.decode)
+# ----------------------------------------------------------------------
+@torch.no_grad()
+def decode_batch(
+    decoder: WireframeAE,
+    out: dict[str, torch.Tensor],
+    hp: dict[str, Any],
+) -> list[dict[str, np.ndarray]]:
+    """Decode a batch of decoder outputs into wireframes (numpy)."""
+    vertex_logit = out["vertex_logit"]
+    vertex_xyz = out["vertex_xyz"]
+    hidden = out["hidden"]
+    global_vec = out["global"]
+    device = vertex_logit.device
+    b = vertex_logit.shape[0]
+    vt = float(hp.get("vertex_thresh", 0.5))
+    et = float(hp.get("edge_thresh", 0.5))
+    cap = int(hp.get("max_decode_vertices", 512))
+    npe = int(hp.get("num_per_edge", NUM_EDGE_POINTS))
+
+    wfs: list[dict[str, np.ndarray]] = []
+    for i in range(b):
+        prob = torch.sigmoid(vertex_logit[i])
+        alive = torch.nonzero(prob >= vt, as_tuple=False).reshape(-1)
+        if alive.numel() > cap > 0:
+            alive = alive[torch.topk(prob[alive], cap).indices]
+        if alive.numel() < 2:
+            wfs.append({
+                "vertices": vertex_xyz[i][alive].cpu().numpy()
+                .astype(np.float32).reshape(-1, 3),
+                "edge_index": np.zeros((0, 2), dtype=np.int64),
+                "edge_points": np.zeros((0, npe, 3), dtype=np.float32),
+            })
+            continue
+        verts = vertex_xyz[i][alive]
+        va = alive.shape[0]
+        iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+        h = hidden[i][alive]
+        ehead = decoder.edge_logits(
+            h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
+        fields = {
+            "vertices": verts.cpu().numpy().astype(np.float32),
+            "pair_index": torch.stack([iu, ju], dim=1).cpu().numpy(),
+            "edge_prob": torch.sigmoid(ehead["exist"]).cpu().numpy(),
+            "edge_type": ehead["type"].argmax(dim=-1).cpu().numpy(),
+            "q1": ehead["params"][:, 0].cpu().numpy(),
+            "q2": ehead["params"][:, 1].cpu().numpy(),
+        }
+        wfs.append(decode_wireframe(fields, edge_thresh=et, num_per_edge=npe))
+    return wfs
 
 
 # ----------------------------------------------------------------------
@@ -119,32 +214,12 @@ def _resample_curve(curve: np.ndarray, num_points: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
-def _bytes_for_npz(arrays: dict[str, np.ndarray]) -> bytes:
-    buf = io.BytesIO()
-    np.savez(buf, **arrays)
-    return buf.getvalue()
-
-
-def _denormalize(x: np.ndarray, center: np.ndarray, scale: float) -> np.ndarray:
-    """Invert the dataset unit-cube transform: ``x * scale + center``."""
-    x = np.asarray(x, dtype=np.float64)
-    if x.size == 0:
-        return x.astype(np.float32)
-    return (x * float(scale) + center.reshape(1, -1)).astype(np.float32)
-
-
 def _build_sample_npz(
     pred: dict[str, np.ndarray],
     latent: np.ndarray,
-    center: np.ndarray,
-    scale: float,
     num_per_edge: int,
 ) -> dict[str, np.ndarray]:
-    """Convert one decoded wireframe (+ latent) to submission npz arrays.
-
-    ``pred`` is in the normalised frame; ``vertices`` / ``edge_points`` are
-    de-normalised back to the on-disk test frame before writing.
-    """
+    """Convert one decoded wireframe (+ latent) to submission npz arrays."""
     latent = np.asarray(latent, dtype=np.float32).reshape(-1)
     if latent.size == 0:
         raise ValueError("empty latent")
@@ -153,8 +228,6 @@ def _build_sample_npz(
             f"latent size {latent.size} exceeds the {LATENT_BUDGET} budget")
 
     vertices = np.asarray(pred.get("vertices"), dtype=np.float32).reshape(-1, 3)
-    vertices = _denormalize(vertices, center, scale)
-
     edge_index = np.asarray(pred.get("edge_index"), dtype=np.int64).reshape(-1, 2)
 
     raw_ep = np.asarray(pred.get("edge_points"), dtype=np.float32)
@@ -163,8 +236,6 @@ def _build_sample_npz(
         ep = np.empty((n_edges, num_per_edge, 3), dtype=np.float32)
         for e in range(n_edges):
             ep[e] = _resample_curve(raw_ep[e], num_per_edge)
-        ep = _denormalize(ep.reshape(-1, 3), center, scale).reshape(
-            n_edges, num_per_edge, 3)
     else:
         # No usable curves: synthesise straight 32-point polylines from the
         # endpoint vertices so the field stays consistent with edge_index.
@@ -188,12 +259,6 @@ def _build_sample_npz(
 # ----------------------------------------------------------------------
 # Multi-GPU layout
 # ----------------------------------------------------------------------
-# Workers write *loose* npz files straight to ``<out_dir>/submission/`` and a
-# per-rank latent shard under ``<out_dir>/_parts/``; the merge step then builds
-# ``latent_pack.npz`` and zips the whole folder. Sharding is strided
-# (``indices[rank::world_size]``) so the load is balanced, and every shape is
-# decoded under a stable per-stem ``np.random`` seed so the result is identical
-# regardless of how many GPUs / shards are used.
 def _sub_dir(out_dir: str) -> str:
     return os.path.join(out_dir, "submission")
 
@@ -202,23 +267,14 @@ def _sample_dir(out_dir: str) -> str:
     return os.path.join(_sub_dir(out_dir), "sample_edge")
 
 
-def _stem_seed(stem: str) -> int:
-    import zlib
-    return int(zlib.crc32(stem.encode("utf-8")) & 0xFFFFFFFF)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "--stage1-ckpt",
-        default="logs/pc2wireframe/f2yry4qc/checkpoints",
-        help="stage-1 (RF) ckpt file or dir (best val_loss auto-picked)")
-    p.add_argument(
-        "--stage2-ckpt",
-        default="logs/pc2wireframe/ro1tlty1/checkpoints",
-        help="stage-2 (grouper) ckpt file or dir (best val_score auto-picked)")
+        "--ckpt",
+        default="logs/pc2wireframe/checkpoints",
+        help="WireframeAE ckpt file or dir (best val_score auto-picked)")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--test-pc-dir", default="data/test/sample_pointcloud",
@@ -226,13 +282,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default="logs/submission")
     p.add_argument("--zip-name", default="submission.zip")
     p.add_argument("--batch-size", type=int, default=4,
-                   help="shapes encoded/sampled per stage-1 forward pass")
+                   help="shapes encoded/decoded per forward pass")
     p.add_argument("--max-pc-points", type=int, default=0,
                    help="cap input cloud size (0 = native); memory knob only")
-    # stage-1 sampler overrides (default: read from ckpt hyper-parameters)
-    p.add_argument("--ode-steps", type=int, default=None)
-    p.add_argument("--ode-method", default=None)
-    p.add_argument("--sample-seed", type=int, default=None)
     p.add_argument("--limit", type=int, default=0,
                    help="only export the first N shapes (0 = all; debugging)")
     p.add_argument("--no-progress", action="store_true")
@@ -258,33 +310,18 @@ def parse_args() -> argparse.Namespace:
 
 
 # ----------------------------------------------------------------------
-# Worker: run the pipeline on this rank's shard, write loose npz + latent part
+# Worker: run the pipeline on this rank's shard, write loose npz
 # ----------------------------------------------------------------------
 def run_worker(args: argparse.Namespace) -> None:
     world = max(1, int(args.world_size))
     rank = int(args.rank)
 
-    s1_ckpt = _resolve_ckpt(args.stage1_ckpt, "val_loss", "min")
-    s2_ckpt = _resolve_ckpt(args.stage2_ckpt, "val_score", "max")
-    print(f"[rank {rank}] stage-1: {s1_ckpt}")
-    print(f"[rank {rank}] stage-2: {s2_ckpt}")
-    encoder, rf_net, hp1 = load_stage1(s1_ckpt, args.device)
-    grouper, hp2 = load_stage2(s2_ckpt, args.device)
+    ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
+    print(f"[rank {rank}] ckpt: {ckpt}")
+    encoder, decoder, hp = load_model(ckpt, args.device)
 
-    # Latent width (K = num_tokens * latent_dim) -- needed to emit a correctly
-    # shaped fallback latent for degenerate (empty) point clouds.
-    k_latent = int(encoder.compressor.num_tokens * encoder.compressor.latent_dim)
-
-    num_points = int(hp1.get("wf_num_points", 8192))
-    ode_steps = int(args.ode_steps if args.ode_steps is not None
-                    else hp1.get("ode_steps", 50))
-    ode_method = str(args.ode_method if args.ode_method is not None
-                     else hp1.get("ode_method", "euler"))
-    sample_seed = int(args.sample_seed if args.sample_seed is not None
-                      else hp1.get("sample_seed", 0))
-    if rank == 0:
-        print(f"Stage-1 sampler: N={num_points}  steps={ode_steps}  "
-              f"method={ode_method}  seed={sample_seed}")
+    k_latent = int(
+        encoder.compressor.num_tokens * encoder.compressor.latent_dim)
 
     dataset = PointCloudDataset(
         pointcloud_dir=args.test_pc_dir, max_pc_points=args.max_pc_points)
@@ -297,8 +334,6 @@ def run_worker(args: argparse.Namespace) -> None:
     sample_dir = _sample_dir(args.out_dir)
     os.makedirs(sample_dir, exist_ok=True)
 
-    # Resume: drop shapes that already have an output npz so an interrupted
-    # run continues instead of recomputing everything.
     n_skipped = 0
     if args.resume:
         pending: list[int] = []
@@ -314,13 +349,8 @@ def run_worker(args: argparse.Namespace) -> None:
           f"(skipped {n_skipped} existing, world_size={world})")
 
     stems: list[str] = []
-    latents_per_sample: list[np.ndarray] = []
     n_failed = 0
-
     bs = max(1, args.batch_size)
-    # A single-process run gets a tqdm bar; under multi-GPU spawn the bars of
-    # different ranks would clobber each other on the shared terminal, so every
-    # worker instead prints a periodic flushed heartbeat line.
     use_tqdm = (world == 1 and rank == 0 and not args.no_progress)
     pbar = None
     if use_tqdm:
@@ -344,10 +374,8 @@ def run_worker(args: argparse.Namespace) -> None:
     def _emit(stem: str, sample_npz: dict[str, np.ndarray]) -> None:
         np.savez(os.path.join(sample_dir, f"{stem}.npz"), **sample_npz)
         stems.append(stem)
-        latents_per_sample.append(sample_npz["latent"])
 
     def _fallback_npz() -> dict[str, np.ndarray]:
-        """Empty wireframe + zero latent (keeps a degenerate stem covered)."""
         return {
             "latent": np.zeros(k_latent, dtype=np.float32),
             "vertices": np.zeros((0, 3), dtype=np.float32),
@@ -360,10 +388,6 @@ def run_worker(args: argparse.Namespace) -> None:
     for start in range(0, len(shard), bs):
         chunk = shard[start:start + bs]
 
-        # Load this chunk defensively: a corrupt / empty point cloud must not
-        # crash the whole export. Such shapes get a fallback (empty) entry so
-        # the stem stays present in the submission, and never reach the model
-        # (an empty cloud would make PTv3 / the compressor produce NaNs).
         samples: list[dict[str, Any]] = []
         for i in chunk:
             try:
@@ -390,36 +414,26 @@ def run_worker(args: argparse.Namespace) -> None:
         if not samples:
             continue
 
-        batch = collate_rf_batch(samples)
+        batch = collate_ae_batch(samples)
         pc = batch["point_cloud"].to(args.device)
         offset = batch["pc_offset"].to(args.device)
 
         with torch.no_grad():
             z = encoder(pc, offset)                       # (b, K, D)
-            anchors = rf_sample(
-                rf_net, z, num_points=num_points, ode_steps=ode_steps,
-                ode_method=ode_method, sample_seed=sample_seed)  # (b, N, 3)
+            out = decoder(z)
+            preds = decode_batch(decoder, out, hp)
 
         for j, s in enumerate(samples):
             stem = str(s["shape_id"])
-            center = s["pc_center"].numpy().astype(np.float64)
-            scale = float(s["pc_scale"])
             latent = z[j].detach().cpu().numpy().reshape(-1)
-            # Stable per-shape seed -> result is independent of shard layout.
-            np.random.seed(_stem_seed(stem))
             try:
-                pred = decode_grouper(grouper, anchors[j], hp2)
-                # The grouper may decode curves at its own resolution
-                # (hp2.num_per_edge); the submission requires exactly
-                # NUM_EDGE_POINTS per edge, so resample on write.
                 sample_npz = _build_sample_npz(
-                    pred, latent, center, scale, NUM_EDGE_POINTS)
+                    preds[j], latent, NUM_EDGE_POINTS)
             except Exception as exc:  # noqa: BLE001
                 n_failed += 1
                 print(f"[rank {rank}] decode failed {stem}: {exc}; "
                       f"writing empty wireframe (latent kept)", file=sys.stderr)
                 sample_npz = _fallback_npz()
-                # The cloud was valid, so keep the real encoder latent.
                 lat = np.asarray(latent, dtype=np.float32).reshape(-1)
                 if lat.size == k_latent:
                     sample_npz["latent"] = lat
@@ -428,32 +442,27 @@ def run_worker(args: argparse.Namespace) -> None:
 
     if pbar is not None:
         pbar.close()
-
-    # No per-rank latent shard is written: latent_pack is rebuilt at merge time
-    # by scanning every submission/sample_edge/*.npz, which makes both
-    # multi-GPU and --resume runs self-consistent.
     print(f"[rank {rank}] wrote {len(stems)} sample(s) "
           f"({n_failed} failed) -> {sample_dir}")
 
 
 # ----------------------------------------------------------------------
-# Merge: gather latent shards -> latent_pack.npz, then zip submission/
+# Merge: gather latents -> latent_pack.npz, then zip submission/
 # ----------------------------------------------------------------------
 def run_merge(args: argparse.Namespace) -> None:
-    import glob
-
     sample_dir = _sample_dir(args.out_dir)
     files = sorted(glob.glob(os.path.join(sample_dir, "*.npz")))
     if not files:
         raise RuntimeError(
             f"No sample npz under {sample_dir!r}; did the workers run?")
 
-    # Rebuild latent_pack by reading the latent out of every sample npz, so the
-    # pack always matches whatever sample files are present (multi-GPU shards,
-    # resumed runs, etc.).
     all_stems: list[str] = []
     all_latents: list[np.ndarray] = []
     widths: set[int] = set()
+    n_no_edges = 0          # empty wireframes (no edges => zero score)
+    n_no_verts = 0          # empty wireframes (no vertices at all)
+    n_zero_latent = 0       # latent is all-zeros (decode/load fallback)
+    empty_stems: list[str] = []
     for f in files:
         stem = os.path.splitext(os.path.basename(f))[0]
         with np.load(f, allow_pickle=True) as z:
@@ -462,11 +471,45 @@ def run_merge(args: argparse.Namespace) -> None:
                       file=sys.stderr)
                 continue
             lat = np.asarray(z["latent"], dtype=np.float32).reshape(-1)
+            n_v = int(z["num_vertices"]) if "num_vertices" in z.files else int(
+                np.asarray(z["vertices"]).reshape(-1, 3).shape[0]
+                if "vertices" in z.files else 0)
+            n_e = int(z["num_edges"]) if "num_edges" in z.files else int(
+                np.asarray(z["edge_index"]).reshape(-1, 2).shape[0]
+                if "edge_index" in z.files else 0)
+        if n_e == 0:
+            n_no_edges += 1
+            if len(empty_stems) < 20:
+                empty_stems.append(stem)
+        if n_v == 0:
+            n_no_verts += 1
+        if lat.size and not np.any(lat):
+            n_zero_latent += 1
         all_stems.append(stem)
         all_latents.append(lat)
         widths.add(int(lat.size))
     if not all_stems:
         raise RuntimeError("No latents found in sample npz; nothing to merge.")
+
+    # Surface empty / fallback wireframes loudly: they serialise fine and never
+    # abort the export, but score ~0, so a silent pile of them quietly tanks the
+    # submission.
+    n = len(all_stems)
+    if n_no_edges or n_no_verts or n_zero_latent:
+        pct = 100.0 * n_no_edges / max(1, n)
+        print("=" * 64, file=sys.stderr)
+        print("[merge][WARN] empty/fallback wireframes in submission:",
+              file=sys.stderr)
+        print(f"  no edges    : {n_no_edges}/{n} ({pct:.1f}%)  <- score ~0",
+              file=sys.stderr)
+        print(f"  no vertices : {n_no_verts}/{n}", file=sys.stderr)
+        print(f"  zero latent : {n_zero_latent}/{n}", file=sys.stderr)
+        if empty_stems:
+            more = " ..." if n_no_edges > len(empty_stems) else ""
+            print(f"  e.g. {empty_stems}{more}", file=sys.stderr)
+        print("=" * 64, file=sys.stderr)
+    else:
+        print(f"[merge] all {n} wireframes non-empty.")
     if len(widths) != 1:
         raise RuntimeError(
             f"Inconsistent latent widths across samples: {sorted(widths)}. "
@@ -526,19 +569,12 @@ def orchestrate(args: argparse.Namespace) -> None:
         sys.executable, os.path.abspath(__file__),
         "--world-size", str(world),
         "--device", "cuda",
-        "--stage1-ckpt", args.stage1_ckpt,
-        "--stage2-ckpt", args.stage2_ckpt,
+        "--ckpt", args.ckpt,
         "--test-pc-dir", args.test_pc_dir,
         "--out-dir", args.out_dir,
         "--batch-size", str(args.batch_size),
         "--max-pc-points", str(args.max_pc_points),
     ]
-    if args.ode_steps is not None:
-        base += ["--ode-steps", str(args.ode_steps)]
-    if args.ode_method is not None:
-        base += ["--ode-method", str(args.ode_method)]
-    if args.sample_seed is not None:
-        base += ["--sample-seed", str(args.sample_seed)]
     if args.limit and args.limit > 0:
         base += ["--limit", str(args.limit)]
     if args.resume:
@@ -548,9 +584,6 @@ def orchestrate(args: argparse.Namespace) -> None:
     for rank, gpu in enumerate(gpu_ids):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
-        # Each rank prints periodic full-line heartbeats (not a tqdm bar), so
-        # interleaving them on the shared terminal stays readable and lets you
-        # spot a single stuck rank.
         cmd = base + ["--rank", str(rank)]
         procs.append(subprocess.Popen(cmd, env=env))
     codes = [p.wait() for p in procs]
@@ -573,7 +606,6 @@ def main() -> None:
         orchestrate(args)
         return
 
-    # Single-process path (optionally one shard of a manual distributed run).
     if args.world_size <= 1 and args.rank == 0:
         os.makedirs(args.out_dir, exist_ok=True)
         if not args.resume:
@@ -581,8 +613,6 @@ def main() -> None:
         run_worker(args)
         run_merge(args)
     else:
-        # Manual distributed worker: write this shard only; run --merge-only
-        # once all ranks finish.
         run_worker(args)
 
 

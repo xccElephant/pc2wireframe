@@ -1,9 +1,9 @@
-"""Wireframe reconstruction from the stage-2 grouper's per-point fields.
+"""Wireframe reconstruction from the WireframeAE decoder fields.
 
-Turns the learned per-point fields (endpoint offsets / embedding / curve type /
-anchors / arclen) into an explicit wireframe
-``{vertices, edge_index, edge_points}``. See :mod:`src.recon.grouped`.
+Turns the decoder's per-query vertex fields + pairwise edge predictions into an
+explicit wireframe ``{vertices, edge_index, edge_points}``. See
+:mod:`src.recon.wireframe`.
 """
-from .grouped import group_wireframe
+from .wireframe import decode_wireframe
 
-__all__ = ["group_wireframe"]
+__all__ = ["decode_wireframe"]

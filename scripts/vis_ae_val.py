@@ -1,52 +1,28 @@
 #!/usr/bin/env python3
-"""Visualize the **full two-stage PC2Wireframe pipeline** end to end.
-
-This ties the two trained checkpoints together exactly as inference would:
-
-    raw point cloud (coord (P_sum,3), offset (B,))
-        --[stage 1: UtoniaEncoder + RFPointSetVelocity, ODE 0->1]-->
-    predicted anchor point set x1_hat (B, N, 3) = xyz
-        --[stage 2: WireframeGrouper -> src.recon.group_wireframe]-->
-    explicit wireframe {vertices, edge_index, edge_points}
-
-Unlike ``scripts/vis_grouper_val.py`` (which feeds the grouper the *clean* GT
-anchor set), this script feeds the grouper the **stage-1 RF output**, so what
-you see is the true end-to-end quality of the two trained weights stacked.
+"""Visualize the single-stage WireframeAE end to end.
 
 For a handful of shapes from the requested ``--split`` it:
 
   1. loads the input surface point cloud (and, for train/val, the GT wireframe)
      via the real dataset code path -- exactly what training validated on;
-  2. runs stage 1 (encoder + RF velocity net) and ODE-samples the predicted
-     anchor set using the sampler hyper-parameters stored in the stage-1 ckpt;
-  3. runs stage 2 (grouper) on that anchor set and decodes a wireframe using
-     the decode hyper-parameters stored in the stage-2 ckpt;
-  4. renders a per-shape comparison row:
-     ``input point cloud | stage-1 anchor set | stage-2 wireframe | GT wireframe``
+  2. runs the encoder (point cloud -> latent z (16x256)) and the WireframeAE
+     decoder (latent -> vertex queries + pairwise edges) and decodes a
+     wireframe with the thresholds stored in the checkpoint;
+  3. renders a per-shape comparison row:
+     ``input point cloud | predicted wireframe | GT wireframe``
      (the GT column is dropped for the ``test`` split, which has no edges).
 
-``test`` has no ground truth and ships only point clouds, so it is loaded from
-``--test-pc-dir`` via the point-cloud-only dataset and GT scoring is skipped.
-For ``test`` the precomputed **baseline submission** wireframe (``--baseline-dir``)
-is drawn as an extra rightmost column for side-by-side comparison; since the
-baseline only covers a subset of the test clouds, random sampling is restricted
-to shapes that have a baseline result (pass ``--no-baseline`` to disable).
+``test`` ships only point clouds, so it is loaded via the point-cloud-only
+dataset and GT scoring is skipped. For ``test`` the precomputed **baseline
+submission** wireframe (``--baseline-dir``) is drawn as an extra column.
 
 Usage (from the project root)::
 
-    # 6 random val shapes, both stages auto-picking their best checkpoint
-    python scripts/vis_pipeline_val.py \
-        --stage1-ckpt logs/pc2wireframe/f2yry4qc/checkpoints \
-        --stage2-ckpt logs/pc2wireframe/ro1tlty1/checkpoints \
+    python scripts/vis_ae_val.py --ckpt logs/pc2wireframe/<run>/checkpoints \
         --split val --num 6
 
-    # 8 random shapes from the (GT-less) test split
-    python scripts/vis_pipeline_val.py --split test --num 8 \
-        --out logs/pipeline_test.png
-
-Only the light parts of ``src`` are imported (encoders, nets, decoder,
-dataset); the metric stack (pytorch3d) and the LightningModule are not pulled
-in. The stage-1 encoder still needs the Utonia PTv3 backbone deps.
+    python scripts/vis_ae_val.py --split test --num 8 \
+        --out logs/ae_test.png
 """
 from __future__ import annotations
 
@@ -61,7 +37,6 @@ from typing import Any
 import numpy as np
 import torch
 
-# Make the project importable as a package (``src.*``) regardless of cwd.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -69,25 +44,17 @@ if _PROJECT_ROOT not in sys.path:
 from src.data.dataset import (  # noqa: E402
     WireframeGraphDataset,
     PointCloudDataset,
-    collate_rf_batch,
+    collate_ae_batch,
 )
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.models.rf_pointset import RFPointSetVelocity  # noqa: E402
-from src.models.wireframe_grouper import WireframeGrouper  # noqa: E402
-from src.recon import group_wireframe  # noqa: E402
+from src.models.wireframe_ae import WireframeAE  # noqa: E402
+from src.recon import decode_wireframe  # noqa: E402
 
 
 # ----------------------------------------------------------------------
 # Checkpoint loading
 # ----------------------------------------------------------------------
-def _resolve_ckpt(path: str, metric: str, best: str) -> str:
-    """Resolve a checkpoint path.
-
-    A file is used as-is; a directory is scanned for the best checkpoint by the
-    ``metric`` encoded in the filename (``best='min'`` picks the lowest value,
-    e.g. ``val_loss``; ``best='max'`` picks the highest, e.g. ``val_score``),
-    falling back to ``last.ckpt`` then any ``.ckpt``.
-    """
+def _resolve_ckpt(path: str, metric: str = "val_score", best: str = "max") -> str:
     if os.path.isfile(path):
         return path
     if os.path.isdir(path):
@@ -113,112 +80,66 @@ def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
     return {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
 
 
-def load_stage1(ckpt_path: str, device: str
-                ) -> tuple[UtoniaEncoder, RFPointSetVelocity, dict[str, Any]]:
-    """Build stage-1 (encoder + RF velocity net) from a checkpoint."""
+def load_model(ckpt_path: str, device: str
+               ) -> tuple[UtoniaEncoder, WireframeAE, dict[str, Any]]:
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters", {}) or {}
-
     encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
-    net = RFPointSetVelocity(**(hp.get("rf_net") or {}))
-
+    decoder = WireframeAE(**(hp.get("decoder") or {}))
     state = ck["state_dict"] if "state_dict" in ck else ck
-    miss_e, unexp_e = encoder.load_state_dict(_strip_prefix(state, "encoder."), strict=False)
-    miss_n, unexp_n = net.load_state_dict(_strip_prefix(state, "net."), strict=False)
-
-    comp_missing = [k for k in miss_e if not k.startswith("backbone.")]
-    if comp_missing:
-        print(f"[warn] missing stage-1 encoder (compressor) keys: {comp_missing}")
-    if unexp_e:
-        print(f"[warn] unexpected stage-1 encoder keys: {unexp_e[:8]}"
-              f"{' ...' if len(unexp_e) > 8 else ''}")
-    if miss_n:
-        print(f"[warn] missing stage-1 net keys: {miss_n}")
-    if unexp_n:
-        print(f"[warn] unexpected stage-1 net keys: {unexp_n}")
-
+    encoder.load_state_dict(_strip_prefix(state, "encoder."), strict=False)
+    decoder.load_state_dict(_strip_prefix(state, "decoder."), strict=False)
     encoder.eval().to(device)
-    net.eval().to(device)
-    return encoder, net, hp
-
-
-def load_stage2(ckpt_path: str, device: str
-                ) -> tuple[WireframeGrouper, dict[str, Any]]:
-    """Build stage-2 (grouper) from a checkpoint."""
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    hp = ck.get("hyper_parameters", {}) or {}
-    net = WireframeGrouper(**(hp.get("grouper") or {}))
-
-    state = ck["state_dict"] if "state_dict" in ck else ck
-    miss, unexp = net.load_state_dict(_strip_prefix(state, "net."), strict=False)
-    if miss:
-        print(f"[warn] missing stage-2 grouper keys: {miss}")
-    if unexp:
-        print(f"[warn] unexpected stage-2 grouper keys: {unexp}")
-
-    net.eval().to(device)
-    return net, hp
+    decoder.eval().to(device)
+    return encoder, decoder, hp
 
 
 # ----------------------------------------------------------------------
-# Stage-1 sampling: replicate RFWireframeModule.sample
+# Decode (mirrors module.decode / export_submission.decode_batch)
 # ----------------------------------------------------------------------
 @torch.no_grad()
-def rf_sample(
-    net: RFPointSetVelocity,
-    z: torch.Tensor,
-    *,
-    num_points: int,
-    ode_steps: int,
-    ode_method: str,
-    sample_seed: int,
-) -> torch.Tensor:
-    """Deterministic ODE sampling ``x0 -> x1`` conditioned on ``z`` (B, N, 3)."""
-    from torchdiffeq import odeint
+def decode_batch(decoder, out, hp) -> list[dict[str, np.ndarray]]:
+    vertex_logit = out["vertex_logit"]
+    vertex_xyz = out["vertex_xyz"]
+    hidden = out["hidden"]
+    global_vec = out["global"]
+    device = vertex_logit.device
+    b = vertex_logit.shape[0]
+    vt = float(hp.get("vertex_thresh", 0.5))
+    et = float(hp.get("edge_thresh", 0.5))
+    cap = int(hp.get("max_decode_vertices", 512))
+    npe = int(hp.get("num_per_edge", 32))
 
-    b = z.shape[0]
-    n = int(num_points)
-    point_dim = int(net.point_dim)
-    gen = torch.Generator(device=z.device)
-    gen.manual_seed(int(sample_seed))
-    x0 = torch.randn(b, n, point_dim, device=z.device, dtype=z.dtype, generator=gen)
-
-    def func(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return net(t.reshape(()).expand(b), x, z)
-
-    t_span = torch.linspace(0.0, 1.0, int(ode_steps) + 1, device=z.device, dtype=z.dtype)
-    traj = odeint(func, x0, t_span, method=str(ode_method))
-    return traj[-1]
-
-
-# ----------------------------------------------------------------------
-# Stage-2 decode: grouper fields -> wireframe (mirrors module.decode)
-# ----------------------------------------------------------------------
-@torch.no_grad()
-def decode_grouper(
-    net: WireframeGrouper,
-    anchor_pts: torch.Tensor,
-    hp: dict[str, Any],
-) -> dict[str, np.ndarray]:
-    """Run the grouper on one anchor set ``(N, 3)`` and decode a wireframe."""
-    pts = anchor_pts.unsqueeze(0)  # (1, N, 3)
-    out = net(pts)
-    fields = {
-        "xyz": pts[0, :, :3].detach().cpu().numpy(),
-        "endpoint_offset": out["endpoint_offset"][0].detach().cpu().numpy(),
-        "embedding": out["embedding"][0].detach().cpu().numpy(),
-        "curve_type": out["curve_type"][0].detach().cpu().numpy(),
-        "anchor": out["anchor"][0].detach().cpu().numpy(),
-    }
-    return group_wireframe(
-        fields,
-        vertex_merge_radius=float(hp.get("vertex_merge_radius", 0.01)),
-        merge_relative=bool(hp.get("vertex_merge_relative", True)),
-        split_by_embedding=bool(hp.get("split_by_embedding", True)),
-        embed_eps=float(hp.get("embed_eps", 0.5)),
-        min_edge_points=int(hp.get("min_edge_points", 3)),
-        num_per_edge=int(hp.get("num_per_edge", 32)),
-    )
+    wfs: list[dict[str, np.ndarray]] = []
+    for i in range(b):
+        prob = torch.sigmoid(vertex_logit[i])
+        alive = torch.nonzero(prob >= vt, as_tuple=False).reshape(-1)
+        if alive.numel() > cap > 0:
+            alive = alive[torch.topk(prob[alive], cap).indices]
+        if alive.numel() < 2:
+            wfs.append({
+                "vertices": vertex_xyz[i][alive].cpu().numpy()
+                .astype(np.float32).reshape(-1, 3),
+                "edge_index": np.zeros((0, 2), dtype=np.int64),
+                "edge_points": np.zeros((0, npe, 3), dtype=np.float32),
+            })
+            continue
+        verts = vertex_xyz[i][alive]
+        va = alive.shape[0]
+        iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+        h = hidden[i][alive]
+        ehead = decoder.edge_logits(
+            h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
+        fields = {
+            "vertices": verts.cpu().numpy().astype(np.float32),
+            "pair_index": torch.stack([iu, ju], dim=1).cpu().numpy(),
+            "edge_prob": torch.sigmoid(ehead["exist"]).cpu().numpy(),
+            "edge_type": ehead["type"].argmax(dim=-1).cpu().numpy(),
+            "q1": ehead["params"][:, 0].cpu().numpy(),
+            "q2": ehead["params"][:, 1].cpu().numpy(),
+        }
+        wfs.append(decode_wireframe(fields, edge_thresh=et, num_per_edge=npe))
+    return wfs
 
 
 # ----------------------------------------------------------------------
@@ -250,9 +171,7 @@ def _chamfer(a: np.ndarray, b: np.ndarray) -> float:
     return 0.5 * (float(np.mean(da)) + float(np.mean(db)))
 
 
-def _topology_accuracy(
-    pred: dict[str, np.ndarray], gt: dict[str, np.ndarray], match_thresh: float
-) -> float:
+def _topology_accuracy(pred, gt, match_thresh: float) -> float:
     from scipy.spatial import cKDTree
 
     gt_e = np.asarray(gt.get("edge_index"), dtype=np.int64).reshape(-1, 2)
@@ -293,18 +212,8 @@ def _dist_to_score(d: float, tau: float) -> float:
     return float(np.exp(-max(0.0, d) / max(1e-9, tau)))
 
 
-def score_reconstruction(
-    pred: dict[str, np.ndarray],
-    gt: dict[str, np.ndarray],
-    *,
-    num_per_edge: int,
-    ccd_tau: float,
-    vpe_tau: float,
-    match_thresh: float,
-    w_ccd: float,
-    w_ta: float,
-    w_vpe: float,
-) -> dict[str, float]:
+def score_reconstruction(pred, gt, *, num_per_edge, ccd_tau, vpe_tau,
+                         match_thresh, w_ccd, w_ta, w_vpe) -> dict[str, float]:
     ccd = _chamfer(
         _flatten_curves(pred, num_per_edge), _flatten_curves(gt, num_per_edge))
     vpe = _chamfer(pred.get("vertices"), gt.get("vertices"))
@@ -312,26 +221,17 @@ def score_reconstruction(
     ccd_s = _dist_to_score(ccd, ccd_tau)
     vpe_s = _dist_to_score(vpe, vpe_tau)
     score = w_ccd * ccd_s + w_ta * ta + w_vpe * vpe_s
-    return {
-        "ccd": ccd, "vpe": vpe, "ta": ta,
-        "ccd_score": ccd_s, "vpe_score": vpe_s, "score": score,
-    }
+    return {"ccd": ccd, "vpe": vpe, "ta": ta,
+            "ccd_score": ccd_s, "vpe_score": vpe_s, "score": score}
 
 
 # ----------------------------------------------------------------------
 # Dataset + sample selection
 # ----------------------------------------------------------------------
 def _build_dataset(args: argparse.Namespace) -> Any:
-    """Build the dataset for the requested split.
-
-    train/val -> ``WireframeGraphDataset`` (point cloud + GT wireframe).
-    test      -> ``PointCloudDataset`` (point cloud only; no GT).
-    """
     if args.split == "test":
         return PointCloudDataset(
-            pointcloud_dir=args.test_pc_dir,
-            max_pc_points=args.max_pc_points,
-        )
+            pointcloud_dir=args.test_pc_dir, max_pc_points=args.max_pc_points)
     return WireframeGraphDataset(
         split=args.split,
         split_path=args.split_path,
@@ -339,15 +239,12 @@ def _build_dataset(args: argparse.Namespace) -> Any:
         pointcloud_dirs=[os.path.join(args.data_root, args.pc_subdir)],
         auto_build_split=True,
         num_edge_points=args.num_edge_points,
-        wf_num_points=args.wf_num_points,
         max_pc_points=args.max_pc_points,
         min_edges=1,
     )
 
 
-def _select_indices(dataset: Any, num: int, pick: str, seed: int,
-                    pool: list[int] | None = None) -> list[int]:
-    """Pick ``num`` indices, optionally constrained to a candidate ``pool``."""
+def _select_indices(dataset, num, pick, seed, pool=None) -> list[int]:
     cands = list(range(len(dataset))) if pool is None else list(pool)
     num = min(num, len(cands))
     if pick == "first":
@@ -356,20 +253,14 @@ def _select_indices(dataset: Any, num: int, pick: str, seed: int,
     return rng.sample(cands, num)
 
 
-# ----------------------------------------------------------------------
-# Baseline submission (test only): a pre-computed wireframe per shape
-# ----------------------------------------------------------------------
 def _baseline_stems(baseline_dir: str) -> set[str]:
     if not os.path.isdir(baseline_dir):
         return set()
-    return {
-        os.path.splitext(f)[0]
-        for f in os.listdir(baseline_dir) if f.endswith(".npz")
-    }
+    return {os.path.splitext(f)[0]
+            for f in os.listdir(baseline_dir) if f.endswith(".npz")}
 
 
-def _load_baseline_wf(stem: str, baseline_dir: str) -> dict[str, np.ndarray] | None:
-    """Load a baseline submission wireframe ``{vertices, edge_index, edge_points}``."""
+def _load_baseline_wf(stem, baseline_dir):
     path = os.path.join(baseline_dir, f"{stem}.npz")
     if not os.path.isfile(path):
         return None
@@ -385,27 +276,23 @@ def _load_baseline_wf(stem: str, baseline_dir: str) -> dict[str, np.ndarray] | N
         return None
 
 
-def _resolve_file_indices(dataset: Any, files: list[str]) -> list[int]:
-    by_stem = {
-        os.path.splitext(os.path.basename(f))[0]: i
-        for i, f in enumerate(dataset.files)
-    }
+def _resolve_file_indices(dataset, files) -> list[int]:
+    by_stem = {os.path.splitext(os.path.basename(f))[0]: i
+               for i, f in enumerate(dataset.files)}
     out: list[int] = []
     for f in files:
         stem = os.path.splitext(os.path.basename(f))[0]
         if stem in by_stem:
             out.append(by_stem[stem])
         else:
-            print(f"[warn] {stem!r} not in split {getattr(dataset, 'split', '?')!r}; skipped")
+            print(f"[warn] {stem!r} not in split; skipped")
     return out
 
 
 # ----------------------------------------------------------------------
 # Visualization
-#   input point cloud | stage-1 anchor set | stage-2 wireframe | GT wireframe
 # ----------------------------------------------------------------------
-_PC_C = "#9aa0a6"       # input surface cloud -- neutral gray
-_ANCHOR_C = "#3a7ca5"   # stage-1 anchor points -- cool blue
+_PC_C = "#9aa0a6"
 _AXIS = {"x": 0, "y": 1, "z": 2}
 _CUSTOM_CMAPS = {
     "soft": ["#6b8fd6", "#56b6c2", "#86d6a8"],
@@ -430,7 +317,7 @@ def _gradient_rgb(t, args) -> np.ndarray:
     return lum[..., None] + args.sat * (rgb - lum[..., None])
 
 
-def _equal_box(ax, pts_list: list[np.ndarray]) -> None:
+def _equal_box(ax, pts_list) -> None:
     allp = [p.reshape(-1, 3) for p in pts_list if p is not None and np.asarray(p).size]
     if not allp:
         ax.set_box_aspect((1, 1, 1))
@@ -455,7 +342,7 @@ def _style_ax(ax, args) -> None:
     ax.patch.set_alpha(0.0)
 
 
-def _draw_wireframe(ax, wf: dict[str, np.ndarray], args) -> None:
+def _draw_wireframe(ax, wf, args) -> None:
     from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
     axis = _AXIS[args.color_axis]
@@ -484,37 +371,29 @@ def _draw_wireframe(ax, wf: dict[str, np.ndarray], args) -> None:
                        depthshade=False)
 
 
-def _visualize(rows: list[dict[str, Any]], out_path: str, args,
-               has_gt: bool, has_baseline: bool) -> None:
+def _visualize(rows, out_path, args, has_gt, has_baseline) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     n = len(rows)
-    # column order: pc | stage-1 anchor | stage-2 wireframe | [GT] | [baseline]
-    ncol = 3 + (1 if has_gt else 0) + (1 if has_baseline else 0)
+    ncol = 2 + (1 if has_gt else 0) + (1 if has_baseline else 0)
     panel = args.panel
     fig = plt.figure(figsize=(ncol * panel, n * panel))
     fig.patch.set_facecolor("white")
 
     for r, row in enumerate(rows):
-        pc = row["point_cloud"]      # (P, 3)
-        anchor = row["anchor"]       # (N, 3)
-        pred = row["pred"]           # wireframe dict
-        gt = row.get("gt")           # wireframe dict or None
-        base = row.get("baseline")   # wireframe dict or None
-        # pipeline columns share one frame (pc/anchor/stage-2 are all in the
-        # per-shape unit-cube frame); the baseline submission has its own frame
-        # so it gets an independent box.
-        pipe_bounds = [pc, anchor[:, :3], pred.get("edge_points"),
-                       pred.get("vertices")]
+        pc = row["point_cloud"]
+        pred = row["pred"]
+        gt = row.get("gt")
+        base = row.get("baseline")
+        pipe_bounds = [pc, pred.get("edge_points"), pred.get("vertices")]
         if gt is not None:
             pipe_bounds += [gt.get("edge_points"), gt.get("vertices")]
 
         off = r * ncol
         col = 0
 
-        # input surface point cloud
         col += 1
         ax = fig.add_subplot(n, ncol, off + col, projection="3d")
         if pc.size:
@@ -526,19 +405,6 @@ def _visualize(rows: list[dict[str, Any]], out_path: str, args,
         ax.set_title(f"{row['name'][:26]}\ninput point cloud: {len(pc)} pts",
                      fontsize=8)
 
-        # stage-1 predicted anchor set
-        col += 1
-        ax = fig.add_subplot(n, ncol, off + col, projection="3d")
-        if anchor.size:
-            ax.scatter(anchor[:, 0], anchor[:, 1], anchor[:, 2],
-                       s=args.point_size, color=_ANCHOR_C, alpha=args.alpha,
-                       depthshade=False, linewidths=0)
-        _equal_box(ax, pipe_bounds)
-        _style_ax(ax, args)
-        ax.set_title(f"stage-1 anchor set (RF)\n{len(anchor)} pts "
-                     f"(std={anchor[:, :3].std():.3f})", fontsize=8)
-
-        # stage-2 predicted wireframe (+ metrics if GT available)
         col += 1
         ax = fig.add_subplot(n, ncol, off + col, projection="3d")
         _draw_wireframe(ax, pred, args)
@@ -549,9 +415,8 @@ def _visualize(rows: list[dict[str, Any]], out_path: str, args,
         if m is not None:
             sub += (f"\nscore={m['score']:.3f}  TA={m['ta']:.3f}  "
                     f"CCD={m['ccd']:.3f}  VPE={m['vpe']:.3f}")
-        ax.set_title(f"stage-2 wireframe (ours)\n{sub}", fontsize=8)
+        ax.set_title(f"WireframeAE (ours)\n{sub}", fontsize=8)
 
-        # GT wireframe (train/val only)
         if has_gt and gt is not None:
             col += 1
             ax = fig.add_subplot(n, ncol, off + col, projection="3d")
@@ -562,7 +427,6 @@ def _visualize(rows: list[dict[str, Any]], out_path: str, args,
                 f"GT wireframe\n{len(gt['vertices'])} V / "
                 f"{len(gt['edge_index'])} E", fontsize=8)
 
-        # baseline submission wireframe (test only), own frame
         if has_baseline:
             col += 1
             ax = fig.add_subplot(n, ncol, off + col, projection="3d")
@@ -591,57 +455,33 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # checkpoints
-    p.add_argument(
-        "--stage1-ckpt",
-        default="logs/pc2wireframe/f2yry4qc/checkpoints",
-        help="stage-1 (RF) ckpt file or dir (best val_loss auto-picked)")
-    p.add_argument(
-        "--stage2-ckpt",
-        default="logs/pc2wireframe/ro1tlty1/checkpoints",
-        help="stage-2 (grouper) ckpt file or dir (best val_score auto-picked)")
+    p.add_argument("--ckpt", default="logs/pc2wireframe/checkpoints",
+                   help="WireframeAE ckpt file or dir (best val_score auto-picked)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    # data location (defaults mirror configs/data.yaml)
     p.add_argument("--data-root", default="data")
     p.add_argument("--edge-subdir", default="train/sample_edge")
     p.add_argument("--pc-subdir", default="train/sample_pointcloud")
     p.add_argument("--split-path", default="data/split.json")
-    p.add_argument("--test-pc-dir", default="data/test/sample_pointcloud",
-                   help="point-cloud dir for the GT-less test split")
-    p.add_argument("--split", default="val", choices=["train", "val", "test"],
-                   help="which split to sample shapes from")
-    # baseline submission (test split only): an extra comparison column
+    p.add_argument("--test-pc-dir", default="data/test/sample_pointcloud")
+    p.add_argument("--split", default="val", choices=["train", "val", "test"])
     p.add_argument(
         "--baseline-dir",
         default="pc2wireframe_baseline/test_submission/submission/sample_edge",
         help="dir of baseline submission wireframe npz (test split only)")
-    p.add_argument("--no-baseline", action="store_true",
-                   help="disable the baseline comparison column on test")
-    # selection
-    p.add_argument("--num", type=int, default=6, help="number of shapes to viz")
+    p.add_argument("--no-baseline", action="store_true")
+    p.add_argument("--num", type=int, default=6)
     p.add_argument("--pick", default="random", choices=["random", "first"])
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--files", nargs="*", default=None,
-                   help="explicit npz paths/stems (overrides --pick/--num)")
-    p.add_argument("--batch-size", type=int, default=4,
-                   help="shapes encoded/sampled per stage-1 forward pass")
-    # RF target format (must match the trained run / data.yaml)
-    p.add_argument("--wf-num-points", type=int, default=8192)
+    p.add_argument("--files", nargs="*", default=None)
+    p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-edge-points", type=int, default=32)
-    p.add_argument("--max-pc-points", type=int, default=0,
-                   help="cap input cloud size (0 = native); a memory knob only")
-    # stage-1 sampler overrides (default: read from ckpt hyper-parameters)
-    p.add_argument("--ode-steps", type=int, default=None)
-    p.add_argument("--ode-method", default=None)
-    p.add_argument("--sample-seed", type=int, default=None)
-    # GT-scoring knobs (defaults match module.py / WireframeScore)
+    p.add_argument("--max-pc-points", type=int, default=0)
     p.add_argument("--ccd-tau", type=float, default=0.1)
     p.add_argument("--vpe-tau", type=float, default=0.1)
     p.add_argument("--match-thresh", type=float, default=0.1)
     p.add_argument("--w-ccd", type=float, default=0.3)
     p.add_argument("--w-ta", type=float, default=0.4)
     p.add_argument("--w-vpe", type=float, default=0.3)
-    # visualization style
     p.add_argument("--cmap", default="warmsoft")
     p.add_argument("--color-axis", default="z", choices=["x", "y", "z"])
     p.add_argument("--sat", type=float, default=0.9)
@@ -656,39 +496,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--panel", type=float, default=4.5)
     p.add_argument("--zoom", type=float, default=1.2)
     p.add_argument("--dpi", type=int, default=150)
-    # output
-    p.add_argument("--out", default=None,
-                   help="output image (default logs/pipeline_<split>.png)")
+    p.add_argument("--out", default=None)
     p.add_argument("--no-viz", action="store_true")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    np.random.seed(args.seed)  # arc-length / vertex sampling reproducibility
+    np.random.seed(args.seed)
     has_gt = args.split != "test"
-    out_path = args.out or f"logs/pipeline_{args.split}.png"
+    out_path = args.out or f"logs/ae_{args.split}.png"
 
-    # ---- load both stages -------------------------------------------------
-    s1_ckpt = _resolve_ckpt(args.stage1_ckpt, "val_loss", "min")
-    s2_ckpt = _resolve_ckpt(args.stage2_ckpt, "val_score", "max")
-    print(f"Loading stage-1 checkpoint: {s1_ckpt}")
-    encoder, rf_net, hp1 = load_stage1(s1_ckpt, args.device)
-    print(f"Loading stage-2 checkpoint: {s2_ckpt}")
-    grouper, hp2 = load_stage2(s2_ckpt, args.device)
+    ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
+    print(f"Loading checkpoint: {ckpt}")
+    encoder, decoder, hp = load_model(ckpt, args.device)
 
-    num_points = int(hp1.get("wf_num_points", args.wf_num_points))
-    ode_steps = int(args.ode_steps if args.ode_steps is not None
-                    else hp1.get("ode_steps", 50))
-    ode_method = str(args.ode_method if args.ode_method is not None
-                     else hp1.get("ode_method", "euler"))
-    sample_seed = int(args.sample_seed if args.sample_seed is not None
-                      else hp1.get("sample_seed", 0))
-    num_per_edge = int(hp2.get("num_per_edge", args.num_edge_points))
-    print(f"Stage-1 sampler: N={num_points}  steps={ode_steps}  "
-          f"method={ode_method}  seed={sample_seed}")
-
-    # ---- baseline comparison (test split only) ----------------------------
     has_baseline = (args.split == "test" and not args.no_baseline)
     baseline_stems: set[str] = set()
     if has_baseline:
@@ -698,25 +520,17 @@ def main() -> None:
                   f"disabling baseline column")
             has_baseline = False
 
-    # ---- select shapes ----------------------------------------------------
     dataset = _build_dataset(args)
     if args.files:
         indices = _resolve_file_indices(dataset, args.files)
     else:
-        # When comparing against the baseline, only sample shapes that have a
-        # baseline result (the baseline covers a subset of the test clouds).
         pool: list[int] | None = None
         if has_baseline:
-            pool = [
-                i for i, f in enumerate(dataset.files)
-                if os.path.splitext(os.path.basename(f))[0] in baseline_stems
-            ]
-            print(f"{len(pool)}/{len(dataset)} test shapes have a baseline "
-                  f"result; sampling from those.")
+            pool = [i for i, f in enumerate(dataset.files)
+                    if os.path.splitext(os.path.basename(f))[0] in baseline_stems]
+            print(f"{len(pool)}/{len(dataset)} test shapes have a baseline result.")
             if not pool:
-                raise SystemExit(
-                    "No test shapes overlap the baseline submission "
-                    f"({args.baseline_dir!r}).")
+                raise SystemExit("No test shapes overlap the baseline submission.")
         indices = _select_indices(dataset, args.num, args.pick, args.seed, pool)
     if not indices:
         raise SystemExit("No shapes selected.")
@@ -731,34 +545,27 @@ def main() -> None:
     print("-" * len(header))
 
     rows: list[dict[str, Any]] = []
-    agg: dict[str, list[float]] = {k: [] for k in
-                                   ("ta", "ccd", "vpe", "score")}
+    agg: dict[str, list[float]] = {k: [] for k in ("ta", "ccd", "vpe", "score")}
 
-    # ---- run the pipeline in batches --------------------------------------
     bs = max(1, args.batch_size)
     for start in range(0, len(indices), bs):
         chunk = indices[start:start + bs]
         samples = [dataset[i] for i in chunk]
-        batch = collate_rf_batch(samples)
+        batch = collate_ae_batch(samples)
         pc = batch["point_cloud"].to(args.device)
         offset = batch["pc_offset"].to(args.device)
 
         with torch.no_grad():
             z = encoder(pc, offset)
-            anchors = rf_sample(
-                rf_net, z, num_points=num_points, ode_steps=ode_steps,
-                ode_method=ode_method, sample_seed=sample_seed)  # (b, N, 3)
+            out = decoder(z)
+            preds = decode_batch(decoder, out, hp)
 
         for j, s in enumerate(samples):
             name = str(s["shape_id"])
-            anchor_t = anchors[j]                      # (N, 3) on device
-            pred = decode_grouper(grouper, anchor_t, hp2)
-            anchor_np = anchor_t.detach().cpu().numpy()
+            pred = preds[j]
             pc_np = s["point_cloud"].numpy()
-
             row: dict[str, Any] = {
-                "name": name, "point_cloud": pc_np,
-                "anchor": anchor_np, "pred": pred,
+                "name": name, "point_cloud": pc_np, "pred": pred,
             }
             if has_baseline:
                 row["baseline"] = _load_baseline_wf(name, args.baseline_dir)
@@ -769,7 +576,7 @@ def main() -> None:
                     "edge_points": s["edge_points"].numpy(),
                 }
                 m = score_reconstruction(
-                    pred, gt, num_per_edge=num_per_edge,
+                    pred, gt, num_per_edge=args.num_edge_points,
                     ccd_tau=args.ccd_tau, vpe_tau=args.vpe_tau,
                     match_thresh=args.match_thresh,
                     w_ccd=args.w_ccd, w_ta=args.w_ta, w_vpe=args.w_vpe)
@@ -797,7 +604,7 @@ def main() -> None:
 
     if not args.no_viz:
         _visualize(rows, out_path, args, has_gt, has_baseline)
-        print(f"\nSaved end-to-end pipeline comparison -> {out_path}")
+        print(f"\nSaved WireframeAE comparison -> {out_path}")
 
 
 if __name__ == "__main__":

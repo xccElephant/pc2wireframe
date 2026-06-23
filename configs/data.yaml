@@ -3,8 +3,6 @@ data:
   init_args:
     # ----- paths (relative to project root) -----
     data_root: data
-    # RF branch trains on the RAW (uncleaned) wireframes -- the arc-length RF
-    # target tolerates dense / messy edges, so no cleaning step is needed.
     train_edge_subdir: train/sample_edge
     train_pointcloud_subdir: train/sample_pointcloud
     predict_pointcloud_subdir: test/sample_pointcloud
@@ -21,20 +19,18 @@ data:
     train_ratio: 0.9
     split_seed: 42
 
-    # ----- graph / point-cloud / RF-target format -----
+    # ----- graph format -----
     vertex_merge_tol: 0.0001
-    # Skip pathologically large wireframes (the dataset drops a sample when
-    # nv > max_vertices or ne > max_edges); keeps the RF target distribution
-    # within a sane size envelope.
-    max_vertices: 1024
-    max_edges: 1024
+    # max_vertices doubles as the decoder vertex-query budget cap: a wireframe
+    # with more than 512 vertices is skipped (must match decoder.num_queries).
+    # The dataset also skips empty clouds and clouds whose max|coord| > 1.2
+    # (the raw CAD data is already ~unit-normalized; no extra normalization).
+    max_vertices: 512
+    max_edges: 0
     num_edge_points: 32
-    # Input point cloud is kept at its NATIVE size and packed for PTv3
-    # (coord + offset); 0 = keep all points (no detail loss). Set a positive
-    # value only as a memory safety cap (random subsample above it).
+    # Input point cloud kept at NATIVE size and packed for PTv3 (coord+offset);
+    # 0 = keep all points. Set positive only as a memory safety cap.
     max_pc_points: 0
-    # RF target point budget N: every sample yields wf_points (8192, 3).
-    wf_num_points: 8192
     min_edges: 1
     max_load_retries: 64
 

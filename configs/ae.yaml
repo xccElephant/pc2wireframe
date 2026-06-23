@@ -1,0 +1,108 @@
+# Single-stage WireframeAE -- one trainable autoencoder.
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/ae.yaml
+#
+# point cloud -> UtoniaEncoder (frozen PTv3 + trainable compressor)
+# -> latent z (16x256 = 4096 floats) -> WireframeAE decoder (vertex queries +
+# pairwise edge head) -> wireframe {vertices, edge_index, edge_points}.
+# For 8x A800 DDP use ae_ddp.yaml.
+seed_everything: 3407
+
+model:
+  class_path: src.module.WireframeAEModule
+  init_args:
+    # ----- point-cloud encoder: frozen Utonia PTv3 + trainable compressor -----
+    pc_encoder:
+      utonia: logs/utonia/utonia.pth   # local Utonia checkpoint (download manually)
+      grid_size: 0.01           # voxel dedup + PTv3 grid (raw ~unit frame)
+      freeze: true              # backbone frozen (eval + no_grad), compressor trains
+      # 16 * 256 = 4096 floats (competition latent budget).
+      latent_num: 16
+      latent_dim: 256
+      # must divide the compressor in_dim = Utonia enc_channels[-1] = 576
+      compressor_heads: 8
+      compressor_layers: 1
+
+    # ----- WireframeAE decoder (vertex queries + pairwise edge head) -----
+    decoder:
+      latent_dim: 256           # = pc_encoder.latent_dim
+      num_queries: 512          # = data.max_vertices (max vertex count)
+      d_model: 256
+      nhead: 8
+      num_layers: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      edge_hidden: 256
+
+    # ----- loss weights -----
+    w_vertex: 1.0               # matched vertex xyz L1
+    w_alive: 1.0                # vertex alive BCE
+    w_edge: 1.0                 # edge existence BCE
+    w_edge_type: 1.0            # edge curve-type CE (class weighted)
+    w_edge_param: 1.0           # edge anchor (q1, q2) L1
+    # parsed-curve Chamfer on matched edges (directly aligns with the CCD
+    # metric). Safe to enable now: the curve samplers were made NaN-free
+    # (safe-denominator arc + per-type index routing in src/models/curves.py),
+    # so the old collinear-fallback NaN-grad risk is gone. grad_clip=1.0 covers
+    # the merely-large early-bezier grads.
+    w_curve_geom: 0.1
+    w_aux: 1.0                  # DETR aux loss on each intermediate decoder layer
+    alive_pos_weight: 5.0       # up-weight the rare alive positives (V << Q)
+    edge_neg_ratio: 3.0         # negative edge pairs per positive
+    match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries
+    # CE class weights [line, arc, bezier]; lines dominate, bezier is rarest.
+    curve_type_class_weights: [1.0, 3.0, 9.0]
+    geom_num_per_edge: 32
+
+    # ----- decode (validation / predict) -----
+    vertex_thresh: 0.5          # alive sigmoid threshold
+    edge_thresh: 0.5            # edge existence sigmoid threshold
+    max_decode_vertices: 512    # cap alive vertices before pairwise edge scoring
+    num_per_edge: 32            # points per reconstructed edge curve
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+
+    # ----- optimization -----
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1                    # single GPU; use configs/ae_ddp.yaml for 8x A800 DDP
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: wireframe_ae
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

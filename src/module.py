@@ -1,46 +1,37 @@
-"""LightningModule for the Rectified-Flow PC2Wireframe branch.
+"""LightningModule for the single-stage WireframeAE PC2Wireframe branch.
 
-A single trainable model is driven through ``LightningCLI`` (see
+A single trainable autoencoder is driven through ``LightningCLI`` (see
 ``src/main.py``):
 
     packed point cloud (coord (P_sum, 3), offset (B,))   (native, variable size)
         -> UtoniaEncoder (frozen PTv3 + trainable latent compressor)
-        -> latent z (B, 64, 64)                        (4096-float budget)
-    noise x0 ~ N(0, I) (B, N, 3)
-        -> RFPointSetVelocity (point-set DiT), conditioned on z
-        -> ODE integrate t: 0 -> 1 (torchdiffeq)
-        -> wireframe anchor point set x1_hat (B, N, 3) = xyz
+        -> latent z (B, 16, 256)                         (4096-float budget)
+        -> WireframeAE decoder (vertex queries + pairwise edge head)
+        -> wireframe {vertices, edge_index, edge_points}
 
-Stage-1 stops at the point set; turning it into an explicit wireframe graph is
-stage-2's (the grouper's) job.
-
-Training is 1-rectified flow (TorchCFM ``ConditionalFlowMatcher``) with
-**per-sample optimal-transport coupling**: within each sample the ``N`` noise
-points are matched to the ``N`` target points by entropic OT (``coupling="ot"``)
-so every target is paired with a nearby noise sample, giving ``(t, xt, ut)``.
-This is essential on a permutation-invariant point set -- random/independent
-coupling leaves the per-point velocity target inconsistent and collapses the
-model to the data-centroid mean (a blob). All three xyz channels regress the
-conditional-flow velocity ``ut`` with an MSE loss (so training and the
-velocity-integration sampler use one consistent parameterization). Stage-1
-validation logs only the flow-matching ``val/loss`` on the held-out split and
-selects the checkpoint by it; ``predict_step`` ODE-samples the point set for
-stage-2.
+The 16x256 latent is the competition submission; the decoder must reconstruct
+the wireframe from it alone. Training is a DETR-style set-prediction problem:
+the ``Q`` vertex queries are Hungarian-matched to the GT vertices (cost = xyz
+L1), then supervised with matched vertex L1 + alive BCE, and the edges are
+supervised on query pairs (existence BCE + curve type CE + anchor L1 + an
+optional curve-geometry Chamfer). There is no KL term -- the latent is
+deterministic.
 """
 from __future__ import annotations
 
 import math
 from typing import Any
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 
 from .metrics import WireframeScore
+from .models.curves import sample_curve_by_type
 from .models.utonia_encoder import UtoniaEncoder
-from .models.rf_pointset import RFPointSetVelocity
-from .models.wireframe_grouper import WireframeGrouper, grouper_loss
-from .recon import group_wireframe
+from .models.wireframe_ae import WireframeAE
+from .recon import decode_wireframe
 
 
 # ----------------------------------------------------------------------
@@ -51,82 +42,25 @@ def _default_pc_encoder() -> dict[str, Any]:
         utonia="logs/utonia/utonia.pth",
         grid_size=0.01,
         freeze=True,
-        # 64 * 64 = 4096 floats (competition latent budget).
-        latent_num=64,
-        latent_dim=64,
+        # 16 * 256 = 4096 floats (competition latent budget).
+        latent_num=16,
+        latent_dim=256,
         compressor_heads=8,
         compressor_layers=1,
     )
 
 
-def _default_rf_net() -> dict[str, Any]:
+def _default_decoder() -> dict[str, Any]:
     return dict(
-        point_dim=3,
-        cond_dim=64,
-        d_model=384,
-        depth=8,
-        nhead=6,
-        mlp_ratio=4.0,
-        dropout=0.0,
-        grad_checkpoint=False,
-    )
-
-
-def _default_grouper() -> dict[str, Any]:
-    return dict(
-        point_dim=3,
+        latent_dim=256,
+        num_queries=512,
         d_model=256,
-        depth=6,
         nhead=8,
+        num_layers=6,
         mlp_ratio=4.0,
         dropout=0.0,
-        embed_dim=8,
+        edge_hidden=256,
     )
-
-
-# ----------------------------------------------------------------------
-# Per-sample optimal-transport coupling for the rectified-flow target
-# ----------------------------------------------------------------------
-@torch.no_grad()
-def ot_couple_noise(
-    x0: torch.Tensor, x1: torch.Tensor, *, reg: float, iters: int
-) -> torch.Tensor:
-    """Reorder the noise ``x0`` to align with the target ``x1``, per sample.
-
-    For each sample in the batch *independently*, solve an entropic optimal
-    transport between the ``N`` noise points ``x0`` and the ``N`` target points
-    ``x1`` (squared-Euclidean cost over all channels, uniform marginals) with a
-    numerically-stable log-domain Sinkhorn, then draw one noise index per target
-    row from the transport plan and gather the noise in that order.
-
-    Why: with independent (random) coupling each target point is paired with an
-    arbitrary noise point, so on a permutation-invariant point set the velocity
-    target ``ut = x1 - x0`` has no consistent per-point assignment and its
-    Bayes-optimal regressor is a mean-seeking field that contracts noise to the
-    data centroid (the model collapses to a blob). OT coupling pairs every
-    target with a *nearby* noise sample, turning ``ut`` into a coherent,
-    low-variance target that the network can actually fit. No gradients flow
-    through the coupling -- it only selects (x0, x1) pairs.
-    """
-    b, n, _ = x1.shape
-    out = torch.empty_like(x0)
-    log_n = math.log(max(n, 1))
-    for i in range(b):
-        # cost[r, c] between target row r and noise col c
-        cost = torch.cdist(x1[i], x0[i]) ** 2            # (N, N)
-        eps = float(reg) * cost.mean().clamp_min(1e-8)
-        neg_M = -cost / eps                              # (N, N) = log-kernel
-        f = x1.new_zeros(n)
-        g = x1.new_zeros(n)
-        for _ in range(int(iters)):
-            f = -log_n - torch.logsumexp(neg_M + g[None, :], dim=1)
-            g = -log_n - torch.logsumexp(neg_M + f[:, None], dim=0)
-        # log transport plan (row r sums to 1/N); pick one noise col per row.
-        log_pi = f[:, None] + neg_M + g[None, :]
-        probs = torch.softmax(log_pi, dim=1)             # row-normalized
-        idx = torch.multinomial(probs, 1).squeeze(1)     # (N,)
-        out[i] = x0[i][idx]
-    return out
 
 
 # ----------------------------------------------------------------------
@@ -178,7 +112,6 @@ class _BaseModule(pl.LightningModule):
         gradient_clip_val=None,
         gradient_clip_algorithm=None,
     ):
-        """Clip grads by global norm using the module's ``grad_clip`` hparam."""
         clip = float(getattr(self.hparams, "grad_clip", 0.0) or 0.0)
         if clip > 0.0:
             self.clip_gradients(
@@ -189,212 +122,41 @@ class _BaseModule(pl.LightningModule):
 
 
 # ----------------------------------------------------------------------
-# Rectified-Flow wireframe module
+# WireframeAE module
 # ----------------------------------------------------------------------
-class RFWireframeModule(_BaseModule):
-    """Point cloud -> latent -> Rectified-Flow point set -> wireframe."""
+class WireframeAEModule(_BaseModule):
+    """Point cloud -> latent -> WireframeAE decoder -> wireframe."""
 
     def __init__(
         self,
         # ----- model config (nested, fully overridable from YAML) -----
         pc_encoder: dict[str, Any] | None = None,
-        rf_net: dict[str, Any] | None = None,
-        # ----- RF target / flow -----
-        wf_num_points: int = 8192,
-        flow_sigma: float = 0.0,
-        w_xyz: float = 1.0,
-        # ----- noise<->target coupling -----
-        # "ot": per-sample entropic-OT coupling (aligns each target point with a
-        # nearby noise sample so the velocity target is consistent on the
-        # permutation-invariant set). "independent": standard random pairing.
-        coupling: str = "ot",
-        ot_reg: float = 0.05,
-        ot_iters: int = 50,
-        # ----- ODE sampling (prediction: point set for stage-2) -----
-        ode_steps: int = 50,
-        ode_method: str = "euler",
-        sample_seed: int = 0,
-        # ----- optimization -----
-        lr: float = 1.5e-4,
-        weight_decay: float = 1e-4,
-        betas: tuple[float, float] = (0.9, 0.95),
-        warmup_steps: int = 500,
-        max_steps: int = 100_000,
-        grad_clip: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.encoder = UtoniaEncoder(**(pc_encoder or _default_pc_encoder()))
-        self.net = RFPointSetVelocity(**(rf_net or _default_rf_net()))
-        self.point_dim = int(self.net.point_dim)
-
-        from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
-
-        # The flow matcher only turns a (x0, x1) pair into (t, xt, ut); the
-        # *coupling* (how x0 is paired with x1) is chosen in ``_flow_loss``.
-        # Per-sample OT coupling (``coupling="ot"``) is the important knob here:
-        # on a permutation-invariant point set, random/independent coupling
-        # leaves the per-point velocity target inconsistent and the model
-        # collapses to the data-centroid mean (a Gaussian blob). OT over the N
-        # points *within each sample* pairs every target with a nearby noise
-        # point, which is exactly what makes the velocity learnable.
-        self.flow_matcher = ConditionalFlowMatcher(sigma=float(flow_sigma))
-
-        # Stage-1 validation selects the checkpoint purely by the flow-matching
-        # loss on the val split (no ODE sampling / traditional reconstruction /
-        # CCD-TA-VPE proxy here -- that scoring belongs to stage-2). The eval_*
-        # hparams are kept only for ``predict_step`` reconstruction at export.
-
-    # ------------------------------------------------------------------
-    def encode(self, batch: dict[str, Any]) -> torch.Tensor:
-        """Latent ``z`` of shape ``(B, K, D)``.
-
-        Consumes the packed point cloud ``batch["point_cloud"] (P_sum, 3)`` +
-        ``batch["pc_offset"] (B,)``.
-        """
-        return self.encoder(batch["point_cloud"], batch["pc_offset"])
-
-    def _flow_loss(
-        self, z: torch.Tensor, x1: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Flow-matching loss (shared by train + val).
-
-        The xyz velocity target ``ut`` is regressed so training and the
-        velocity-integration sampler share ONE parameterization. The anchor
-        point set is pure xyz (3 channels), so the loss is a single MSE over
-        all three channels.
-        """
-        x0 = torch.randn_like(x1)
-        if str(self.hparams.coupling) == "ot":
-            x0 = ot_couple_noise(
-                x0, x1,
-                reg=float(self.hparams.ot_reg),
-                iters=int(self.hparams.ot_iters),
-            )
-        t, xt, ut = self.flow_matcher.sample_location_and_conditional_flow(x0, x1)
-        v = self.net(t, xt, z)
-
-        loss_xyz = F.mse_loss(v, ut)
-        loss = self.hparams.w_xyz * loss_xyz
-        return {"loss": loss, "loss_xyz": loss_xyz}
-
-    def training_step(self, batch, batch_idx):
-        z = self.encode(batch)
-        losses = self._flow_loss(z, batch["wf_points"])
-        bs = z.shape[0]
-        self.log("train/loss", losses["loss"], batch_size=bs,
-                 prog_bar=True, sync_dist=True)
-        self.log("train/loss_xyz", losses["loss_xyz"], batch_size=bs, sync_dist=True)
-        return losses["loss"]
-
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def sample(self, z: torch.Tensor, num_points: int | None = None) -> torch.Tensor:
-        """Deterministic ODE sampling ``x0 -> x1`` conditioned on ``z``.
-
-        Integrates ``dx/dt = net(t, x, z)`` from ``t=0`` to ``t=1`` with a fixed
-        noise seed (so the reconstruction is reproducible across epochs).
-        Returns ``x1_hat (B, N, point_dim)``.
-        """
-        from torchdiffeq import odeint
-
-        b = z.shape[0]
-        n = int(num_points or self.hparams.wf_num_points)
-        gen = torch.Generator(device=z.device)
-        gen.manual_seed(int(self.hparams.sample_seed))
-        x0 = torch.randn(
-            b, n, self.point_dim, device=z.device, dtype=z.dtype, generator=gen)
-
-        def func(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-            return self.net(t.reshape(()).expand(b), x, z)
-
-        t_span = torch.linspace(
-            0.0, 1.0, int(self.hparams.ode_steps) + 1, device=z.device, dtype=z.dtype)
-        traj = odeint(func, x0, t_span, method=str(self.hparams.ode_method))
-        # Pure-xyz anchor point set: the integrated endpoint already lives in
-        # the data frame, so just return it.
-        return traj[-1]
-
-    def validation_step(self, batch, batch_idx):
-        """Stage-1 validation = flow-matching loss only (drives checkpointing).
-
-        No ODE sampling / reconstruction / CCD-TA-VPE here. ``val/loss`` is the
-        epoch-mean velocity-matching loss on the held-out split; the loss is
-        stochastic per call (random t / noise) but its mean over the whole val
-        set is stable enough to rank epochs.
-        """
-        z = self.encode(batch)
-        losses = self._flow_loss(z, batch["wf_points"])
-        bs = z.shape[0]
-        self.log("val/loss", losses["loss"], batch_size=bs, prog_bar=True,
-                 on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val/loss_xyz", losses["loss_xyz"], batch_size=bs,
-                 on_step=False, on_epoch=True, sync_dist=True)
-
-    def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        """Per-shape latent + ODE-sampled wireframe point set.
-
-        Stage-1 stops at the anchor point set ``wf_points (B, N, 3) = xyz``;
-        turning it into an explicit wireframe is stage-2's (the grouper's) job.
-        The point set is emitted in the per-shape *normalized* frame together
-        with ``pc_center`` / ``pc_scale`` so downstream can map xyz back to raw
-        CAD coordinates.
-        """
-        z = self.encode(batch)
-        wf_points = self.sample(z)
-        return {
-            "shape_id": batch.get("shape_id"),
-            "z": z,
-            "wf_points": wf_points,
-            "pc_center": batch.get("pc_center"),
-            "pc_scale": batch.get("pc_scale"),
-        }
-
-
-# ----------------------------------------------------------------------
-# Wireframe grouper module (learned point-set -> wireframe read-out)
-# ----------------------------------------------------------------------
-class WireframeGrouperModule(_BaseModule):
-    """Learned read-out: a wireframe anchor set ``(N, 3)`` -> explicit wireframe.
-
-    Trains :class:`WireframeGrouper` on the labelled anchor set produced by
-    ``WireframeGrouperDataModule`` (per-point edge id, arc-length, endpoints,
-    curve type, anchors). All supervision is teacher-forced; decoding at
-    validation time uses :func:`src.recon.group_wireframe` and scores against
-    the native GT graph with the same CCD / TA / VPE proxy as the RF stage, so
-    ``val/score`` is directly comparable to the traditional-reconstruction
-    baseline.
-
-    This module is standalone: it consumes wireframe point sets, not raw point
-    clouds, so it can be trained on GT point sets without the RF encoder. At
-    inference it is fed the RF stage's ODE-sampled point set.
-    """
-
-    def __init__(
-        self,
-        # ----- model -----
-        grouper: dict[str, Any] | None = None,
+        decoder: dict[str, Any] | None = None,
         # ----- loss weights -----
-        w_endpoint: float = 1.0,
-        w_anchor: float = 1.0,
-        w_curve_type: float = 1.0,
-        w_arclen: float = 1.0,
-        w_embed: float = 1.0,
-        w_topo: float = 1.0,
+        w_vertex: float = 1.0,
+        w_alive: float = 1.0,
+        w_edge: float = 1.0,
+        w_edge_type: float = 1.0,
+        w_edge_param: float = 1.0,
         w_curve_geom: float = 0.1,
-        embed_delta_var: float = 0.5,
-        embed_delta_dist: float = 1.5,
-        # type CE class weights (line / arc / bezier); line tends to dominate.
+        # DETR-style auxiliary loss: the same losses applied to every
+        # intermediate decoder layer, averaged. 0 disables (and skips the
+        # extra forward work).
+        w_aux: float = 1.0,
+        # alive BCE: positives are rare (V << Q), so up-weight them.
+        alive_pos_weight: float = 5.0,
+        # edge negatives are sampled at this multiple of the positive count.
+        edge_neg_ratio: float = 3.0,
+        # Hungarian matching cost = xyz L1 - match_alive_weight * alive_prob,
+        # so confident-alive queries are preferred (stabilises the matching).
+        match_alive_weight: float = 0.2,
+        # curve type CE class weights (line / arc / bezier).
         curve_type_class_weights: list[float] | None = None,
-        topo_tau: float = 0.1,
         geom_num_per_edge: int = 32,
-        # ----- decode (validation) -----
-        vertex_merge_radius: float = 0.01,
-        vertex_merge_relative: bool = True,
-        split_by_embedding: bool = True,
-        embed_eps: float = 0.5,
-        min_edge_points: int = 3,
+        # ----- decode (validation / predict) -----
+        vertex_thresh: float = 0.5,
+        edge_thresh: float = 0.5,
+        max_decode_vertices: int = 512,
         num_per_edge: int = 32,
         # ----- eval metric -----
         eval_w_ccd: float = 0.3,
@@ -414,73 +176,355 @@ class WireframeGrouperModule(_BaseModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.net = WireframeGrouper(**(grouper or _default_grouper()))
+        self.encoder = UtoniaEncoder(**(pc_encoder or _default_pc_encoder()))
+        self.decoder = WireframeAE(**(decoder or _default_decoder()))
+        self.num_queries = int(self.decoder.num_queries)
+
         self.val_metrics = WireframeScore(
             w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
             ccd_tau=eval_ccd_tau, vpe_tau=eval_vpe_tau,
             match_thresh=eval_match_thresh, num_per_edge=num_per_edge,
         )
 
-    def _loss(self, out, batch) -> dict[str, torch.Tensor]:
-        return grouper_loss(
-            out, batch,
-            gt_wireframes=batch.get("gt_wireframes"),
-            w_endpoint=self.hparams.w_endpoint,
-            w_anchor=self.hparams.w_anchor,
-            w_curve_type=self.hparams.w_curve_type,
-            w_arclen=self.hparams.w_arclen,
-            w_embed=self.hparams.w_embed,
-            w_topo=self.hparams.w_topo,
-            w_curve_geom=self.hparams.w_curve_geom,
-            curve_type_class_weights=self.hparams.curve_type_class_weights,
-            topo_tau=self.hparams.topo_tau,
-            geom_num_per_edge=self.hparams.geom_num_per_edge,
-            embed_kwargs=dict(
-                delta_var=self.hparams.embed_delta_var,
-                delta_dist=self.hparams.embed_delta_dist,
-            ),
+    # ------------------------------------------------------------------
+    def encode(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Latent ``z`` of shape ``(B, K, D)``."""
+        return self.encoder(batch["point_cloud"], batch["pc_offset"])
+
+    def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+        z = self.encode(batch)
+        # Only pay for intermediate layers when the aux loss is active (train).
+        want_aux = self.training and float(self.hparams.w_aux) > 0.0
+        out = self.decoder(z, return_intermediate=want_aux)
+        out["latent"] = z
+        return out
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+    @staticmethod
+    @torch.no_grad()
+    def _match(
+        pred_xyz: torch.Tensor,
+        gt_v: torch.Tensor,
+        alive_prob: torch.Tensor | None = None,
+        alive_weight: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hungarian match queries -> GT vertices.
+
+        Cost is the xyz L1 distance minus an optional alive-confidence reward
+        (``alive_weight * sigmoid(alive_logit)``), so that -- among queries that
+        are geometrically close to a GT vertex -- the one the model already
+        believes is alive is preferred (DETR's classification cost term).
+
+        Returns ``(row, col)`` (query ids matched to gt ids, length ``V``).
+        """
+        from scipy.optimize import linear_sum_assignment
+
+        cost = torch.cdist(pred_xyz, gt_v, p=1)               # (Q, V)
+        if alive_prob is not None and alive_weight > 0.0:
+            cost = cost - float(alive_weight) * alive_prob[:, None]
+        cost = cost.detach().cpu().numpy()
+        row, col = linear_sum_assignment(cost)
+        device = pred_xyz.device
+        return (
+            torch.as_tensor(row, dtype=torch.long, device=device),
+            torch.as_tensor(col, dtype=torch.long, device=device),
         )
 
+    def _loss(
+        self, out: dict[str, torch.Tensor], gt_wireframes: list[dict[str, Any]]
+    ) -> dict[str, torch.Tensor]:
+        vertex_logit = out["vertex_logit"]      # (B, Q)
+        vertex_xyz = out["vertex_xyz"]          # (B, Q, 3)
+        hidden = out["hidden"]                  # (B, Q, d)
+        global_vec = out["global"]              # (B, d)
+        device = vertex_logit.device
+        b, q, _ = vertex_xyz.shape
+
+        type_weight = (
+            vertex_logit.new_tensor(list(self.hparams.curve_type_class_weights))
+            if self.hparams.curve_type_class_weights is not None else None
+        )
+
+        l_vertex = vertex_xyz.new_zeros(())
+        l_alive = vertex_xyz.new_zeros(())
+        l_edge = vertex_xyz.new_zeros(())
+        l_edge_type = vertex_xyz.new_zeros(())
+        l_edge_param = vertex_xyz.new_zeros(())
+        l_geom = vertex_xyz.new_zeros(())
+        n_alive = n_vertex = n_edge = n_etype = n_geom = 0
+
+        for i in range(b):
+            g = gt_wireframes[i]
+            gt_v = g["vertices"].to(device).float().reshape(-1, 3)
+            v = gt_v.shape[0]
+
+            alive_target = vertex_logit.new_zeros(q)
+            if v == 0:
+                l_alive = l_alive + F.binary_cross_entropy_with_logits(
+                    vertex_logit[i], alive_target)
+                n_alive += 1
+                continue
+
+            row, col = self._match(
+                vertex_xyz[i], gt_v,
+                torch.sigmoid(vertex_logit[i]),
+                float(self.hparams.match_alive_weight),
+            )                                             # query ids, gt ids
+            alive_target[row] = 1.0
+
+            # alive BCE (positives up-weighted) + matched vertex L1
+            pos_w = vertex_logit.new_tensor(float(self.hparams.alive_pos_weight))
+            l_alive = l_alive + F.binary_cross_entropy_with_logits(
+                vertex_logit[i], alive_target, pos_weight=pos_w)
+            l_vertex = l_vertex + F.l1_loss(
+                vertex_xyz[i][row], gt_v[col])
+            n_alive += 1
+            n_vertex += 1
+
+            # gt vertex id -> matched query id
+            gt2q = vertex_logit.new_full((v,), -1, dtype=torch.long)
+            gt2q[col] = row
+
+            gt_edges = g["edge_index"].to(device).long().reshape(-1, 2)
+            gt_type = g["edge_type"].to(device).long().reshape(-1)
+            gt_params = g["edge_params"].to(device).float().reshape(-1, 2, 3)
+            e = gt_edges.shape[0]
+
+            # ---- positive edges: gt edges -> matched query pairs ----
+            pos_a, pos_b, pos_t, pos_p, pos_eidx = [], [], [], [], []
+            pos_set: set[tuple[int, int]] = set()
+            for ei in range(e):
+                gs, ge = int(gt_edges[ei, 0]), int(gt_edges[ei, 1])
+                if gs < 0 or ge < 0 or gs >= v or ge >= v:
+                    continue
+                qs, qe = int(gt2q[gs]), int(gt2q[ge])
+                if qs < 0 or qe < 0 or qs == qe:
+                    continue
+                # canonical ascending query order (q1 follows endpoint a)
+                if qs <= qe:
+                    aa, bb = qs, qe
+                    p1, p2 = gt_params[ei, 0], gt_params[ei, 1]
+                else:
+                    aa, bb = qe, qs
+                    p1, p2 = gt_params[ei, 1], gt_params[ei, 0]
+                pair = (aa, bb)
+                if pair in pos_set:
+                    continue
+                pos_set.add(pair)
+                pos_a.append(aa)
+                pos_b.append(bb)
+                pos_t.append(int(gt_type[ei]))
+                pos_p.append(torch.stack([p1, p2], dim=0))
+                pos_eidx.append(ei)
+
+            n_pos = len(pos_a)
+
+            # ---- negative edges: random pairs (not in pos) drawn from the
+            # matched queries *plus* the queries the model currently predicts
+            # alive. The latter closes the train/inference gap: at decode time
+            # edges are scored over all thresholded-alive queries, so the edge
+            # head must also reject pairs among alive-but-unmatched queries.
+            n_neg = int(round(max(1, n_pos) * float(self.hparams.edge_neg_ratio)))
+            neg_a, neg_b = [], []
+            matched_q = row.tolist()
+            matched_set = set(matched_q)
+            alive_pred = torch.nonzero(
+                torch.sigmoid(vertex_logit[i].detach())
+                >= float(self.hparams.vertex_thresh),
+                as_tuple=False,
+            ).reshape(-1).tolist()
+            cand_q = matched_q + [
+                int(x) for x in alive_pred if int(x) not in matched_set]
+            if len(cand_q) >= 2:
+                tries = 0
+                max_tries = n_neg * 8 + 16
+                while len(neg_a) < n_neg and tries < max_tries:
+                    tries += 1
+                    ia, ib = np.random.randint(0, len(cand_q), size=2)
+                    if ia == ib:
+                        continue
+                    qa, qb = cand_q[ia], cand_q[ib]
+                    lo, hi = (qa, qb) if qa < qb else (qb, qa)
+                    if (lo, hi) in pos_set:
+                        continue
+                    neg_a.append(lo)
+                    neg_b.append(hi)
+
+            a_ids = pos_a + neg_a
+            b_ids = pos_b + neg_b
+            if a_ids:
+                a_idx = torch.as_tensor(a_ids, dtype=torch.long, device=device)
+                b_idx = torch.as_tensor(b_ids, dtype=torch.long, device=device)
+                ehead = self.decoder.edge_logits(
+                    hidden[i][a_idx], hidden[i][b_idx],
+                    global_vec[i][None, :].expand(a_idx.shape[0], -1))
+                exist_target = vertex_logit.new_zeros(a_idx.shape[0])
+                exist_target[:n_pos] = 1.0
+                # negatives outnumber positives by ~edge_neg_ratio: up-weight
+                # the positive existence term to keep edge recall balanced.
+                edge_pos_w = vertex_logit.new_tensor(
+                    float(self.hparams.edge_neg_ratio))
+                l_edge = l_edge + F.binary_cross_entropy_with_logits(
+                    ehead["exist"], exist_target, pos_weight=edge_pos_w)
+                n_edge += 1
+
+                if n_pos > 0:
+                    type_target = torch.as_tensor(
+                        pos_t, dtype=torch.long, device=device)
+                    l_edge_type = l_edge_type + F.cross_entropy(
+                        ehead["type"][:n_pos], type_target, weight=type_weight)
+                    param_target = torch.stack(pos_p, dim=0)  # (n_pos, 2, 3)
+                    l_edge_param = l_edge_param + F.l1_loss(
+                        ehead["params"][:n_pos], param_target)
+                    n_etype += 1
+
+                    # ---- optional curve-geometry Chamfer (matched edges) ----
+                    if float(self.hparams.w_curve_geom) != 0.0:
+                        gep = g["edge_points"].to(device).float()
+                        eidx = torch.as_tensor(
+                            pos_eidx, dtype=torch.long, device=device)
+                        if gep.shape[0] and int(eidx.max()) < gep.shape[0]:
+                            a_xyz = vertex_xyz[i][a_idx[:n_pos]]
+                            b_xyz = vertex_xyz[i][b_idx[:n_pos]]
+                            q1 = ehead["params"][:n_pos, 0]
+                            q2 = ehead["params"][:n_pos, 1]
+                            ct = ehead["type"][:n_pos].argmax(dim=-1)
+                            pred_curve = sample_curve_by_type(
+                                a_xyz, q1, q2, b_xyz, ct,
+                                int(self.hparams.geom_num_per_edge))
+                            gt_curve = gep[eidx]   # (n_pos, U, 3)
+                            dmat = torch.cdist(pred_curve, gt_curve)
+                            cd = 0.5 * (
+                                dmat.min(dim=2)[0].mean(dim=1)
+                                + dmat.min(dim=1)[0].mean(dim=1)
+                            )
+                            l_geom = l_geom + cd.mean()
+                            n_geom += 1
+
+        # ---- normalise + combine ----
+        # Every term is a mean over the samples that actually contributed to it
+        # (its own counter), so the relative loss magnitudes no longer drift
+        # with the batch's mix of empty / non-empty wireframes.
+        if n_alive > 0:
+            l_alive = l_alive / n_alive
+        if n_vertex > 0:
+            l_vertex = l_vertex / n_vertex
+        if n_edge > 0:
+            l_edge = l_edge / n_edge
+        if n_etype > 0:
+            l_edge_type = l_edge_type / n_etype
+            l_edge_param = l_edge_param / n_etype
+        if n_geom > 0:
+            l_geom = l_geom / n_geom
+
+        total = (
+            self.hparams.w_vertex * l_vertex
+            + self.hparams.w_alive * l_alive
+            + self.hparams.w_edge * l_edge
+            + self.hparams.w_edge_type * l_edge_type
+            + self.hparams.w_edge_param * l_edge_param
+            + self.hparams.w_curve_geom * l_geom
+        )
+        return {
+            "loss": total,
+            "loss_vertex": l_vertex.detach(),
+            "loss_alive": l_alive.detach(),
+            "loss_edge": l_edge.detach(),
+            "loss_edge_type": l_edge_type.detach(),
+            "loss_edge_param": l_edge_param.detach(),
+            "loss_curve_geom": l_geom.detach(),
+        }
+
+    # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        out = self.net(batch["wf_points"])
-        losses = self._loss(out, batch)
-        bs = batch["wf_points"].shape[0]
-        self.log("train/loss", losses["loss"], batch_size=bs,
+        out = self.forward(batch)
+        gt = batch["gt_wireframes"]
+        losses = self._loss(out, gt)
+        total = losses["loss"]
+        bs = batch["num_graphs"]
+
+        # DETR-style auxiliary supervision on the intermediate decoder layers.
+        aux_hidden = out.get("aux_hidden")
+        if aux_hidden:
+            aux_vals = [
+                self._loss(self.decoder.vertex_heads(h), gt)["loss"]
+                for h in aux_hidden
+            ]
+            aux_mean = torch.stack(aux_vals).mean()
+            total = total + float(self.hparams.w_aux) * aux_mean
+            self.log("train/loss_aux", aux_mean.detach(), batch_size=bs,
+                     sync_dist=True)
+
+        self.log("train/loss", total, batch_size=bs,
                  prog_bar=True, sync_dist=True)
         self.log_dict(
             {f"train/{k}": v for k, v in losses.items() if k != "loss"},
             batch_size=bs, sync_dist=True,
         )
-        return losses["loss"]
+        return total
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def decode(self, out: dict[str, torch.Tensor], pts: torch.Tensor
-               ) -> list[dict[str, Any]]:
-        """Decode a batch of per-point fields into wireframes (numpy)."""
-        xyz = pts[..., :3].detach().cpu().numpy()
-        eoff = out["endpoint_offset"].detach().cpu().numpy()
-        emb = out["embedding"].detach().cpu().numpy()
-        ctype = out["curve_type"].detach().cpu().numpy()
-        anchor = out["anchor"].detach().cpu().numpy()
-        wfs: list[dict[str, Any]] = []
-        for i in range(xyz.shape[0]):
-            wfs.append(group_wireframe(
-                {
-                    "xyz": xyz[i],
-                    "endpoint_offset": eoff[i],
-                    "embedding": emb[i],
-                    "curve_type": ctype[i],
-                    "anchor": anchor[i],
-                },
-                vertex_merge_radius=self.hparams.vertex_merge_radius,
-                merge_relative=self.hparams.vertex_merge_relative,
-                split_by_embedding=self.hparams.split_by_embedding,
-                embed_eps=self.hparams.embed_eps,
-                min_edge_points=self.hparams.min_edge_points,
-                num_per_edge=self.hparams.num_per_edge,
-            ))
+    def decode(self, out: dict[str, torch.Tensor]) -> list[dict[str, np.ndarray]]:
+        """Decode a batch of decoder outputs into wireframes (numpy)."""
+        vertex_logit = out["vertex_logit"]
+        vertex_xyz = out["vertex_xyz"]
+        hidden = out["hidden"]
+        global_vec = out["global"]
+        device = vertex_logit.device
+        b = vertex_logit.shape[0]
+        vt = float(self.hparams.vertex_thresh)
+        cap = int(self.hparams.max_decode_vertices)
+
+        wfs: list[dict[str, np.ndarray]] = []
+        for i in range(b):
+            prob = torch.sigmoid(vertex_logit[i])
+            alive = torch.nonzero(prob >= vt, as_tuple=False).reshape(-1)
+            if alive.numel() > cap > 0:
+                alive = alive[torch.topk(prob[alive], cap).indices]
+            if alive.numel() < 2:
+                wfs.append({
+                    "vertices": vertex_xyz[i][alive].detach().cpu().numpy()
+                    .astype(np.float32).reshape(-1, 3),
+                    "pair_index": np.zeros((0, 2), dtype=np.int64),
+                    "edge_prob": np.zeros((0,), dtype=np.float32),
+                    "edge_type": np.zeros((0,), dtype=np.int64),
+                    "q1": np.zeros((0, 3), dtype=np.float32),
+                    "q2": np.zeros((0, 3), dtype=np.float32),
+                })
+                continue
+
+            verts = vertex_xyz[i][alive]                 # (V, 3)
+            va = alive.shape[0]
+            iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+            h = hidden[i][alive]
+            ehead = self.decoder.edge_logits(
+                h[iu], h[ju],
+                global_vec[i][None, :].expand(iu.shape[0], -1))
+            wfs.append({
+                "vertices": verts.detach().cpu().numpy().astype(np.float32),
+                "pair_index": torch.stack([iu, ju], dim=1).cpu().numpy(),
+                "edge_prob": torch.sigmoid(ehead["exist"]).detach().cpu().numpy(),
+                "edge_type": ehead["type"].argmax(dim=-1).detach().cpu().numpy(),
+                "q1": ehead["params"][:, 0].detach().cpu().numpy(),
+                "q2": ehead["params"][:, 1].detach().cpu().numpy(),
+            })
         return wfs
+
+    def decode_to_wireframes(
+        self, out: dict[str, torch.Tensor]
+    ) -> list[dict[str, np.ndarray]]:
+        fields = self.decode(out)
+        return [
+            decode_wireframe(
+                f,
+                edge_thresh=float(self.hparams.edge_thresh),
+                num_per_edge=int(self.hparams.num_per_edge),
+            )
+            for f in fields
+        ]
 
     @staticmethod
     def _gt_to_numpy(gt_wireframes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -494,11 +538,16 @@ class WireframeGrouperModule(_BaseModule):
         ]
 
     def validation_step(self, batch, batch_idx):
-        out = self.net(batch["wf_points"])
-        losses = self._loss(out, batch)
-        self.log("val/loss", losses["loss"],
-                 batch_size=batch["wf_points"].shape[0], sync_dist=True)
-        preds = self.decode(out, batch["wf_points"])
+        out = self.forward(batch)
+        losses = self._loss(out, batch["gt_wireframes"])
+        bs = batch["num_graphs"]
+        self.log("val/loss", losses["loss"], batch_size=bs, prog_bar=True,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        self.log_dict(
+            {f"val/{k}": v for k, v in losses.items() if k != "loss"},
+            batch_size=bs, on_step=False, on_epoch=True, sync_dist=True,
+        )
+        preds = self.decode_to_wireframes(out)
         self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
 
     def on_validation_epoch_end(self) -> None:
@@ -510,5 +559,19 @@ class WireframeGrouperModule(_BaseModule):
         self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
         self.val_metrics.reset()
 
+    def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
+        """Per-shape latent + decoded wireframe.
 
-__all__ = ["RFWireframeModule", "WireframeGrouperModule"]
+        The latent ``z (B, K, D)`` is the competition submission; the wireframe
+        is decoded from it for visualisation / scoring.
+        """
+        out = self.forward(batch)
+        preds = self.decode_to_wireframes(out)
+        return {
+            "shape_id": batch.get("shape_id"),
+            "latent": out["latent"],
+            "wireframes": preds,
+        }
+
+
+__all__ = ["WireframeAEModule"]

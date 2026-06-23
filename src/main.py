@@ -1,26 +1,27 @@
-"""LightningCLI entry point for the Rectified-Flow PC2Wireframe branch.
+"""LightningCLI entry point for the single-stage WireframeAE PC2Wireframe branch.
 
-A single trainable model (PTv3 encoder + RF velocity net) and datamodule are
-resolved from ``class_path`` in the configs::
+A single trainable autoencoder (frozen PTv3 encoder + compressor + WireframeAE
+decoder) and datamodule are resolved from ``class_path`` in the configs::
 
     # train (single GPU)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/rf.yaml
+        --config configs/ae.yaml
 
     # train (8x A800 DDP)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/rf_ddp.yaml
+        --config configs/ae_ddp.yaml
 
-    # inference / submission
-    python -m src.main predict \
+    # validate a checkpoint
+    python -m src.main validate \
         --config configs/data.yaml \
-        --config configs/rf.yaml \
-        --ckpt_path <rf.ckpt>
+        --config configs/ae.yaml \
+        --ckpt_path <ae.ckpt>
 
-``--ckpt_path`` is Lightning's own arg to resume a run / load weights for
-``predict`` / ``validate``.
+Submission export uses ``scripts/export_submission.py`` (single forward:
+encode -> latent -> decode). ``--ckpt_path`` is Lightning's own arg to resume a
+run / load weights for ``predict`` / ``validate``.
 """
 import pyrootutils
 import torch

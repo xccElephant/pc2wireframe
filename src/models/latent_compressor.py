@@ -10,8 +10,8 @@ values. A single decoder layer (``num_layers=1``) already performs the pooling;
 more layers just add mixing capacity.
 
 Output layout is ``(B, num_tokens, latent_dim)``, consumed directly as the
-conditioning latent of the RF velocity network
-(:class:`~src.models.rf_pointset.RFPointSetVelocity`).
+compressed latent decoded by the WireframeAE decoder
+(:class:`~src.models.wireframe_ae.WireframeAE`).
 """
 from __future__ import annotations
 
