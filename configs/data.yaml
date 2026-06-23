@@ -44,8 +44,8 @@ data:
     shuffle: true
     num_workers: 8
     # Per-GPU batch. Stage-1 global batch = batch_size * num_devices (8x A800 ->
-    # 768); the RF-stage LR in rf*.yaml is sqrt-scaled from this.
-    batch_size: 96
+    # 128); the RF-stage LR in rf*.yaml is sqrt-scaled from this.
+    batch_size: 16
     pin_memory: true
     prefetch_factor: 2
     persistent_workers: true

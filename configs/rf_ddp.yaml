@@ -54,10 +54,9 @@ model:
     val_vpe: true
 
     # ----- optimization -----
-    # Global batch = 96 * 8 = 768 (48x the old batch-16 reference). sqrt-scaled
-    # LR: 1.5e-4 * sqrt(48) ~= 1.0e-3. Aggressive -- watch the first few hundred
-    # steps for spikes/NaN and back off (or lengthen warmup) if needed.
-    lr: 1.0e-3
+    # Global batch = 16 * 8 = 128 (8x the batch-16 reference). sqrt-scaled
+    # LR: 1.5e-4 * sqrt(8) ~= 4.2e-4.
+    lr: 4.2e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     warmup_steps: 1000

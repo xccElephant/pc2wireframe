@@ -43,8 +43,9 @@ data:
     shuffle: true
     num_workers: 8
     # V^2 pairwise + along-edge evidence are memory heavy and grow as vmax^2;
-    # at vmax=512 a batch of 8 is reasonable (lower it if you raise vmax / hit OOM).
-    batch_size: 8
+    # at vmax=512 batch 16 can be tight -- lower it (or use
+    # trainer.accumulate_grad_batches) if you hit OOM.
+    batch_size: 16
     pin_memory: true
     prefetch_factor: 2
     persistent_workers: true
@@ -114,7 +115,9 @@ model:
     eval_match_thresh: 0.1
 
     # ----- optimization -----
-    lr: 3.0e-4
+    # lr ~sqrt(batch/8) from the 3e-4@batch8 reference; at batch 16 that is
+    # 3e-4 * sqrt(2) ~= 4.2e-4.
+    lr: 4.2e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     warmup_steps: 500
