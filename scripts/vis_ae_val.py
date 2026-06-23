@@ -98,17 +98,34 @@ def load_model(ckpt_path: str, device: str
 # Decode (mirrors module.decode / export_submission.decode_batch)
 # ----------------------------------------------------------------------
 @torch.no_grad()
-def decode_batch(decoder, out, hp) -> list[dict[str, np.ndarray]]:
+def decode_batch(
+    decoder, out, hp,
+    *,
+    vertex_thresh: float | None = None,
+    edge_thresh: float | None = None,
+    max_edges: int = 0,
+) -> list[dict[str, np.ndarray]]:
+    """Decode a batch of decoder outputs into wireframes (numpy).
+
+    ``vertex_thresh`` / ``edge_thresh`` override the values baked into the
+    checkpoint hyper-parameters when provided. ``max_edges`` caps the number of
+    edges per shape: among the pairs that clear ``edge_thresh`` only the top-k
+    by existence probability are kept (0 = no cap). Mirrors
+    ``export_submission.decode_batch`` so visualizations match the submission.
+    """
     vertex_logit = out["vertex_logit"]
     vertex_xyz = out["vertex_xyz"]
     hidden = out["hidden"]
     global_vec = out["global"]
     device = vertex_logit.device
     b = vertex_logit.shape[0]
-    vt = float(hp.get("vertex_thresh", 0.5))
-    et = float(hp.get("edge_thresh", 0.5))
+    vt = float(vertex_thresh if vertex_thresh is not None
+               else hp.get("vertex_thresh", 0.5))
+    et = float(edge_thresh if edge_thresh is not None
+               else hp.get("edge_thresh", 0.5))
     cap = int(hp.get("max_decode_vertices", 512))
     npe = int(hp.get("num_per_edge", 32))
+    me = max(0, int(max_edges))
 
     wfs: list[dict[str, np.ndarray]] = []
     for i in range(b):
@@ -130,13 +147,27 @@ def decode_batch(decoder, out, hp) -> list[dict[str, np.ndarray]]:
         h = hidden[i][alive]
         ehead = decoder.edge_logits(
             h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
+
+        # Threshold + top-k edge selection on-device (mirrors the official
+        # baseline): keep edges above ``et`` and, if still too many, the
+        # top-``me`` by probability.
+        edge_prob = torch.sigmoid(ehead["exist"])      # (M,)
+        keep = edge_prob >= et
+        if me > 0 and int(keep.sum().item()) > me:
+            surv = torch.nonzero(keep, as_tuple=False).reshape(-1)
+            top = torch.topk(edge_prob[surv], me, largest=True).indices
+            keep = torch.zeros_like(keep)
+            keep[surv[top]] = True
+        sel = torch.nonzero(keep, as_tuple=False).reshape(-1)
+
+        iu_s, ju_s = iu[sel], ju[sel]
         fields = {
             "vertices": verts.cpu().numpy().astype(np.float32),
-            "pair_index": torch.stack([iu, ju], dim=1).cpu().numpy(),
-            "edge_prob": torch.sigmoid(ehead["exist"]).cpu().numpy(),
-            "edge_type": ehead["type"].argmax(dim=-1).cpu().numpy(),
-            "q1": ehead["params"][:, 0].cpu().numpy(),
-            "q2": ehead["params"][:, 1].cpu().numpy(),
+            "pair_index": torch.stack([iu_s, ju_s], dim=1).cpu().numpy(),
+            "edge_prob": edge_prob[sel].cpu().numpy(),
+            "edge_type": ehead["type"][sel].argmax(dim=-1).cpu().numpy(),
+            "q1": ehead["params"][sel, 0].cpu().numpy(),
+            "q2": ehead["params"][sel, 1].cpu().numpy(),
         }
         wfs.append(decode_wireframe(fields, edge_thresh=et, num_per_edge=npe))
     return wfs
@@ -476,6 +507,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-edge-points", type=int, default=32)
     p.add_argument("--max-pc-points", type=int, default=0)
+    # decode post-processing (override the thresholds baked into the ckpt)
+    p.add_argument("--vertex-thresh", type=float, default=0.5,
+                   help="keep a vertex iff sigmoid(alive) >= this "
+                        "(default: use ckpt value; higher = fewer vertices)")
+    p.add_argument("--edge-thresh", type=float, default=0.5,
+                   help="keep an edge iff sigmoid(exist) >= this "
+                        "(default: use ckpt value)")
+    p.add_argument("--max-edges", type=int, default=1024,
+                   help="hard cap on edges per shape: among edges passing "
+                        "--edge-thresh, keep the top-k by probability "
+                        "(0 = no cap). Mirrors the official top-k strategy.")
     p.add_argument("--ccd-tau", type=float, default=0.1)
     p.add_argument("--vpe-tau", type=float, default=0.1)
     p.add_argument("--match-thresh", type=float, default=0.1)
@@ -510,6 +552,12 @@ def main() -> None:
     ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
     print(f"Loading checkpoint: {ckpt}")
     encoder, decoder, hp = load_model(ckpt, args.device)
+    vt = args.vertex_thresh if args.vertex_thresh is not None \
+        else hp.get("vertex_thresh", 0.5)
+    et = args.edge_thresh if args.edge_thresh is not None \
+        else hp.get("edge_thresh", 0.5)
+    print(f"decode: vertex_thresh={vt} edge_thresh={et} "
+          f"max_edges={args.max_edges or 'inf'}")
 
     has_baseline = (args.split == "test" and not args.no_baseline)
     baseline_stems: set[str] = set()
@@ -558,7 +606,11 @@ def main() -> None:
         with torch.no_grad():
             z = encoder(pc, offset)
             out = decoder(z)
-            preds = decode_batch(decoder, out, hp)
+            preds = decode_batch(
+                decoder, out, hp,
+                vertex_thresh=args.vertex_thresh,
+                edge_thresh=args.edge_thresh,
+                max_edges=args.max_edges)
 
         for j, s in enumerate(samples):
             name = str(s["shape_id"])
