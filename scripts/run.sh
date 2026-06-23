@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Single-stage WireframeAE PC2Wireframe training driver -- one trainable
-# autoencoder (frozen PTv3 encoder + compressor + WireframeAE decoder).
+# VQVAE WireframeAE PC2Wireframe training driver -- one trainable end-to-end
+# discrete autoencoder (frozen PTv3 encoder + multi-scale compressors +
+# per-scale ResidualVQ + graph decoder).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -9,18 +10,18 @@ DATA=configs/data.yaml
 
 # ----- train (single GPU) -----
 train() {
-  python -m src.main fit --config "$DATA" --config configs/ae.yaml
+  python -m src.main fit --config "$DATA" --config configs/vqvae.yaml
 }
 
 # ----- train (8x A800 DDP) -----
 train_ddp() {
-  python -m src.main fit --config "$DATA" --config configs/ae_ddp.yaml
+  python -m src.main fit --config "$DATA" --config configs/vqvae_ddp.yaml
 }
 
-# ----- inference / submission export (pass CKPT=<ae.ckpt>) -----
+# ----- inference / submission export (pass CKPT=<vqvae.ckpt>) -----
 export_submission() {
   python scripts/export_submission.py \
-    --ckpt "${CKPT:?set CKPT to the trained WireframeAE checkpoint}" \
+    --ckpt "${CKPT:?set CKPT to the trained VQVAE checkpoint}" \
     --out-dir logs/submission
 }
 

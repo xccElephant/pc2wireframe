@@ -1,32 +1,44 @@
-# Single-stage WireframeAE (8x A800 DDP) -- one trainable autoencoder.
+# VQVAE WireframeAE (8x A800 DDP) -- end-to-end discrete autoencoder.
 # Run with:
-#   python -m src.main fit --config configs/data.yaml --config configs/ae_ddp.yaml
+#   python -m src.main fit --config configs/data.yaml --config configs/vqvae_ddp.yaml
 #
-# Multi-GPU twin of ae.yaml: identical model, DDP trainer + an LR scaled for the
-# larger global batch (data.batch_size * 8). Keep in sync with ae.yaml.
+# Multi-GPU twin of vqvae.yaml: identical model, DDP trainer + an LR scaled for
+# the larger global batch (data.batch_size * 8). Keep in sync with vqvae.yaml.
 seed_everything: 3407
 
 model:
   class_path: src.module.WireframeAEModule
   init_args:
-    # ----- point-cloud encoder: frozen Utonia PTv3 + trainable compressor -----
+    # ----- point-cloud encoder: frozen Utonia PTv3, multi-scale compressors -----
     pc_encoder:
       utonia: logs/utonia/utonia.pth
       grid_size: 0.01
       freeze: true
-      latent_num: 16
+      scale_tokens: [256, 128, 64]
+      scale_stages: null
       latent_dim: 256
-      # must divide the compressor in_dim = Utonia enc_channels[-1] = 576
       compressor_heads: 8
       compressor_layers: 1
 
-    # ----- WireframeAE decoder -----
+    # ----- per-scale residual vector quantizer -----
+    quantizer:
+      n_q: 8                     # budget (256+128+64)*8 = 3584 <= 4096
+      codebook_size: 8192
+      kmeans_init: true
+      kmeans_iters: 10
+      threshold_ema_dead_code: 2
+      decay: 0.99
+      commitment_weight: 0.25
+
+    # ----- graph wireframe decoder -----
     decoder:
       latent_dim: 256
       num_queries: 512
       d_model: 256
       nhead: 8
       num_layers: 6
+      gnn_rounds: 3
+      knn_k: 24
       mlp_ratio: 4.0
       dropout: 0.0
       edge_hidden: 256
@@ -37,12 +49,18 @@ model:
     w_edge: 1.0
     w_edge_type: 1.0
     w_edge_param: 1.0
-    w_curve_geom: 0.1           # curve Chamfer (now NaN-safe; see ae.yaml note)
-    alive_pos_weight: 5.0
-    edge_neg_ratio: 3.0
-    match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries
+    w_curve_geom: 0.2
+    w_commit: 0.25
+    alive_pos_weight: 10.0
+    focal_gamma: 2.0
+    focal_alpha: 0.25
+    match_alive_weight: 0.2
     curve_type_class_weights: [1.0, 3.0, 9.0]
     geom_num_per_edge: 32
+
+    # ----- quantization schedule -----
+    quant_warmup_steps: 2000
+    commit_ramp_steps: 2000
 
     # ----- decode (validation / predict) -----
     vertex_thresh: 0.5
@@ -63,7 +81,7 @@ model:
     lr: 8.0e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
-    warmup_steps: 500
+    warmup_steps: 1000
     max_steps: 100000
     grad_clip: 1.0
 
@@ -71,13 +89,17 @@ trainer:
   max_epochs: 100
   check_val_every_n_epoch: 5
   accelerator: gpu
-  devices: 8                    # 8x A800; for single GPU use configs/ae.yaml
+  devices: 8                    # 8x A800; for single GPU use configs/vqvae.yaml
   num_nodes: 1
-  # The frozen Utonia backbone has no grads; every *trainable* param (compressor
-  # + decoder) contributes to the loss each step, so plain DDP is safe (no
-  # find_unused_parameters pass).
-  strategy: ddp
-  sync_batchnorm: false         # model uses Layer/GroupNorm, not BatchNorm
+  # find_unused_parameters: during the continuous-z quant warmup the decoder
+  # consumes z (not z_q), so each RVQ's output projection is momentarily unused;
+  # the flag lets DDP tolerate that conditional path. The frozen Utonia backbone
+  # simply has no grads.
+  strategy:
+    class_path: pytorch_lightning.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+  sync_batchnorm: false
   use_distributed_sampler: true
   precision: 32-true
   accumulate_grad_batches: 1
@@ -87,7 +109,7 @@ trainer:
     init_args:
       save_dir: logs
       project: pc2wireframe
-      name: wireframe_ae_ddp
+      name: wireframe_vqvae_ddp
       log_model: false
   callbacks:
     - class_path: ModelCheckpoint

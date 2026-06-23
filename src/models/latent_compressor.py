@@ -9,9 +9,10 @@ projected to a ``latent_dim``-channel distribution, giving a latent of
 values. A single decoder layer (``num_layers=1``) already performs the pooling;
 more layers just add mixing capacity.
 
-Output layout is ``(B, num_tokens, latent_dim)``, consumed directly as the
-compressed latent decoded by the WireframeAE decoder
-(:class:`~src.models.wireframe_ae.WireframeAE`).
+Output layout is ``(B, num_tokens, latent_dim)``. In the VQVAE branch one
+compressor is built per encoder scale, and its output is the continuous latent
+fed to the per-scale residual vector quantizer
+(:class:`~src.models.quantizer.MultiScaleResidualVQ`).
 """
 from __future__ import annotations
 

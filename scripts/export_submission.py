@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a competition submission zip from the single-stage WireframeAE model.
+"""Export a competition submission zip from the VQVAE WireframeAE model.
 
 Serialises every test shape into the layout the official evaluator (and the
 ``pc2wireframe_baseline`` submission) expect::
@@ -7,7 +7,7 @@ Serialises every test shape into the layout the official evaluator (and the
     submission/
         latent_pack.npz                 # stems (N,)  + latents (N, K)
         sample_edge/<stem>.npz
-            latent       : (K,) float32, K <= 4096
+            latent       : (K,) float32, K <= 4096   (flat RVQ indices)
             vertices     : (V, 3) float32
             edge_index   : (E, 2) int32   (indexes into vertices)
             edge_points  : (E, 32, 3) float32
@@ -19,20 +19,24 @@ and finally zips ``submission/`` into ``submission.zip``.
 Pipeline per shape::
 
     raw test point cloud
-        --[UtoniaEncoder -> latent z (16x256)]-->
-    latent z
-        --[WireframeAE decoder -> src.recon.decode_wireframe]-->
+        --[UtoniaEncoder -> multi-scale z_s]-->
+        --[MultiScaleResidualVQ -> flat indices (K,)]-->     # the submission
+    flat indices
+        --[decode_indices -> z_q -> WireframeGraphDecoder -> decode_wireframe]-->
     wireframe {vertices, edge_index, edge_points}
+
+The wireframe is reconstructed from the **submitted indices** alone
+(indices -> codebooks -> z_q -> decoder), so the export is a guaranteed
+round-trip with the evaluator's view of the latent.
 
 Coordinate frame
 ----------------
-The WireframeAE works directly in the **raw** point-cloud frame (no per-shape
-normalization), so vertices / curves are written as decoded -- there is no
-de-normalization step.
+The model works directly in the **raw** point-cloud frame (no per-shape
+normalization), so vertices / curves are written as decoded.
 
-The per-sample ``latent`` is the encoder latent ``z`` flattened to
-``(K,) = latent_num * latent_dim`` floats (<= 4096, guaranteed by the
-``LatentCompressor`` budget).
+The per-sample ``latent`` is the flat RVQ index vector
+``(K,) = sum_s N_s * n_q`` floats (<= 4096, guaranteed by the
+``MultiScaleResidualVQ`` budget check at construction).
 
 Usage (from the project root)::
 
@@ -73,8 +77,12 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.data.dataset import PointCloudDataset, collate_ae_batch  # noqa: E402
+from src.models.quantizer import MultiScaleResidualVQ  # noqa: E402
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.models.wireframe_ae import WireframeAE  # noqa: E402
+from src.models.wireframe_graph_decoder import (  # noqa: E402
+    WireframeGraphDecoder,
+    knn_candidate_pairs,
+)
 from src.recon import decode_wireframe  # noqa: E402
 
 NUM_EDGE_POINTS = 32
@@ -112,17 +120,28 @@ def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
 
 
 def load_model(ckpt_path: str, device: str
-               ) -> tuple[UtoniaEncoder, WireframeAE, dict[str, Any]]:
-    """Build the WireframeAE encoder + decoder from a checkpoint."""
+               ) -> tuple[UtoniaEncoder, MultiScaleResidualVQ,
+                          WireframeGraphDecoder, dict[str, Any]]:
+    """Build the multi-scale encoder + RVQ + graph decoder from a checkpoint."""
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters", {}) or {}
 
     encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
-    decoder = WireframeAE(**(hp.get("decoder") or {}))
+    quantizer = MultiScaleResidualVQ(
+        scale_tokens=encoder.scale_tokens,
+        dim=encoder.latent_dim,
+        **(hp.get("quantizer") or {}),
+    )
+    dec_cfg = dict(hp.get("decoder") or {})
+    dec_cfg.setdefault("num_scales", len(encoder.scale_tokens))
+    dec_cfg.setdefault("latent_dim", encoder.latent_dim)
+    decoder = WireframeGraphDecoder(**dec_cfg)
 
     state = ck["state_dict"] if "state_dict" in ck else ck
     miss_e, unexp_e = encoder.load_state_dict(
         _strip_prefix(state, "encoder."), strict=False)
+    miss_q, unexp_q = quantizer.load_state_dict(
+        _strip_prefix(state, "quantizer."), strict=False)
     miss_d, unexp_d = decoder.load_state_dict(
         _strip_prefix(state, "decoder."), strict=False)
 
@@ -132,14 +151,18 @@ def load_model(ckpt_path: str, device: str
     if unexp_e:
         print(f"[warn] unexpected encoder keys: {unexp_e[:8]}"
               f"{' ...' if len(unexp_e) > 8 else ''}")
+    if miss_q:
+        print(f"[warn] missing quantizer keys: {miss_q[:8]}"
+              f"{' ...' if len(miss_q) > 8 else ''}")
     if miss_d:
         print(f"[warn] missing decoder keys: {miss_d}")
     if unexp_d:
         print(f"[warn] unexpected decoder keys: {unexp_d}")
 
     encoder.eval().to(device)
+    quantizer.eval().to(device)
     decoder.eval().to(device)
-    return encoder, decoder, hp
+    return encoder, quantizer, decoder, hp
 
 
 # ----------------------------------------------------------------------
@@ -147,7 +170,7 @@ def load_model(ckpt_path: str, device: str
 # ----------------------------------------------------------------------
 @torch.no_grad()
 def decode_batch(
-    decoder: WireframeAE,
+    decoder: WireframeGraphDecoder,
     out: dict[str, torch.Tensor],
     hp: dict[str, Any],
     *,
@@ -177,6 +200,7 @@ def decode_batch(
                else hp.get("edge_thresh", 0.5))
     cap = int(hp.get("max_decode_vertices", 512))
     npe = int(hp.get("num_per_edge", NUM_EDGE_POINTS))
+    knn_k = int(getattr(decoder, "knn_k", 24))
     me = max(0, int(max_edges))
 
     wfs: list[dict[str, np.ndarray]] = []
@@ -194,8 +218,10 @@ def decode_batch(
             })
             continue
         verts = vertex_xyz[i][alive]
-        va = alive.shape[0]
-        iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+        # kNN candidate pairs over the predicted xyz (O(V*k)); mirrors the
+        # training candidates and the LightningModule.decode path.
+        pairs = knn_candidate_pairs(verts.detach(), knn_k)
+        iu, ju = pairs[:, 0], pairs[:, 1]
         h = hidden[i][alive]
         ehead = decoder.edge_logits(
             h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
@@ -363,10 +389,9 @@ def run_worker(args: argparse.Namespace) -> None:
     print(f"[rank {rank}] decode: vertex_thresh={args.vertex_thresh} "
           f"edge_thresh={args.edge_thresh} "
           f"max_edges={args.max_edges or 'inf'}")
-    encoder, decoder, hp = load_model(ckpt, args.device)
+    encoder, quantizer, decoder, hp = load_model(ckpt, args.device)
 
-    k_latent = int(
-        encoder.compressor.num_tokens * encoder.compressor.latent_dim)
+    k_latent = int(quantizer.total_indices)
 
     dataset = PointCloudDataset(
         pointcloud_dir=args.test_pc_dir, max_pc_points=args.max_pc_points)
@@ -464,8 +489,12 @@ def run_worker(args: argparse.Namespace) -> None:
         offset = batch["pc_offset"].to(args.device)
 
         with torch.no_grad():
-            z = encoder(pc, offset)                       # (b, K, D)
-            out = decoder(z)
+            z_list = encoder(pc, offset)                  # list[(b, N_s, D)]
+            indices = quantizer(z_list)["indices"]        # (b, T) submission
+            # Decode from the *submitted* indices (round-trip): indices ->
+            # codebooks -> z_q -> graph decoder.
+            z_q = quantizer.decode_indices(indices)
+            out = decoder(z_q)
             preds = decode_batch(
                 decoder, out, hp,
                 vertex_thresh=args.vertex_thresh,
@@ -474,7 +503,7 @@ def run_worker(args: argparse.Namespace) -> None:
 
         for j, s in enumerate(samples):
             stem = str(s["shape_id"])
-            latent = z[j].detach().cpu().numpy().reshape(-1)
+            latent = indices[j].detach().cpu().numpy().reshape(-1)
             try:
                 sample_npz = _build_sample_npz(
                     preds[j], latent, NUM_EDGE_POINTS)

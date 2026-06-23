@@ -1,0 +1,122 @@
+# VQVAE WireframeAE -- end-to-end discrete autoencoder (single GPU).
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/vqvae.yaml
+#
+# point cloud -> frozen Utonia PTv3 (multi-scale per-stage features)
+# -> per-scale continuous tokens -> per-scale ResidualVQ -> flat indices
+# (<=4096, the submission) -> WireframeGraphDecoder (vertex queries + GNN +
+# kNN pairwise edges) -> wireframe {vertices, edge_index, edge_points}.
+# For 8x A800 DDP use vqvae_ddp.yaml.
+seed_everything: 3407
+
+model:
+  class_path: src.module.WireframeAEModule
+  init_args:
+    # ----- point-cloud encoder: frozen Utonia PTv3, multi-scale compressors -----
+    pc_encoder:
+      utonia: logs/utonia/utonia.pth   # local Utonia checkpoint (download manually)
+      grid_size: 0.01           # voxel dedup + PTv3 grid (raw ~unit frame)
+      freeze: true              # backbone frozen (eval + no_grad), compressors train
+      # multi-scale token allocation (finer -> coarser).
+      scale_tokens: [256, 128, 64]
+      scale_stages: null        # null -> deepest len(scale_tokens) PTv3 enc stages
+      latent_dim: 256
+      compressor_heads: 8       # must divide each stage's enc_channels
+      compressor_layers: 1
+
+    # ----- per-scale residual vector quantizer (the discrete latent) -----
+    quantizer:
+      # budget = sum_s N_s * n_q = (256+128+64)*8 = 3584 <= 4096 (checked at build).
+      n_q: 8
+      codebook_size: 8192       # index *count* is the budget, so size is free
+      kmeans_init: true
+      kmeans_iters: 10
+      threshold_ema_dead_code: 2
+      decay: 0.99
+      commitment_weight: 0.25
+
+    # ----- graph wireframe decoder (vertex queries + GNN + kNN edges) -----
+    decoder:
+      latent_dim: 256           # = pc_encoder.latent_dim
+      num_queries: 512          # = data.max_vertices (max vertex count)
+      d_model: 256
+      nhead: 8
+      num_layers: 6             # vertex cross-attention decoder layers
+      gnn_rounds: 3             # graph self-attention relation-reasoning rounds
+      knn_k: 24                 # kNN edge candidates per vertex
+      mlp_ratio: 4.0
+      dropout: 0.0
+      edge_hidden: 256
+
+    # ----- loss weights -----
+    w_vertex: 1.0               # matched vertex xyz L1
+    w_alive: 1.0                # vertex alive BCE
+    w_edge: 1.0                 # edge existence focal loss
+    w_edge_type: 1.0            # edge curve-type CE (class weighted)
+    w_edge_param: 1.0           # edge anchor (q1, q2) L1
+    w_curve_geom: 0.2           # parsed-curve Chamfer on matched edges
+    w_commit: 0.25              # VQ commitment loss (ramped in after warmup)
+    alive_pos_weight: 10.0      # up-weight the rare alive positives (V << Q)
+    focal_gamma: 2.0            # edge existence focal-loss focusing
+    focal_alpha: 0.25           # edge existence focal-loss balance
+    match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries
+    # CE class weights [line, arc, bezier]; lines dominate, bezier is rarest.
+    curve_type_class_weights: [1.0, 3.0, 9.0]
+    geom_num_per_edge: 32
+
+    # ----- quantization schedule -----
+    quant_warmup_steps: 2000    # continuous-z warmup (codebooks still EMA-update)
+    commit_ramp_steps: 2000     # commit weight 0 -> w_commit linear ramp
+
+    # ----- decode (validation / predict) -----
+    vertex_thresh: 0.5          # alive sigmoid threshold
+    edge_thresh: 0.5            # edge existence sigmoid threshold
+    max_decode_vertices: 512    # cap alive vertices before kNN edge scoring
+    num_per_edge: 32            # points per reconstructed edge curve
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_ccd_tau: 0.1
+    eval_vpe_tau: 0.1
+    eval_match_thresh: 0.1
+
+    # ----- optimization -----
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 1000
+    max_steps: 100000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1                    # single GPU; use configs/vqvae_ddp.yaml for 8x A800
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: wireframe_vqvae
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score:.4f}
+        monitor: val/score
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

@@ -1,21 +1,25 @@
-"""LightningModule for the single-stage WireframeAE PC2Wireframe branch.
+"""LightningModule for the VQVAE PC2Wireframe branch.
 
-A single trainable autoencoder is driven through ``LightningCLI`` (see
-``src/main.py``):
+A single trainable, end-to-end discrete autoencoder driven through
+``LightningCLI`` (see ``src/main.py``):
 
     packed point cloud (coord (P_sum, 3), offset (B,))   (native, variable size)
-        -> UtoniaEncoder (frozen PTv3 + trainable latent compressor)
-        -> latent z (B, 16, 256)                         (4096-float budget)
-        -> WireframeAE decoder (vertex queries + pairwise edge head)
+        -> UtoniaEncoder (frozen PTv3, multi-scale per-stage features)
+        -> per-scale continuous tokens  z_s (B, N_s, 256)
+        -> MultiScaleResidualVQ (per-scale ResidualVQ)
+        -> per-scale quantized z_q_s + flat indices (B, T<=4096)   (submission)
+        -> WireframeGraphDecoder (vertex queries + GNN + kNN pairwise edges)
         -> wireframe {vertices, edge_index, edge_points}
 
-The 16x256 latent is the competition submission; the decoder must reconstruct
-the wireframe from it alone. Training is a DETR-style set-prediction problem:
-the ``Q`` vertex queries are Hungarian-matched to the GT vertices (cost = xyz
-L1), then supervised with matched vertex L1 + alive BCE, and the edges are
-supervised on query pairs (existence BCE + curve type CE + anchor L1 + an
-optional curve-geometry Chamfer). There is no KL term -- the latent is
-deterministic.
+The flat **indices** (``T = sum_s N_s * n_q <= 4096``) are the competition
+submission; the decoder must reconstruct the wireframe from them alone (indices
+-> codebooks -> z_q -> decoder). Training is a DETR-style set-prediction
+problem: the ``Q`` vertex queries are Hungarian-matched to the GT vertices
+(cost = xyz L1), supervised with matched vertex L1 + alive BCE; edges are scored
+over kNN candidate pairs (unioned with the GT positives at train time) with a
+focal existence loss + curve type CE + anchor L1 + an optional curve-geometry
+Chamfer. A VQ commitment loss (ramped in after a continuous-``z`` warmup) trains
+the codebooks; there is no KL term.
 """
 from __future__ import annotations
 
@@ -29,8 +33,12 @@ import torch.nn.functional as F
 
 from .metrics import WireframeScore
 from .models.curves import sample_curve_by_type
+from .models.quantizer import MultiScaleResidualVQ
 from .models.utonia_encoder import UtoniaEncoder
-from .models.wireframe_ae import WireframeAE
+from .models.wireframe_graph_decoder import (
+    WireframeGraphDecoder,
+    knn_candidate_pairs,
+)
 from .recon import decode_wireframe
 
 
@@ -42,11 +50,26 @@ def _default_pc_encoder() -> dict[str, Any]:
         utonia="logs/utonia/utonia.pth",
         grid_size=0.01,
         freeze=True,
-        # 16 * 256 = 4096 floats (competition latent budget).
-        latent_num=16,
+        # multi-scale token allocation (finer -> coarser).
+        scale_tokens=[256, 128, 64],
+        scale_stages=None,        # None -> deepest len(scale_tokens) stages
         latent_dim=256,
         compressor_heads=8,
         compressor_layers=1,
+    )
+
+
+def _default_quantizer() -> dict[str, Any]:
+    # (scale_tokens / dim are taken from the encoder; budget is the *index*
+    # count sum_s N_s*n_q, e.g. (256+128+64)*8 = 3584 <= 4096.)
+    return dict(
+        n_q=8,
+        codebook_size=8192,
+        kmeans_init=True,
+        kmeans_iters=10,
+        threshold_ema_dead_code=2,
+        decay=0.99,
+        commitment_weight=0.25,
     )
 
 
@@ -57,6 +80,8 @@ def _default_decoder() -> dict[str, Any]:
         d_model=256,
         nhead=8,
         num_layers=6,
+        gnn_rounds=3,
+        knn_k=24,
         mlp_ratio=4.0,
         dropout=0.0,
         edge_hidden=256,
@@ -122,15 +147,35 @@ class _BaseModule(pl.LightningModule):
 
 
 # ----------------------------------------------------------------------
-# WireframeAE module
+# loss helpers
+# ----------------------------------------------------------------------
+def _focal_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float,
+    alpha: float,
+) -> torch.Tensor:
+    """Mean binary focal loss (Lin et al.) for the heavily-imbalanced edges."""
+    if logits.numel() == 0:
+        return logits.new_zeros(())
+    p = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1.0 - p) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    return (alpha_t * (1.0 - p_t).clamp_min(0.0) ** gamma * ce).mean()
+
+
+# ----------------------------------------------------------------------
+# WireframeAE module (VQVAE pipeline)
 # ----------------------------------------------------------------------
 class WireframeAEModule(_BaseModule):
-    """Point cloud -> latent -> WireframeAE decoder -> wireframe."""
+    """Point cloud -> multi-scale RVQ indices -> graph decoder -> wireframe."""
 
     def __init__(
         self,
         # ----- model config (nested, fully overridable from YAML) -----
         pc_encoder: dict[str, Any] | None = None,
+        quantizer: dict[str, Any] | None = None,
         decoder: dict[str, Any] | None = None,
         # ----- loss weights -----
         w_vertex: float = 1.0,
@@ -138,17 +183,21 @@ class WireframeAEModule(_BaseModule):
         w_edge: float = 1.0,
         w_edge_type: float = 1.0,
         w_edge_param: float = 1.0,
-        w_curve_geom: float = 0.1,
+        w_curve_geom: float = 0.2,
+        w_commit: float = 0.25,
         # alive BCE: positives are rare (V << Q), so up-weight them.
-        alive_pos_weight: float = 5.0,
-        # edge negatives are sampled at this multiple of the positive count.
-        edge_neg_ratio: float = 3.0,
-        # Hungarian matching cost = xyz L1 - match_alive_weight * alive_prob,
-        # so confident-alive queries are preferred (stabilises the matching).
+        alive_pos_weight: float = 10.0,
+        # edge existence focal-loss params.
+        focal_gamma: float = 2.0,
+        focal_alpha: float = 0.25,
+        # Hungarian matching cost = xyz L1 - match_alive_weight * alive_prob.
         match_alive_weight: float = 0.2,
         # curve type CE class weights (line / arc / bezier).
         curve_type_class_weights: list[float] | None = None,
         geom_num_per_edge: int = 32,
+        # ----- quantization schedule -----
+        quant_warmup_steps: int = 2000,   # continuous-z warmup (no commit)
+        commit_ramp_steps: int = 2000,    # commit weight 0 -> w_commit ramp
         # ----- decode (validation / predict) -----
         vertex_thresh: float = 0.5,
         edge_thresh: float = 0.5,
@@ -165,7 +214,7 @@ class WireframeAEModule(_BaseModule):
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         betas: tuple[float, float] = (0.9, 0.95),
-        warmup_steps: int = 500,
+        warmup_steps: int = 1000,
         max_steps: int = 100_000,
         grad_clip: float = 1.0,
     ) -> None:
@@ -173,8 +222,17 @@ class WireframeAEModule(_BaseModule):
         self.save_hyperparameters()
 
         self.encoder = UtoniaEncoder(**(pc_encoder or _default_pc_encoder()))
-        self.decoder = WireframeAE(**(decoder or _default_decoder()))
+        self.quantizer = MultiScaleResidualVQ(
+            scale_tokens=self.encoder.scale_tokens,
+            dim=self.encoder.latent_dim,
+            **(quantizer or _default_quantizer()),
+        )
+        dec_cfg = dict(decoder or _default_decoder())
+        dec_cfg.setdefault("num_scales", len(self.encoder.scale_tokens))
+        dec_cfg.setdefault("latent_dim", self.encoder.latent_dim)
+        self.decoder = WireframeGraphDecoder(**dec_cfg)
         self.num_queries = int(self.decoder.num_queries)
+        self.knn_k = int(self.decoder.knn_k)
 
         self.val_metrics = WireframeScore(
             w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
@@ -183,14 +241,32 @@ class WireframeAEModule(_BaseModule):
         )
 
     # ------------------------------------------------------------------
-    def encode(self, batch: dict[str, Any]) -> torch.Tensor:
-        """Latent ``z`` of shape ``(B, K, D)``."""
+    def _commit_weight(self) -> float:
+        """0 during the continuous-z warmup, then linearly ramp to ``w_commit``."""
+        step = int(self.global_step)
+        warm = int(self.hparams.quant_warmup_steps)
+        ramp = max(1, int(self.hparams.commit_ramp_steps))
+        if step < warm:
+            return 0.0
+        return float(self.hparams.w_commit) * min(1.0, (step - warm) / ramp)
+
+    def encode(self, batch: dict[str, Any]) -> list[torch.Tensor]:
+        """Per-scale continuous latent tokens ``[z_s (B, N_s, D)]``."""
         return self.encoder(batch["point_cloud"], batch["pc_offset"])
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
-        z = self.encode(batch)
-        out = self.decoder(z)
-        out["latent"] = z
+        z_list = self.encode(batch)
+        qo = self.quantizer(z_list)
+        # During the warmup the decoder sees continuous z (the codebooks still
+        # update via EMA); afterwards (and always at eval) it sees the
+        # straight-through z_q, matching the discrete submission.
+        use_q = (not self.training) or (
+            int(self.global_step) >= int(self.hparams.quant_warmup_steps))
+        dec_in = qo["z_q"] if use_q else z_list
+        out = self.decoder(dec_in)
+        out["indices"] = qo["indices"]
+        out["commit"] = qo["commit"]
+        out["idx_list"] = qo["idx_list"]
         return out
 
     # ------------------------------------------------------------------
@@ -204,12 +280,7 @@ class WireframeAEModule(_BaseModule):
         alive_prob: torch.Tensor | None = None,
         alive_weight: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Hungarian match queries -> GT vertices.
-
-        Cost is the xyz L1 distance minus an optional alive-confidence reward
-        (``alive_weight * sigmoid(alive_logit)``), so that -- among queries that
-        are geometrically close to a GT vertex -- the one the model already
-        believes is alive is preferred (DETR's classification cost term).
+        """Hungarian match queries -> GT vertices (cost = xyz L1 - alive reward).
 
         Returns ``(row, col)`` (query ids matched to gt ids, length ``V``).
         """
@@ -235,6 +306,8 @@ class WireframeAEModule(_BaseModule):
         global_vec = out["global"]              # (B, d)
         device = vertex_logit.device
         b, q, _ = vertex_xyz.shape
+        gamma = float(self.hparams.focal_gamma)
+        alpha = float(self.hparams.focal_alpha)
 
         type_weight = (
             vertex_logit.new_tensor(list(self.hparams.curve_type_class_weights))
@@ -268,16 +341,13 @@ class WireframeAEModule(_BaseModule):
             )                                             # query ids, gt ids
             alive_target[row] = 1.0
 
-            # alive BCE (positives up-weighted) + matched vertex L1
             pos_w = vertex_logit.new_tensor(float(self.hparams.alive_pos_weight))
             l_alive = l_alive + F.binary_cross_entropy_with_logits(
                 vertex_logit[i], alive_target, pos_weight=pos_w)
-            l_vertex = l_vertex + F.l1_loss(
-                vertex_xyz[i][row], gt_v[col])
+            l_vertex = l_vertex + F.l1_loss(vertex_xyz[i][row], gt_v[col])
             n_alive += 1
             n_vertex += 1
 
-            # gt vertex id -> matched query id
             gt2q = vertex_logit.new_full((v,), -1, dtype=torch.long)
             gt2q[col] = row
 
@@ -296,7 +366,6 @@ class WireframeAEModule(_BaseModule):
                 qs, qe = int(gt2q[gs]), int(gt2q[ge])
                 if qs < 0 or qe < 0 or qs == qe:
                     continue
-                # canonical ascending query order (q1 follows endpoint a)
                 if qs <= qe:
                     aa, bb = qs, qe
                     p1, p2 = gt_params[ei, 0], gt_params[ei, 1]
@@ -315,13 +384,10 @@ class WireframeAEModule(_BaseModule):
 
             n_pos = len(pos_a)
 
-            # ---- negative edges: random pairs (not in pos) drawn from the
-            # matched queries *plus* the queries the model currently predicts
-            # alive. The latter closes the train/inference gap: at decode time
-            # edges are scored over all thresholded-alive queries, so the edge
-            # head must also reject pairs among alive-but-unmatched queries.
-            n_neg = int(round(max(1, n_pos) * float(self.hparams.edge_neg_ratio)))
-            neg_a, neg_b = [], []
+            # ---- candidate negatives: kNN of the predicted xyz over the
+            # matched-plus-predicted-alive query set (mirrors inference, where
+            # edges are scored over the kNN of the thresholded-alive vertices).
+            # Training candidates = GT positives UNION kNN pairs (minus pos).
             matched_q = row.tolist()
             matched_set = set(matched_q)
             alive_pred = torch.nonzero(
@@ -331,20 +397,21 @@ class WireframeAEModule(_BaseModule):
             ).reshape(-1).tolist()
             cand_q = matched_q + [
                 int(x) for x in alive_pred if int(x) not in matched_set]
+            neg_a, neg_b = [], []
             if len(cand_q) >= 2:
-                tries = 0
-                max_tries = n_neg * 8 + 16
-                while len(neg_a) < n_neg and tries < max_tries:
-                    tries += 1
-                    ia, ib = np.random.randint(0, len(cand_q), size=2)
-                    if ia == ib:
-                        continue
-                    qa, qb = cand_q[ia], cand_q[ib]
-                    lo, hi = (qa, qb) if qa < qb else (qb, qa)
-                    if (lo, hi) in pos_set:
-                        continue
-                    neg_a.append(lo)
-                    neg_b.append(hi)
+                cand_t = torch.as_tensor(cand_q, dtype=torch.long, device=device)
+                knn_local = knn_candidate_pairs(
+                    vertex_xyz[i][cand_t].detach(), self.knn_k)
+                if knn_local.numel():
+                    gi = cand_t[knn_local[:, 0]]
+                    gj = cand_t[knn_local[:, 1]]
+                    lo = torch.minimum(gi, gj).tolist()
+                    hi = torch.maximum(gi, gj).tolist()
+                    for la, lb in zip(lo, hi):
+                        if la == lb or (la, lb) in pos_set:
+                            continue
+                        neg_a.append(la)
+                        neg_b.append(lb)
 
             a_ids = pos_a + neg_a
             b_ids = pos_b + neg_b
@@ -356,12 +423,8 @@ class WireframeAEModule(_BaseModule):
                     global_vec[i][None, :].expand(a_idx.shape[0], -1))
                 exist_target = vertex_logit.new_zeros(a_idx.shape[0])
                 exist_target[:n_pos] = 1.0
-                # negatives outnumber positives by ~edge_neg_ratio: up-weight
-                # the positive existence term to keep edge recall balanced.
-                edge_pos_w = vertex_logit.new_tensor(
-                    float(self.hparams.edge_neg_ratio))
-                l_edge = l_edge + F.binary_cross_entropy_with_logits(
-                    ehead["exist"], exist_target, pos_weight=edge_pos_w)
+                l_edge = l_edge + _focal_bce(
+                    ehead["exist"], exist_target, gamma, alpha)
                 n_edge += 1
 
                 if n_pos > 0:
@@ -374,7 +437,6 @@ class WireframeAEModule(_BaseModule):
                         ehead["params"][:n_pos], param_target)
                     n_etype += 1
 
-                    # ---- optional curve-geometry Chamfer (matched edges) ----
                     if float(self.hparams.w_curve_geom) != 0.0:
                         gep = g["edge_points"].to(device).float()
                         eidx = torch.as_tensor(
@@ -397,10 +459,6 @@ class WireframeAEModule(_BaseModule):
                             l_geom = l_geom + cd.mean()
                             n_geom += 1
 
-        # ---- normalise + combine ----
-        # Every term is a mean over the samples that actually contributed to it
-        # (its own counter), so the relative loss magnitudes no longer drift
-        # with the batch's mix of empty / non-empty wireframes.
         if n_alive > 0:
             l_alive = l_alive / n_alive
         if n_vertex > 0:
@@ -422,7 +480,7 @@ class WireframeAEModule(_BaseModule):
             + self.hparams.w_curve_geom * l_geom
         )
         return {
-            "loss": total,
+            "loss_geom": total,
             "loss_vertex": l_vertex.detach(),
             "loss_alive": l_alive.detach(),
             "loss_edge": l_edge.detach(),
@@ -431,28 +489,41 @@ class WireframeAEModule(_BaseModule):
             "loss_curve_geom": l_geom.detach(),
         }
 
+    def _perplexity_logs(self, out: dict[str, torch.Tensor]) -> dict[str, Any]:
+        pplx = MultiScaleResidualVQ.perplexity(
+            out["idx_list"], self.quantizer.codebook_size)
+        return {f"vq/perplexity_s{s}": p for s, p in enumerate(pplx)}
+
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         out = self.forward(batch)
         losses = self._loss(out, batch["gt_wireframes"])
+        commit_w = self._commit_weight()
+        loss = losses["loss_geom"] + commit_w * out["commit"]
         bs = batch["num_graphs"]
-        self.log("train/loss", losses["loss"], batch_size=bs,
-                 prog_bar=True, sync_dist=True)
+        self.log("train/loss", loss, batch_size=bs, prog_bar=True, sync_dist=True)
+        self.log("train/loss_commit", out["commit"].detach(), batch_size=bs,
+                 sync_dist=True)
+        self.log("train/commit_weight", commit_w, batch_size=bs)
         self.log_dict(
-            {f"train/{k}": v for k, v in losses.items() if k != "loss"},
+            {f"train/{k}": v for k, v in losses.items() if k != "loss_geom"},
             batch_size=bs, sync_dist=True,
         )
-        return losses["loss"]
+        self.log_dict(self._perplexity_logs(out), batch_size=bs, sync_dist=True)
+        return loss
 
     # ------------------------------------------------------------------
     @torch.no_grad()
     def decode(self, out: dict[str, torch.Tensor]) -> list[dict[str, np.ndarray]]:
-        """Decode a batch of decoder outputs into wireframes (numpy)."""
+        """Decode a batch of decoder outputs into wireframes (numpy).
+
+        Edges are scored only over the kNN candidate pairs of the alive vertices
+        (``O(V*k)``), matching the training candidates and the export path.
+        """
         vertex_logit = out["vertex_logit"]
         vertex_xyz = out["vertex_xyz"]
         hidden = out["hidden"]
         global_vec = out["global"]
-        device = vertex_logit.device
         b = vertex_logit.shape[0]
         vt = float(self.hparams.vertex_thresh)
         cap = int(self.hparams.max_decode_vertices)
@@ -476,15 +547,15 @@ class WireframeAEModule(_BaseModule):
                 continue
 
             verts = vertex_xyz[i][alive]                 # (V, 3)
-            va = alive.shape[0]
-            iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+            pairs = knn_candidate_pairs(verts.detach(), self.knn_k)  # (P, 2)
             h = hidden[i][alive]
+            iu, ju = pairs[:, 0], pairs[:, 1]
             ehead = self.decoder.edge_logits(
                 h[iu], h[ju],
                 global_vec[i][None, :].expand(iu.shape[0], -1))
             wfs.append({
                 "vertices": verts.detach().cpu().numpy().astype(np.float32),
-                "pair_index": torch.stack([iu, ju], dim=1).cpu().numpy(),
+                "pair_index": pairs.cpu().numpy(),
                 "edge_prob": torch.sigmoid(ehead["exist"]).detach().cpu().numpy(),
                 "edge_type": ehead["type"].argmax(dim=-1).detach().cpu().numpy(),
                 "q1": ehead["params"][:, 0].detach().cpu().numpy(),
@@ -519,13 +590,18 @@ class WireframeAEModule(_BaseModule):
     def validation_step(self, batch, batch_idx):
         out = self.forward(batch)
         losses = self._loss(out, batch["gt_wireframes"])
+        loss = losses["loss_geom"] + float(self.hparams.w_commit) * out["commit"]
         bs = batch["num_graphs"]
-        self.log("val/loss", losses["loss"], batch_size=bs, prog_bar=True,
+        self.log("val/loss", loss, batch_size=bs, prog_bar=True,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_commit", out["commit"].detach(), batch_size=bs,
                  on_step=False, on_epoch=True, sync_dist=True)
         self.log_dict(
-            {f"val/{k}": v for k, v in losses.items() if k != "loss"},
+            {f"val/{k}": v for k, v in losses.items() if k != "loss_geom"},
             batch_size=bs, on_step=False, on_epoch=True, sync_dist=True,
         )
+        self.log_dict(self._perplexity_logs(out), batch_size=bs,
+                      on_step=False, on_epoch=True, sync_dist=True)
         preds = self.decode_to_wireframes(out)
         self.val_metrics.update(preds, self._gt_to_numpy(batch["gt_wireframes"]))
 
@@ -539,16 +615,18 @@ class WireframeAEModule(_BaseModule):
         self.val_metrics.reset()
 
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
-        """Per-shape latent + decoded wireframe.
+        """Per-shape flat indices (submission) + decoded wireframe.
 
-        The latent ``z (B, K, D)`` is the competition submission; the wireframe
-        is decoded from it for visualisation / scoring.
+        The flat ``indices (B, T<=4096)`` are the competition submission; the
+        wireframe is decoded from the quantized latent for visualisation /
+        scoring.
         """
         out = self.forward(batch)
         preds = self.decode_to_wireframes(out)
         return {
             "shape_id": batch.get("shape_id"),
-            "latent": out["latent"],
+            "indices": out["indices"],
+            "latent": out["indices"],
             "wireframes": preds,
         }
 

@@ -17,6 +17,11 @@ torchdiffeq     # odeint (deterministic ODE sampling at val / predict)
 # --------- loggers --------- #
 wandb
 
+# --------- vector quantization (VQVAE branch) --------- #
+# Per-scale ResidualVQ for the discrete multi-scale latent. Imported by
+# src/models/quantizer.py; install it yourself (not auto-installed here).
+vector-quantize-pytorch
+
 # --------- custom --------- #
 scikit-image
 imageio

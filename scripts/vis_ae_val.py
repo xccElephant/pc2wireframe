@@ -46,8 +46,12 @@ from src.data.dataset import (  # noqa: E402
     PointCloudDataset,
     collate_ae_batch,
 )
+from src.models.quantizer import MultiScaleResidualVQ  # noqa: E402
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.models.wireframe_ae import WireframeAE  # noqa: E402
+from src.models.wireframe_graph_decoder import (  # noqa: E402
+    WireframeGraphDecoder,
+    knn_candidate_pairs,
+)
 from src.recon import decode_wireframe  # noqa: E402
 
 
@@ -81,17 +85,28 @@ def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
 
 
 def load_model(ckpt_path: str, device: str
-               ) -> tuple[UtoniaEncoder, WireframeAE, dict[str, Any]]:
+               ) -> tuple[UtoniaEncoder, MultiScaleResidualVQ,
+                          WireframeGraphDecoder, dict[str, Any]]:
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters", {}) or {}
     encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
-    decoder = WireframeAE(**(hp.get("decoder") or {}))
+    quantizer = MultiScaleResidualVQ(
+        scale_tokens=encoder.scale_tokens,
+        dim=encoder.latent_dim,
+        **(hp.get("quantizer") or {}),
+    )
+    dec_cfg = dict(hp.get("decoder") or {})
+    dec_cfg.setdefault("num_scales", len(encoder.scale_tokens))
+    dec_cfg.setdefault("latent_dim", encoder.latent_dim)
+    decoder = WireframeGraphDecoder(**dec_cfg)
     state = ck["state_dict"] if "state_dict" in ck else ck
     encoder.load_state_dict(_strip_prefix(state, "encoder."), strict=False)
+    quantizer.load_state_dict(_strip_prefix(state, "quantizer."), strict=False)
     decoder.load_state_dict(_strip_prefix(state, "decoder."), strict=False)
     encoder.eval().to(device)
+    quantizer.eval().to(device)
     decoder.eval().to(device)
-    return encoder, decoder, hp
+    return encoder, quantizer, decoder, hp
 
 
 # ----------------------------------------------------------------------
@@ -125,6 +140,7 @@ def decode_batch(
                else hp.get("edge_thresh", 0.5))
     cap = int(hp.get("max_decode_vertices", 512))
     npe = int(hp.get("num_per_edge", 32))
+    knn_k = int(getattr(decoder, "knn_k", 24))
     me = max(0, int(max_edges))
 
     wfs: list[dict[str, np.ndarray]] = []
@@ -142,8 +158,8 @@ def decode_batch(
             })
             continue
         verts = vertex_xyz[i][alive]
-        va = alive.shape[0]
-        iu, ju = torch.triu_indices(va, va, offset=1, device=device)
+        pairs = knn_candidate_pairs(verts.detach(), knn_k)
+        iu, ju = pairs[:, 0], pairs[:, 1]
         h = hidden[i][alive]
         ehead = decoder.edge_logits(
             h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
@@ -551,7 +567,7 @@ def main() -> None:
 
     ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
     print(f"Loading checkpoint: {ckpt}")
-    encoder, decoder, hp = load_model(ckpt, args.device)
+    encoder, quantizer, decoder, hp = load_model(ckpt, args.device)
     vt = args.vertex_thresh if args.vertex_thresh is not None \
         else hp.get("vertex_thresh", 0.5)
     et = args.edge_thresh if args.edge_thresh is not None \
@@ -604,8 +620,10 @@ def main() -> None:
         offset = batch["pc_offset"].to(args.device)
 
         with torch.no_grad():
-            z = encoder(pc, offset)
-            out = decoder(z)
+            z_list = encoder(pc, offset)
+            indices = quantizer(z_list)["indices"]
+            z_q = quantizer.decode_indices(indices)
+            out = decoder(z_q)
             preds = decode_batch(
                 decoder, out, hp,
                 vertex_thresh=args.vertex_thresh,

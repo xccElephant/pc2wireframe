@@ -1,27 +1,28 @@
-"""LightningCLI entry point for the single-stage WireframeAE PC2Wireframe branch.
+"""LightningCLI entry point for the VQVAE WireframeAE PC2Wireframe branch.
 
-A single trainable autoencoder (frozen PTv3 encoder + compressor + WireframeAE
-decoder) and datamodule are resolved from ``class_path`` in the configs::
+A single trainable end-to-end discrete autoencoder (frozen PTv3 encoder +
+multi-scale compressors + per-scale ResidualVQ + graph decoder) and datamodule
+are resolved from ``class_path`` in the configs::
 
     # train (single GPU)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/ae.yaml
+        --config configs/vqvae.yaml
 
     # train (8x A800 DDP)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/ae_ddp.yaml
+        --config configs/vqvae_ddp.yaml
 
     # validate a checkpoint
     python -m src.main validate \
         --config configs/data.yaml \
-        --config configs/ae.yaml \
-        --ckpt_path <ae.ckpt>
+        --config configs/vqvae.yaml \
+        --ckpt_path <vqvae.ckpt>
 
 Submission export uses ``scripts/export_submission.py`` (single forward:
-encode -> latent -> decode). ``--ckpt_path`` is Lightning's own arg to resume a
-run / load weights for ``predict`` / ``validate``.
+encode -> RVQ indices -> decode). ``--ckpt_path`` is Lightning's own arg to
+resume a run / load weights for ``predict`` / ``validate``.
 """
 import pyrootutils
 import torch
