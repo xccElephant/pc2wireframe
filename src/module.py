@@ -139,10 +139,6 @@ class WireframeAEModule(_BaseModule):
         w_edge_type: float = 1.0,
         w_edge_param: float = 1.0,
         w_curve_geom: float = 0.1,
-        # DETR-style auxiliary loss: the same losses applied to every
-        # intermediate decoder layer, averaged. 0 disables (and skips the
-        # extra forward work).
-        w_aux: float = 1.0,
         # alive BCE: positives are rare (V << Q), so up-weight them.
         alive_pos_weight: float = 5.0,
         # edge negatives are sampled at this multiple of the positive count.
@@ -193,9 +189,7 @@ class WireframeAEModule(_BaseModule):
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         z = self.encode(batch)
-        # Only pay for intermediate layers when the aux loss is active (train).
-        want_aux = self.training and float(self.hparams.w_aux) > 0.0
-        out = self.decoder(z, return_intermediate=want_aux)
+        out = self.decoder(z)
         out["latent"] = z
         return out
 
@@ -440,30 +434,15 @@ class WireframeAEModule(_BaseModule):
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         out = self.forward(batch)
-        gt = batch["gt_wireframes"]
-        losses = self._loss(out, gt)
-        total = losses["loss"]
+        losses = self._loss(out, batch["gt_wireframes"])
         bs = batch["num_graphs"]
-
-        # DETR-style auxiliary supervision on the intermediate decoder layers.
-        aux_hidden = out.get("aux_hidden")
-        if aux_hidden:
-            aux_vals = [
-                self._loss(self.decoder.vertex_heads(h), gt)["loss"]
-                for h in aux_hidden
-            ]
-            aux_mean = torch.stack(aux_vals).mean()
-            total = total + float(self.hparams.w_aux) * aux_mean
-            self.log("train/loss_aux", aux_mean.detach(), batch_size=bs,
-                     sync_dist=True)
-
-        self.log("train/loss", total, batch_size=bs,
+        self.log("train/loss", losses["loss"], batch_size=bs,
                  prog_bar=True, sync_dist=True)
         self.log_dict(
             {f"train/{k}": v for k, v in losses.items() if k != "loss"},
             batch_size=bs, sync_dist=True,
         )
-        return total
+        return losses["loss"]
 
     # ------------------------------------------------------------------
     @torch.no_grad()

@@ -46,7 +46,6 @@ model:
     # so the old collinear-fallback NaN-grad risk is gone. grad_clip=1.0 covers
     # the merely-large early-bezier grads.
     w_curve_geom: 0.1
-    w_aux: 1.0                  # DETR aux loss on each intermediate decoder layer
     alive_pos_weight: 5.0       # up-weight the rare alive positives (V << Q)
     edge_neg_ratio: 3.0         # negative edge pairs per positive
     match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries

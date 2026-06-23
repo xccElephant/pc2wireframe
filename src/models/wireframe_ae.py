@@ -94,28 +94,11 @@ class WireframeAE(nn.Module):
         self.edge_param_head = _mlp(edge_in, edge_hidden, 6)
 
     # ------------------------------------------------------------------
-    def vertex_heads(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Apply the per-query vertex heads to a hidden state ``(B, Q, d)``.
-
-        Factored out so the same heads can score the final decoder layer *and*
-        each intermediate layer (DETR-style auxiliary losses).
-        """
-        return {
-            "vertex_logit": self.alive_head(h).squeeze(-1),
-            "vertex_xyz": self.xyz_head(h),
-            "hidden": h,
-            "global": h.mean(dim=1),
-        }
-
-    def forward(
-        self, latent: torch.Tensor, return_intermediate: bool = False
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, latent: torch.Tensor) -> dict[str, torch.Tensor]:
         """Decode the latent into per-query vertex fields + hidden states.
 
         Args:
             latent: ``(B, K, D)`` compressed latent tokens.
-            return_intermediate: also return every non-final decoder layer's
-                (normed) hidden state under ``aux_hidden`` for auxiliary losses.
 
         Returns:
             dict with::
@@ -124,28 +107,17 @@ class WireframeAE(nn.Module):
                 vertex_xyz   (B, Q, 3)       predicted vertex coordinate
                 hidden       (B, Q, d_model) query tokens (for the edge head)
                 global       (B, d_model)    mean query token (shape context)
-                aux_hidden   list[(B, Q, d_model)]  (only if return_intermediate)
         """
         b = latent.shape[0]
         mem = self.latent_proj(latent)                  # (B, K, d_model)
         q = self.queries.expand(b, -1, -1)
-
-        if not return_intermediate:
-            h = self.decoder(tgt=q, memory=mem)         # (B, Q, d_model)
-            return self.vertex_heads(h)
-
-        # Manually unroll the layers to expose intermediate hidden states; the
-        # final-layer output is numerically identical to ``self.decoder(...)``.
-        hs: list[torch.Tensor] = []
-        output = q
-        for layer in self.decoder.layers:
-            output = layer(output, mem)
-            hs.append(output)
-        if self.decoder.norm is not None:
-            hs = [self.decoder.norm(o) for o in hs]
-        out = self.vertex_heads(hs[-1])
-        out["aux_hidden"] = hs[:-1]
-        return out
+        h = self.decoder(tgt=q, memory=mem)             # (B, Q, d_model)
+        return {
+            "vertex_logit": self.alive_head(h).squeeze(-1),
+            "vertex_xyz": self.xyz_head(h),
+            "hidden": h,
+            "global": h.mean(dim=1),
+        }
 
     # ------------------------------------------------------------------
     def edge_logits(

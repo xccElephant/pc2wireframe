@@ -38,7 +38,6 @@ model:
     w_edge_type: 1.0
     w_edge_param: 1.0
     w_curve_geom: 0.1           # curve Chamfer (now NaN-safe; see ae.yaml note)
-    w_aux: 1.0                  # DETR aux loss on each intermediate decoder layer
     alive_pos_weight: 5.0
     edge_neg_ratio: 3.0
     match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries
