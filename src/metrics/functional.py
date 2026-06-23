@@ -39,15 +39,6 @@ def _as_points(x, device: torch.device | str = "cpu") -> torch.Tensor:
     return t.reshape(-1, 3)
 
 
-def nn_distances(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Euclidean distance from each point in ``a`` to its nearest in ``b``."""
-    from pytorch3d.ops import knn_points
-
-    # knn_points returns *squared* distances; (1, N, 1) -> (N,)
-    sq = knn_points(a[None], b[None], K=1).dists[0, :, 0]
-    return sq.clamp_min(0.0).sqrt()
-
-
 # ----------------------------------------------------------------------
 # geometry helpers
 # ----------------------------------------------------------------------
@@ -181,7 +172,6 @@ def distance_to_score(distance: float, tau: float) -> float:
 
 
 __all__ = [
-    "nn_distances",
     "chamfer_distance",
     "sample_wireframe_points",
     "curve_chamfer_distance",
