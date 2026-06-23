@@ -52,14 +52,24 @@ def nn_distances(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 # geometry helpers
 # ----------------------------------------------------------------------
 def chamfer_distance(a, b, device: torch.device | str = "cpu") -> float:
-    """Symmetric L2 chamfer distance between two point sets (mean of means)."""
+    """Symmetric chamfer distance between two point sets via PyTorch3D.
+
+    Thin wrapper over ``pytorch3d.loss.chamfer_distance``: the mean per-point
+    *squared* L2 nearest-neighbour distance, summed over both directions.
+    Returns ``inf`` if either set is empty.
+
+    NOTE: this is the *squared* chamfer (PyTorch3D's convention), not the
+    Euclidean mean-of-means used previously -- the ``*_tau`` score-mapping knobs
+    must be recalibrated to this smaller scale.
+    """
+    from pytorch3d.loss import chamfer_distance as _p3d_chamfer
+
     a = _as_points(a, device)
     b = _as_points(b, device)
     if a.numel() == 0 or b.numel() == 0:
         return float("inf")
-    da = nn_distances(a, b)
-    db = nn_distances(b, a)
-    return 0.5 * (float(da.mean()) + float(db.mean()))
+    loss, _ = _p3d_chamfer(a[None], b[None])
+    return float(loss)
 
 
 def sample_wireframe_points(
