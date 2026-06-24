@@ -23,8 +23,7 @@ data:
     vertex_merge_tol: 0.0001
     # max_vertices doubles as the decoder vertex-query budget cap: a wireframe
     # with more than 512 vertices is skipped (must match decoder.num_queries).
-    # The dataset also skips empty clouds and clouds whose max|coord| > 1.2
-    # (the raw CAD data is already ~unit-normalized; no extra normalization).
+    # The dataset is already unit-normalized ([-1, 1]); no extra normalization.
     max_vertices: 512
     max_edges: 0
     num_edge_points: 32
@@ -32,6 +31,8 @@ data:
     # 0 = keep all points. Set positive only as a memory safety cap.
     max_pc_points: 0
     min_edges: 1
+    # Skip (training) point clouds with fewer than this many points.
+    min_pc_points: 100
     max_load_retries: 64
 
     # ----- data loader -----

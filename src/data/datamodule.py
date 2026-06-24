@@ -62,6 +62,9 @@ class WireframeDataModule(pl.LightningDataModule):
         # Input point cloud is variable size (packed for PTv3); 0 = keep all.
         max_pc_points: int = 0,
         min_edges: int = 1,
+        # Training point clouds with fewer points than this are skipped (the
+        # loader retries the next file). Does not affect predict/test.
+        min_pc_points: int = 100,
         max_load_retries: int = 64,
         # ----- data loader -----
         shuffle: bool = True,
@@ -103,6 +106,7 @@ class WireframeDataModule(pl.LightningDataModule):
             num_edge_points=self.hparams.num_edge_points,
             max_pc_points=self.hparams.max_pc_points,
             min_edges=self.hparams.min_edges,
+            min_pc_points=self.hparams.min_pc_points,
             max_load_retries=self.hparams.max_load_retries,
         )
 

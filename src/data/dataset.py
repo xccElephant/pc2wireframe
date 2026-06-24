@@ -13,11 +13,11 @@
         fractions ``t = 1/3`` (``q1``, near the start vertex) and ``t = 2/3``
         (``q2``, near the end vertex).
 
-    Coordinates are kept **raw** (no per-shape normalization): the whole branch
-    trains and supervises in the original frame. Point clouds whose
-    ``max(|coord|) > 1.2`` (or which are empty / oversize) are *skipped* (the
-    loader retries the next file), as are wireframes with more than
-    ``max_vertices`` vertices.
+    Coordinates are kept **raw**: the dataset is already normalized to the unit
+    cube (``[-1, 1]``), so the branch trains and supervises directly in that
+    frame with no extra per-shape normalization. Point clouds with fewer than
+    ``min_pc_points`` points are *skipped* (the loader retries the next file),
+    as are wireframes with more than ``max_vertices`` vertices.
 
 ``PointCloudDataset``
     Used for prediction / submission. The test split ships only point clouds
@@ -41,10 +41,6 @@ _log = logging.getLogger(__name__)
 
 # Coordinates beyond this magnitude are treated as corrupt and dropped.
 _PC_COORD_CLIP = 1e4
-# Point clouds whose max absolute coordinate exceeds this are skipped: the raw
-# CAD data is already roughly unit-normalized, so a larger extent flags an
-# un-normalized / corrupt sample (and would also overflow PTv3's grid depth).
-_MAX_ABS_COORD = 1.2
 
 
 # ----------------------------------------------------------------------
@@ -386,6 +382,7 @@ class WireframeGraphDataset(Dataset):
         num_edge_points: int = 32,
         max_pc_points: int = 0,
         min_edges: int = 1,
+        min_pc_points: int = 100,
         max_load_retries: int = 64,
     ) -> None:
         super().__init__()
@@ -402,6 +399,7 @@ class WireframeGraphDataset(Dataset):
             for d in (pointcloud_dirs or [])
         ]
         self.min_edges = int(min_edges)
+        self.min_pc_points = max(0, int(min_pc_points))
         self.max_load_retries = max(1, int(max_load_retries))
         self._bad_files: set[str] = set()
 
@@ -530,12 +528,10 @@ class WireframeGraphDataset(Dataset):
                     continue
                 if (mv > 0 and nv > mv) or (me > 0 and ne > me):
                     continue
-                # Raw frame (no normalization): skip clouds that are empty or
-                # exceed the expected unit extent.
+                # Raw frame (data is already unit-normalized): skip clouds that
+                # are too sparse to encode reliably.
                 pc = self._load_point_cloud(edge_path)
-                if pc.shape[0] < 1:
-                    continue
-                if float(np.abs(pc).max()) > _MAX_ABS_COORD:
+                if pc.shape[0] < self.min_pc_points:
                     continue
 
                 return self._make_item(
