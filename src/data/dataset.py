@@ -3,15 +3,11 @@
 ``WireframeGraphDataset``
     Used for training / validation. Loads a per-edge GT wireframe NPZ
     (endpoints + resampled curve points) together with its matching surface
-    point cloud, and emits the **native** GT wireframe graph (vertices +
-    edge_index) annotated with the per-edge supervision the WireframeAE
-    decoder regresses:
-
-      * ``edge_type``   ``(E,)``     -- 0=line / 1=arc / 2=bezier
-        (geometric residual fit, :func:`_fit_curve_type`);
-      * ``edge_params`` ``(E, 2, 3)``-- the curve coordinates at the arc-length
-        fractions ``t = 1/3`` (``q1``, near the start vertex) and ``t = 2/3``
-        (``q2``, near the end vertex).
+    point cloud, and emits the **native** GT wireframe graph
+    (``vertices`` + ``edge_index`` + ordered ``edge_points (E, P, 3)``). The
+    edge-centric decoder regresses each edge's ordered sample points directly
+    (its first / last points are the endpoints), so no parametric curve-type /
+    anchor supervision is produced.
 
     Coordinates are kept **raw**: the dataset is already normalized to the unit
     cube (``[-1, 1]``), so the branch trains and supervises directly in that
@@ -115,109 +111,6 @@ def _clean_point_cloud(points: np.ndarray, max_points: int = 0) -> np.ndarray:
         idx = np.random.choice(points.shape[0], size=int(max_points), replace=False)
         points = points[idx]
     return points
-
-
-# ----------------------------------------------------------------------
-# Per-edge curve type + parameter targets
-# ----------------------------------------------------------------------
-# Curve-type fit thresholds (max residual relative to the edge arc length).
-_CURVE_LINE_THRESH = 0.02
-_CURVE_ARC_THRESH = 0.02
-
-# Curve-type codes (kept in sync with the WireframeAE edge head + decoder).
-_CURVE_LINE = 0
-_CURVE_ARC = 1
-_CURVE_BEZIER = 2
-
-
-def _fit_curve_type(
-    polyline: np.ndarray,
-    *,
-    line_thresh: float = _CURVE_LINE_THRESH,
-    arc_thresh: float = _CURVE_ARC_THRESH,
-) -> int:
-    """Classify a GT polyline as ``0=line`` / ``1=arc`` / ``2=bezier``.
-
-    The decision is residual-based and scale-invariant (every residual is
-    measured relative to the polyline's arc length):
-
-      * **line**: small max perpendicular residual to the PCA principal axis;
-      * **arc**: otherwise, project onto the best-fit plane (the two dominant
-        PCA axes), fit a circle by least squares, and accept if the combined
-        in-plane radial + out-of-plane residual is small;
-      * **bezier**: everything else (the catch-all parameterisation).
-    """
-    pts = np.asarray(polyline, dtype=np.float64).reshape(-1, 3)
-    if pts.shape[0] < 3:
-        return _CURVE_LINE
-    seg_len = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-    arclen = float(seg_len.sum())
-    if arclen <= 1e-12:
-        return _CURVE_LINE
-
-    centered = pts - pts.mean(axis=0)
-    # PCA via SVD: rows of vt are principal axes (descending variance).
-    _, _, vt = np.linalg.svd(centered, full_matrices=False)
-    if vt.shape[0] < 3:
-        return _CURVE_LINE
-    axis0, axis1, normal = vt[0], vt[1], vt[2]
-
-    # Line test: residual orthogonal to the principal axis.
-    perp = centered - np.outer(centered @ axis0, axis0)
-    line_res = float(np.sqrt((perp ** 2).sum(axis=1)).max())
-    if line_res / arclen < line_thresh:
-        return _CURVE_LINE
-
-    # Arc test: least-squares circle in the (axis0, axis1) plane.
-    x = centered @ axis0
-    y = centered @ axis1
-    z = centered @ normal
-    a_mat = np.stack([x, y, np.ones_like(x)], axis=1)
-    b_vec = -(x ** 2 + y ** 2)
-    try:
-        sol, *_ = np.linalg.lstsq(a_mat, b_vec, rcond=None)
-    except np.linalg.LinAlgError:
-        return _CURVE_BEZIER
-    cx, cy = -0.5 * sol[0], -0.5 * sol[1]
-    r2 = cx ** 2 + cy ** 2 - sol[2]
-    if r2 <= 0.0:
-        return _CURVE_BEZIER
-    radius = np.sqrt(r2)
-    radial = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    arc_res = float(np.sqrt((radial - radius) ** 2 + z ** 2).max())
-    if arc_res / arclen < arc_thresh:
-        return _CURVE_ARC
-    return _CURVE_BEZIER
-
-
-def _curve_point_at(polyline: np.ndarray, frac: float) -> np.ndarray:
-    """Coordinate at normalised arc-length ``frac in [0, 1]`` on a polyline."""
-    pts = np.asarray(polyline, dtype=np.float64).reshape(-1, 3)
-    if pts.shape[0] == 0:
-        return np.zeros(3, dtype=np.float64)
-    if pts.shape[0] == 1:
-        return pts[0]
-    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-    total = float(seg.sum())
-    if total <= 1e-12:
-        return pts[0]
-    cum = np.concatenate([[0.0], np.cumsum(seg)])
-    target = float(np.clip(frac, 0.0, 1.0)) * total
-    j = int(np.clip(np.searchsorted(cum, target, side="right") - 1,
-                    0, seg.shape[0] - 1))
-    local = (target - cum[j]) / max(seg[j], 1e-12)
-    return pts[j] + local * (pts[j + 1] - pts[j])
-
-
-def _edge_params(edge_points: np.ndarray) -> np.ndarray:
-    """Per-edge ``(E, 2, 3)`` anchors at the t=1/3 (q1) and t=2/3 (q2) points."""
-    pts = np.asarray(edge_points, dtype=np.float64)
-    e = pts.shape[0]
-    out = np.zeros((e, 2, 3), dtype=np.float32)
-    for i in range(e):
-        out[i, 0] = _curve_point_at(pts[i], 1.0 / 3.0)
-        out[i, 1] = _curve_point_at(pts[i], 2.0 / 3.0)
-    return out
 
 
 # ----------------------------------------------------------------------
@@ -478,22 +371,15 @@ class WireframeGraphDataset(Dataset):
         if ne > 0:
             edge_index_arr = np.asarray(edge_index, dtype=np.int64)
             edge_points_arr = np.stack(edge_points, axis=0).astype(np.float32)
-            edge_type_arr = np.array(
-                [_fit_curve_type(ep) for ep in edge_points_arr], dtype=np.int64)
-            edge_params_arr = _edge_params(edge_points_arr)
         else:
             edge_index_arr = np.zeros((0, 2), dtype=np.int64)
             edge_points_arr = np.zeros(
                 (0, fmt.num_edge_points, 3), dtype=np.float32)
-            edge_type_arr = np.zeros((0,), dtype=np.int64)
-            edge_params_arr = np.zeros((0, 2, 3), dtype=np.float32)
 
         return {
             "vertices": vertices_arr,
             "edge_index": edge_index_arr,
             "edge_points": edge_points_arr,
-            "edge_type": edge_type_arr,
-            "edge_params": edge_params_arr,
             "num_vertices": nv,
             "num_edges": ne,
         }
@@ -541,8 +427,6 @@ class WireframeGraphDataset(Dataset):
                     vertices=graph["vertices"],
                     edge_index=graph["edge_index"],
                     edge_points=graph["edge_points"],
-                    edge_type=graph["edge_type"],
-                    edge_params=graph["edge_params"],
                 )
             except Exception as exc:
                 self._bad_files.add(edge_path)
@@ -562,8 +446,6 @@ class WireframeGraphDataset(Dataset):
         vertices: np.ndarray,
         edge_index: np.ndarray,
         edge_points: np.ndarray,
-        edge_type: np.ndarray,
-        edge_params: np.ndarray,
     ) -> dict[str, Any]:
         def _t(a: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(np.ascontiguousarray(a))
@@ -574,8 +456,6 @@ class WireframeGraphDataset(Dataset):
             "vertices": _t(vertices),
             "edge_index": _t(edge_index),
             "edge_points": _t(edge_points),
-            "edge_type": _t(edge_type),
-            "edge_params": _t(edge_params),
         }
 
 
@@ -655,8 +535,6 @@ def collate_ae_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
                 "vertices": s["vertices"],
                 "edge_index": s["edge_index"],
                 "edge_points": s["edge_points"],
-                "edge_type": s["edge_type"],
-                "edge_params": s["edge_params"],
             }
             for s in samples
         ]

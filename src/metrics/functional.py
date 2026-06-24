@@ -43,24 +43,28 @@ def _as_points(x, device: torch.device | str = "cpu") -> torch.Tensor:
 # geometry helpers
 # ----------------------------------------------------------------------
 def chamfer_distance(a, b, device: torch.device | str = "cpu") -> float:
-    """Symmetric chamfer distance between two point sets via PyTorch3D.
+    """Symmetric **Euclidean** chamfer distance between two point sets.
 
-    Thin wrapper over ``pytorch3d.loss.chamfer_distance``: the mean per-point
-    *squared* L2 nearest-neighbour distance, summed over both directions.
-    Returns ``inf`` if either set is empty.
+    The mean-of-means of the *Euclidean* (not squared) nearest-neighbour
+    distance in both directions::
 
-    NOTE: this is the *squared* chamfer (PyTorch3D's convention), not the
-    Euclidean mean-of-means used previously -- the ``*_tau`` score-mapping knobs
-    must be recalibrated to this smaller scale.
+        0.5 * ( mean_i min_j ||a_i - b_j|| + mean_j min_i ||a_i - b_j|| )
+
+    This is the original Euclidean-scale chamfer (restored from the PyTorch3D
+    *squared* convention) so the ``*_tau`` score-mapping knobs stay comparable
+    to the historical baseline. Nearest-neighbour queries still run batched on
+    the GPU via ``pytorch3d.ops.knn_points``. Returns ``inf`` if either set is
+    empty.
     """
-    from pytorch3d.loss import chamfer_distance as _p3d_chamfer
+    from pytorch3d.ops import knn_points
 
     a = _as_points(a, device)
     b = _as_points(b, device)
     if a.numel() == 0 or b.numel() == 0:
         return float("inf")
-    loss, _ = _p3d_chamfer(a[None], b[None])
-    return float(loss)
+    d_ab = knn_points(a[None], b[None], K=1).dists[0, :, 0].clamp_min(0.0).sqrt()
+    d_ba = knn_points(b[None], a[None], K=1).dists[0, :, 0].clamp_min(0.0).sqrt()
+    return float(0.5 * (d_ab.mean() + d_ba.mean()))
 
 
 def sample_wireframe_points(

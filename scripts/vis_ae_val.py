@@ -5,9 +5,10 @@ For a handful of shapes from the requested ``--split`` it:
 
   1. loads the input surface point cloud (and, for train/val, the GT wireframe)
      via the real dataset code path -- exactly what training validated on;
-  2. runs the encoder (point cloud -> latent z (16x256)) and the WireframeAE
-     decoder (latent -> vertex queries + pairwise edges) and decodes a
-     wireframe with the thresholds stored in the checkpoint;
+  2. runs the encoder (point cloud -> multi-scale z_q) and the edge-set
+     decoder (z_q -> per-edge existence + ordered curve points) and decodes a
+     wireframe by union-find endpoint aggregation with the thresholds stored in
+     the checkpoint;
   3. renders a per-shape comparison row:
      ``input point cloud | predicted wireframe | GT wireframe``
      (the GT column is dropped for the ``test`` split, which has no edges).
@@ -46,13 +47,10 @@ from src.data.dataset import (  # noqa: E402
     PointCloudDataset,
     collate_ae_batch,
 )
+from src.models.edge_set_decoder import EdgeSetDecoder  # noqa: E402
 from src.models.quantizer import MultiScaleResidualVQ  # noqa: E402
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.models.wireframe_graph_decoder import (  # noqa: E402
-    WireframeGraphDecoder,
-    knn_candidate_pairs,
-)
-from src.recon import decode_wireframe  # noqa: E402
+from src.recon import aggregate_wireframe  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -86,7 +84,7 @@ def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
 
 def load_model(ckpt_path: str, device: str
                ) -> tuple[UtoniaEncoder, MultiScaleResidualVQ,
-                          WireframeGraphDecoder, dict[str, Any]]:
+                          EdgeSetDecoder, dict[str, Any]]:
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters", {}) or {}
     encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
@@ -98,7 +96,7 @@ def load_model(ckpt_path: str, device: str
     dec_cfg = dict(hp.get("decoder") or {})
     dec_cfg.setdefault("num_scales", len(encoder.scale_tokens))
     dec_cfg.setdefault("latent_dim", encoder.latent_dim)
-    decoder = WireframeGraphDecoder(**dec_cfg)
+    decoder = EdgeSetDecoder(**dec_cfg)
     state = ck["state_dict"] if "state_dict" in ck else ck
     encoder.load_state_dict(_strip_prefix(state, "encoder."), strict=False)
     quantizer.load_state_dict(_strip_prefix(state, "quantizer."), strict=False)
@@ -116,76 +114,36 @@ def load_model(ckpt_path: str, device: str
 def decode_batch(
     decoder, out, hp,
     *,
-    vertex_thresh: float | None = None,
     edge_thresh: float | None = None,
+    tau_merge: float | None = None,
     max_edges: int = 0,
 ) -> list[dict[str, np.ndarray]]:
-    """Decode a batch of decoder outputs into wireframes (numpy).
+    """Decode a batch of edge-set decoder outputs into wireframes (numpy).
 
-    ``vertex_thresh`` / ``edge_thresh`` override the values baked into the
+    ``edge_thresh`` / ``tau_merge`` override the values baked into the
     checkpoint hyper-parameters when provided. ``max_edges`` caps the number of
-    edges per shape: among the pairs that clear ``edge_thresh`` only the top-k
-    by existence probability are kept (0 = no cap). Mirrors
+    edges per shape: among the edges that clear ``edge_thresh`` only the
+    top-``max_edges`` by existence probability are kept (0 = no cap). Mirrors
     ``export_submission.decode_batch`` so visualizations match the submission.
     """
-    vertex_logit = out["vertex_logit"]
-    vertex_xyz = out["vertex_xyz"]
-    hidden = out["hidden"]
-    global_vec = out["global"]
-    device = vertex_logit.device
-    b = vertex_logit.shape[0]
-    vt = float(vertex_thresh if vertex_thresh is not None
-               else hp.get("vertex_thresh", 0.5))
+    exist_prob = torch.sigmoid(out["edge_exist_logit"])     # (B, Q)
+    edge_points = out["edge_points"]                         # (B, Q, P, 3)
+    b = exist_prob.shape[0]
     et = float(edge_thresh if edge_thresh is not None
                else hp.get("edge_thresh", 0.5))
-    cap = int(hp.get("max_decode_vertices", 512))
+    tau = float(tau_merge if tau_merge is not None
+                else hp.get("tau_merge", 0.015))
     npe = int(hp.get("num_per_edge", 32))
-    knn_k = int(getattr(decoder, "knn_k", 24))
     me = max(0, int(max_edges))
 
     wfs: list[dict[str, np.ndarray]] = []
     for i in range(b):
-        prob = torch.sigmoid(vertex_logit[i])
-        alive = torch.nonzero(prob >= vt, as_tuple=False).reshape(-1)
-        if alive.numel() > cap > 0:
-            alive = alive[torch.topk(prob[alive], cap).indices]
-        if alive.numel() < 2:
-            wfs.append({
-                "vertices": vertex_xyz[i][alive].cpu().numpy()
-                .astype(np.float32).reshape(-1, 3),
-                "edge_index": np.zeros((0, 2), dtype=np.int64),
-                "edge_points": np.zeros((0, npe, 3), dtype=np.float32),
-            })
-            continue
-        verts = vertex_xyz[i][alive]
-        pairs = knn_candidate_pairs(verts.detach(), knn_k)
-        iu, ju = pairs[:, 0], pairs[:, 1]
-        h = hidden[i][alive]
-        ehead = decoder.edge_logits(
-            h[iu], h[ju], global_vec[i][None, :].expand(iu.shape[0], -1))
-
-        # Threshold + top-k edge selection on-device (mirrors the official
-        # baseline): keep edges above ``et`` and, if still too many, the
-        # top-``me`` by probability.
-        edge_prob = torch.sigmoid(ehead["exist"])      # (M,)
-        keep = edge_prob >= et
-        if me > 0 and int(keep.sum().item()) > me:
-            surv = torch.nonzero(keep, as_tuple=False).reshape(-1)
-            top = torch.topk(edge_prob[surv], me, largest=True).indices
-            keep = torch.zeros_like(keep)
-            keep[surv[top]] = True
-        sel = torch.nonzero(keep, as_tuple=False).reshape(-1)
-
-        iu_s, ju_s = iu[sel], ju[sel]
-        fields = {
-            "vertices": verts.cpu().numpy().astype(np.float32),
-            "pair_index": torch.stack([iu_s, ju_s], dim=1).cpu().numpy(),
-            "edge_prob": edge_prob[sel].cpu().numpy(),
-            "edge_type": ehead["type"][sel].argmax(dim=-1).cpu().numpy(),
-            "q1": ehead["params"][sel, 0].cpu().numpy(),
-            "q2": ehead["params"][sel, 1].cpu().numpy(),
-        }
-        wfs.append(decode_wireframe(fields, edge_thresh=et, num_per_edge=npe))
+        wfs.append(aggregate_wireframe(
+            edge_points[i].cpu().numpy(),
+            exist_prob[i].cpu().numpy(),
+            edge_threshold=et, tau_merge=tau, topk_edges=me,
+            num_per_edge=npe,
+        ))
     return wfs
 
 
@@ -524,12 +482,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-edge-points", type=int, default=32)
     p.add_argument("--max-pc-points", type=int, default=0)
     # decode post-processing (override the thresholds baked into the ckpt)
-    p.add_argument("--vertex-thresh", type=float, default=0.5,
-                   help="keep a vertex iff sigmoid(alive) >= this "
-                        "(default: use ckpt value; higher = fewer vertices)")
     p.add_argument("--edge-thresh", type=float, default=0.5,
                    help="keep an edge iff sigmoid(exist) >= this "
                         "(default: use ckpt value)")
+    p.add_argument("--tau-merge", type=float, default=0.015,
+                   help="union-find endpoint merge radius (shared-vertex tol)")
     p.add_argument("--max-edges", type=int, default=1024,
                    help="hard cap on edges per shape: among edges passing "
                         "--edge-thresh, keep the top-k by probability "
@@ -568,11 +525,11 @@ def main() -> None:
     ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
     print(f"Loading checkpoint: {ckpt}")
     encoder, quantizer, decoder, hp = load_model(ckpt, args.device)
-    vt = args.vertex_thresh if args.vertex_thresh is not None \
-        else hp.get("vertex_thresh", 0.5)
     et = args.edge_thresh if args.edge_thresh is not None \
         else hp.get("edge_thresh", 0.5)
-    print(f"decode: vertex_thresh={vt} edge_thresh={et} "
+    tau = args.tau_merge if args.tau_merge is not None \
+        else hp.get("tau_merge", 0.015)
+    print(f"decode: edge_thresh={et} tau_merge={tau} "
           f"max_edges={args.max_edges or 'inf'}")
 
     has_baseline = (args.split == "test" and not args.no_baseline)
@@ -626,8 +583,8 @@ def main() -> None:
             out = decoder(z_q)
             preds = decode_batch(
                 decoder, out, hp,
-                vertex_thresh=args.vertex_thresh,
                 edge_thresh=args.edge_thresh,
+                tau_merge=args.tau_merge,
                 max_edges=args.max_edges)
 
         for j, s in enumerate(samples):

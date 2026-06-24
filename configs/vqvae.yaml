@@ -4,8 +4,9 @@
 #
 # point cloud -> frozen Utonia PTv3 (multi-scale per-stage features)
 # -> per-scale continuous tokens -> per-scale ResidualVQ -> flat indices
-# (<=4096, the submission) -> WireframeGraphDecoder (vertex queries + GNN +
-# kNN pairwise edges) -> wireframe {vertices, edge_index, edge_points}.
+# (<=4096, the submission) -> EdgeSetDecoder (512 edge queries: self-attn edges
+# + cross-attn z_q -> per-edge existence + 32 ordered curve points) -> wireframe
+# {vertices, edge_index, edge_points} (vertices from union-find endpoint merge).
 # For 8x A800 DDP use vqvae_ddp.yaml.
 seed_everything: 3407
 
@@ -35,43 +36,38 @@ model:
       decay: 0.99
       commitment_weight: 0.25
 
-    # ----- graph wireframe decoder (vertex queries + GNN + kNN edges) -----
+    # ----- edge-set decoder (512 edge queries: self-attn + cross-attn z_q) -----
     decoder:
       latent_dim: 256           # = pc_encoder.latent_dim
-      num_queries: 512          # = data.max_vertices (max vertex count)
+      num_edge_queries: 512     # edge-set size (max edges per shape)
+      sample_points_num: 32     # ordered points per edge (= data.num_edge_points)
       d_model: 256
       nhead: 8
-      num_layers: 6             # vertex cross-attention decoder layers
-      gnn_rounds: 3             # graph self-attention relation-reasoning rounds
-      knn_k: 24                 # kNN edge candidates per vertex
+      num_layers: 6             # transformer decoder layers (self + cross attn)
       mlp_ratio: 4.0
       dropout: 0.0
-      edge_hidden: 256
+      points_hidden: 256        # per-edge points MLP hidden width
 
-    # ----- loss weights -----
-    w_vertex: 1.0               # matched vertex xyz L1
-    w_alive: 1.0                # vertex alive BCE
-    w_edge: 1.0                 # edge existence focal loss
-    w_edge_type: 1.0            # edge curve-type CE (class weighted)
-    w_edge_param: 1.0           # edge anchor (q1, q2) L1
-    w_curve_geom: 0.2           # parsed-curve Chamfer on matched edges
+    # ----- loss weights (edge-set criterion) -----
+    w_exist: 1.0                # edge existence focal loss
+    w_points: 5.0               # ordered per-point L1 (matched edges, dir-min)
+    w_endpoint: 5.0             # endpoint (pts[0]/pts[-1]) L1 (shared vertices)
+    w_smooth: 0.5               # 2nd-difference smoothness (small)
+    w_seglen: 0.1               # segment-length-variance (even spacing, small)
     w_commit: 0.25              # VQ commitment loss (ramped in after warmup)
-    alive_pos_weight: 10.0      # up-weight the rare alive positives (V << Q)
     focal_gamma: 2.0            # edge existence focal-loss focusing
     focal_alpha: 0.25           # edge existence focal-loss balance
-    match_alive_weight: 0.2     # Hungarian cost reward for confident-alive queries
-    # CE class weights [line, arc, bezier]; lines dominate, bezier is rarest.
-    curve_type_class_weights: [1.0, 3.0, 9.0]
-    geom_num_per_edge: 32
+    match_w_geo: 1.0            # Hungarian cost: endpoint-L1 weight
+    match_w_exist: 0.5          # Hungarian cost: existence reward
 
     # ----- quantization schedule -----
     quant_warmup_steps: 2000    # continuous-z warmup (codebooks still EMA-update)
     commit_ramp_steps: 2000     # commit weight 0 -> w_commit linear ramp
 
-    # ----- decode (validation / predict) -----
-    vertex_thresh: 0.5          # alive sigmoid threshold
+    # ----- decode (validation / predict): endpoint aggregation -----
     edge_thresh: 0.5            # edge existence sigmoid threshold
-    max_decode_vertices: 512    # cap alive vertices before kNN edge scoring
+    tau_merge: 0.015            # union-find endpoint merge radius (shared vertex)
+    topk_edges: 0               # keep top-k most-confident kept edges (0 = all)
     num_per_edge: 32            # points per reconstructed edge curve
 
     # ----- eval metric: CCD / TA / VPE -> weighted final score -----

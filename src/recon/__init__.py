@@ -1,9 +1,9 @@
-"""Wireframe reconstruction from the WireframeAE decoder fields.
+"""Wireframe reconstruction from the edge-set decoder fields.
 
-Turns the decoder's per-query vertex fields + pairwise edge predictions into an
-explicit wireframe ``{vertices, edge_index, edge_points}``. See
-:mod:`src.recon.wireframe`.
+Turns the decoder's per-edge existence + ordered curve points into an explicit
+wireframe ``{vertices, edge_index, edge_points}`` by union-find endpoint
+aggregation. See :mod:`src.recon.wireframe`.
 """
-from .wireframe import decode_wireframe
+from .wireframe import aggregate_wireframe
 
-__all__ = ["decode_wireframe"]
+__all__ = ["aggregate_wireframe"]
