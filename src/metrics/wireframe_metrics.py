@@ -3,16 +3,16 @@
 Accumulates per-sample CCD / VPE / TA over a validation epoch (DDP-safe via
 summed states) and computes the competition's weighted final score::
 
-    final = w_ccd * ccd_score + w_ta * TA + w_vpe * vpe_score
+    final = w_ccd * (1 - min(CCD, 1)) + w_ta * TA + w_vpe * (1 - min(VPE, 1))
 
-where the geometric errors are mapped to ``(0, 1]`` scores with
-``exp(-d / tau)`` so that the final score is in ``[0, 1]`` and *higher is
+where the geometric errors CCD / VPE are clamped to ``1`` ("兜底") and turned
+into ``[0, 1]`` scores, so the final score is in ``[0, 1]`` and *higher is
 better* (suitable for ``ModelCheckpoint(mode="max")``).
 
 Default weights follow the brief: ``(CCD, TA, VPE) = (0.3, 0.4, 0.3)`` -- TA is
 weighted highest because the competition stresses topological correctness. The
-``tau`` and ``match_thresh`` knobs are exposed so the proxy can be calibrated
-to the (unpublished) official scorer.
+``match_thresh`` knob is exposed so the proxy can be calibrated to the
+(unpublished) official scorer.
 """
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ import torch
 from torchmetrics import Metric
 
 from .functional import (
+    clamped_distance_to_score,
     curve_chamfer_distance,
-    distance_to_score,
     topology_accuracy,
     vertex_position_error,
 )
@@ -39,8 +39,6 @@ class WireframeScore(Metric):
         w_ccd: float = 0.3,
         w_ta: float = 0.4,
         w_vpe: float = 0.3,
-        ccd_tau: float = 0.1,
-        vpe_tau: float = 0.1,
         match_thresh: float = 0.1,
         num_per_edge: int = 32,
         **kwargs,
@@ -49,8 +47,6 @@ class WireframeScore(Metric):
         self.w_ccd = float(w_ccd)
         self.w_ta = float(w_ta)
         self.w_vpe = float(w_vpe)
-        self.ccd_tau = float(ccd_tau)
-        self.vpe_tau = float(vpe_tau)
         self.match_thresh = float(match_thresh)
         self.num_per_edge = int(num_per_edge)
 
@@ -85,8 +81,8 @@ class WireframeScore(Metric):
             self.ccd_sum += ccd if math.isfinite(ccd) else bad
             self.vpe_sum += vpe if math.isfinite(vpe) else bad
             self.ta_sum += float(ta)
-            self.ccd_score_sum += distance_to_score(ccd, self.ccd_tau)
-            self.vpe_score_sum += distance_to_score(vpe, self.vpe_tau)
+            self.ccd_score_sum += clamped_distance_to_score(ccd)
+            self.vpe_score_sum += clamped_distance_to_score(vpe)
             self.count += 1.0
 
     def compute(self) -> dict[str, torch.Tensor]:

@@ -47,16 +47,18 @@ model:
       mlp_ratio: 4.0
       dropout: 0.0
       points_hidden: 256        # per-edge points MLP hidden width
+      chord_residual: true      # endpoints absolute + interior = chord + offset
 
     # ----- loss weights (edge-set criterion) -----
-    w_exist: 1.0                # edge existence focal loss
+    w_exist: 2.0                # edge existence focal loss (up: fix under-conf.)
     w_points: 5.0               # ordered per-point L1 (matched edges, dir-min)
-    w_endpoint: 5.0             # endpoint (pts[0]/pts[-1]) L1 (shared vertices)
+    w_endpoint: 8.0             # endpoint (pts[0]/pts[-1]) L1 (shared vertices)
     w_smooth: 0.5               # 2nd-difference smoothness (small)
     w_seglen: 0.1               # segment-length-variance (even spacing, small)
+    w_consistency: 1.0          # shared-GT-vertex endpoint variance (anti-float)
     w_commit: 0.25              # VQ commitment loss (ramped in after warmup)
     focal_gamma: 2.0            # edge existence focal-loss focusing
-    focal_alpha: 0.25           # edge existence focal-loss balance
+    focal_alpha: 0.5            # edge existence focal-loss balance (up from 0.25)
     match_w_geo: 1.0            # Hungarian cost: endpoint-L1 weight
     match_w_exist: 0.5          # Hungarian cost: existence reward
 
@@ -74,9 +76,14 @@ model:
     eval_w_ccd: 0.3
     eval_w_ta: 0.4
     eval_w_vpe: 0.3
-    eval_ccd_tau: 0.1
-    eval_vpe_tau: 0.1
     eval_match_thresh: 0.1
+
+    # ----- threshold-robust checkpoint selection -----
+    # val/score is recomputed over this grid each epoch; the max is logged as
+    # val/score_best (monitored by ModelCheckpoint). tau grid null -> uses
+    # tau_merge above.
+    val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
+    val_tau_merge_grid: null
 
     # ----- optimization -----
     lr: 3.0e-4
@@ -106,8 +113,8 @@ trainer:
   callbacks:
     - class_path: ModelCheckpoint
       init_args:
-        filename: epoch={epoch:03d}-val_score={val/score:.4f}
-        monitor: val/score
+        filename: epoch={epoch:03d}-val_score={val/score_best:.4f}
+        monitor: val/score_best
         verbose: false
         save_last: true
         save_top_k: 3

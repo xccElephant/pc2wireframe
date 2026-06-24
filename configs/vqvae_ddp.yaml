@@ -41,16 +41,18 @@ model:
       mlp_ratio: 4.0
       dropout: 0.0
       points_hidden: 256
+      chord_residual: true
 
     # ----- loss weights (edge-set criterion) -----
-    w_exist: 1.0
+    w_exist: 2.0
     w_points: 5.0
-    w_endpoint: 5.0
+    w_endpoint: 8.0
     w_smooth: 0.5
     w_seglen: 0.1
+    w_consistency: 1.0
     w_commit: 0.25
     focal_gamma: 2.0
-    focal_alpha: 0.25
+    focal_alpha: 0.5
     match_w_geo: 1.0
     match_w_exist: 0.5
 
@@ -68,9 +70,11 @@ model:
     eval_w_ccd: 0.3
     eval_w_ta: 0.4
     eval_w_vpe: 0.3
-    eval_ccd_tau: 0.1
-    eval_vpe_tau: 0.1
     eval_match_thresh: 0.1
+
+    # ----- threshold-robust checkpoint selection -----
+    val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
+    val_tau_merge_grid: null
 
     # ----- optimization -----
     # LR ~sqrt(8)x the single-GPU 3e-4 (global batch is 8x larger under DDP).
@@ -110,8 +114,8 @@ trainer:
   callbacks:
     - class_path: ModelCheckpoint
       init_args:
-        filename: epoch={epoch:03d}-val_score={val/score:.4f}
-        monitor: val/score
+        filename: epoch={epoch:03d}-val_score={val/score_best:.4f}
+        monitor: val/score_best
         verbose: false
         save_last: true
         save_top_k: 3

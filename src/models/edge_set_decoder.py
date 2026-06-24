@@ -72,12 +72,14 @@ class EdgeSetDecoder(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         points_hidden: int = 256,
+        chord_residual: bool = True,
     ) -> None:
         super().__init__()
         self.num_edge_queries = int(num_edge_queries)
         self.sample_points_num = int(sample_points_num)
         self.d_model = int(d_model)
         self.num_scales = int(num_scales)
+        self.chord_residual = bool(chord_residual)
 
         self.latent_proj = (
             nn.Linear(latent_dim, d_model)
@@ -131,12 +133,40 @@ class EdgeSetDecoder(nn.Module):
         h = self.decoder(tgt=q, memory=mem)              # (B, Q, d_model)
 
         edge_exist_logit = self.exist_head(h).squeeze(-1)            # (B, Q)
-        edge_points = self.points_head(h).reshape(
+        raw = self.points_head(h).reshape(
             b, self.num_edge_queries, self.sample_points_num, 3)     # (B, Q, P, 3)
+
+        if self.chord_residual:
+            # Decouple position from shape: slots 0 / -1 are the *absolute*
+            # endpoints v1 / v2 (directly regressed -> precise, mergeable), the
+            # interior is the straight chord v1->v2 plus a learned offset (so a
+            # straight edge only needs offset≈0; arcs learn a small residual).
+            edge_points = self._chord_residual(raw)
+        else:
+            edge_points = raw
         return {
             "edge_exist_logit": edge_exist_logit,
             "edge_points": edge_points,
         }
+
+    def _chord_residual(self, raw: torch.Tensor) -> torch.Tensor:
+        """``raw (B,Q,P,3)`` -> points = chord(v1,v2) + interior offset.
+
+        ``v1 = raw[...,0,:]``, ``v2 = raw[...,-1,:]`` are the absolute endpoints;
+        interior point ``i`` is ``lerp(v1, v2, t_i) + raw[...,i,:]`` (the offset
+        is masked to 0 at the two ends, so ``pts[0]=v1`` and ``pts[-1]=v2``
+        exactly).
+        """
+        p = self.sample_points_num
+        v1 = raw[..., 0, :]                                  # (B, Q, 3)
+        v2 = raw[..., -1, :]
+        t = torch.linspace(0.0, 1.0, p, device=raw.device, dtype=raw.dtype)
+        chord = (v1[..., None, :] * (1.0 - t)[..., :, None]
+                 + v2[..., None, :] * t[..., :, None])       # (B, Q, P, 3)
+        mask = torch.ones(p, device=raw.device, dtype=raw.dtype)
+        mask[0] = 0.0
+        mask[-1] = 0.0
+        return chord + raw * mask[..., :, None]
 
 
 __all__ = ["EdgeSetDecoder"]

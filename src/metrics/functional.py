@@ -175,6 +175,17 @@ def distance_to_score(distance: float, tau: float) -> float:
     return float(np.exp(-max(0.0, distance) / max(1e-9, tau)))
 
 
+def clamped_distance_to_score(distance: float) -> float:
+    """Map a non-negative error to a ``[0, 1]`` score via ``1 - min(d, 1)``.
+
+    The error is clamped to ``1`` ("兜底"), so a degenerate / non-finite
+    prediction scores ``0`` rather than going negative.
+    """
+    if not np.isfinite(distance):
+        return 0.0
+    return 1.0 - min(1.0, max(0.0, distance))
+
+
 __all__ = [
     "chamfer_distance",
     "sample_wireframe_points",
@@ -182,4 +193,5 @@ __all__ = [
     "vertex_position_error",
     "topology_accuracy",
     "distance_to_score",
+    "clamped_distance_to_score",
 ]

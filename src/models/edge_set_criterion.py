@@ -25,7 +25,10 @@ module matches those queries to the GT edges and supervises them:
         coordinates, so this pulls the endpoints that should coincide onto the
         same point (the basis for the union-find merge / topology accuracy);
       - ``smooth``   small second-difference penalty (anti-jitter);
-      - ``seglen``   small segment-length-variance penalty (even spacing).
+      - ``seglen``   small segment-length-variance penalty (even spacing);
+      - ``consistency`` groups matched endpoints by their GT vertex id and
+        penalises the intra-group variance, so endpoints that should share a
+        vertex coincide (makes the union-find merge work / kills floating edges).
 """
 from __future__ import annotations
 
@@ -75,13 +78,14 @@ class EdgeSetCriterion(nn.Module):
     def __init__(
         self,
         *,
-        w_exist: float = 1.0,
+        w_exist: float = 2.0,
         w_points: float = 5.0,
-        w_endpoint: float = 5.0,
+        w_endpoint: float = 8.0,
         w_smooth: float = 0.5,
         w_seglen: float = 0.1,
+        w_consistency: float = 1.0,
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.5,
         match_w_geo: float = 1.0,
         match_w_exist: float = 0.5,
     ) -> None:
@@ -91,6 +95,7 @@ class EdgeSetCriterion(nn.Module):
         self.w_endpoint = float(w_endpoint)
         self.w_smooth = float(w_smooth)
         self.w_seglen = float(w_seglen)
+        self.w_consistency = float(w_consistency)
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
         self.match_w_geo = float(match_w_geo)
@@ -142,7 +147,8 @@ class EdgeSetCriterion(nn.Module):
         l_endpoint = edge_points.new_zeros(())
         l_smooth = edge_points.new_zeros(())
         l_seglen = edge_points.new_zeros(())
-        n_exist = n_geom = 0
+        l_consistency = edge_points.new_zeros(())
+        n_exist = n_geom = n_cons = 0
         n_matched_total = 0
 
         for i in range(b):
@@ -185,7 +191,8 @@ class EdgeSetCriterion(nn.Module):
             # aligned GT used for every per-point / endpoint term.
             l1_fwd = (pred_m - gt_m).abs().mean(dim=(1, 2))   # (M,)
             l1_rev = (pred_m - gt_rev).abs().mean(dim=(1, 2))
-            use_rev = (l1_rev < l1_fwd)[:, None, None]
+            use_rev_1d = l1_rev < l1_fwd                       # (M,)
+            use_rev = use_rev_1d[:, None, None]
             gt_aligned = torch.where(use_rev, gt_rev, gt_m)   # (M, P, 3)
 
             l_points = l_points + (pred_m - gt_aligned).abs().mean()
@@ -202,6 +209,36 @@ class EdgeSetCriterion(nn.Module):
                 l_seglen = l_seglen + seg.var(dim=-1).mean()
             n_geom += 1
 
+            # ---- vertex consistency: predicted endpoints that map to the SAME
+            # GT vertex should coincide. Group matched endpoints by their GT
+            # vertex id and penalise the intra-group variance (the "share a
+            # vertex -> connected wireframe" pressure that makes union-find work
+            # and kills floating edges).
+            if self.w_consistency > 0.0:
+                gei = g["edge_index"].to(device).long().reshape(-1, 2)
+                if m > 0 and gei.shape[0] > int(col.max().item()):
+                    u = gei[col, 0]                            # (M,) GT vid of ga
+                    v = gei[col, 1]                            # (M,) GT vid of gb
+                    # pts[:,0]=v1 aligns with ga unless reversed; then with gb.
+                    vid0 = torch.where(use_rev_1d, v, u)       # vid of pred ep0
+                    vid1 = torch.where(use_rev_1d, u, v)       # vid of pred ep1
+                    coords = torch.cat([pred_m[:, 0], pred_m[:, -1]], dim=0)
+                    vids = torch.cat([vid0, vid1], dim=0)      # (2M,)
+                    uniq, inv = torch.unique(vids, return_inverse=True)
+                    g_cnt = torch.zeros(
+                        uniq.shape[0], device=device).index_add_(
+                        0, inv, torch.ones_like(inv, dtype=coords.dtype))
+                    g_sum = torch.zeros(
+                        uniq.shape[0], 3, device=device).index_add_(
+                        0, inv, coords)
+                    g_mean = g_sum / g_cnt[:, None].clamp_min(1.0)
+                    dev = coords - g_mean[inv]                 # (2M, 3)
+                    shared = g_cnt[inv] >= 2                   # only multi-edge v
+                    if shared.any():
+                        l_consistency = l_consistency + (
+                            dev[shared] ** 2).sum(dim=-1).mean()
+                        n_cons += 1
+
         if n_exist > 0:
             l_exist = l_exist / n_exist
         if n_geom > 0:
@@ -209,6 +246,8 @@ class EdgeSetCriterion(nn.Module):
             l_endpoint = l_endpoint / n_geom
             l_smooth = l_smooth / n_geom
             l_seglen = l_seglen / n_geom
+        if n_cons > 0:
+            l_consistency = l_consistency / n_cons
 
         total = (
             self.w_exist * l_exist
@@ -216,6 +255,7 @@ class EdgeSetCriterion(nn.Module):
             + self.w_endpoint * l_endpoint
             + self.w_smooth * l_smooth
             + self.w_seglen * l_seglen
+            + self.w_consistency * l_consistency
         )
         avg_matched = float(n_matched_total) / max(1, b)
         return {
@@ -225,6 +265,7 @@ class EdgeSetCriterion(nn.Module):
             "loss_endpoint": l_endpoint.detach(),
             "loss_smooth": l_smooth.detach(),
             "loss_seglen": l_seglen.detach(),
+            "loss_consistency": l_consistency.detach(),
             "matched_edges": edge_exist_logit.new_tensor(avg_matched),
         }
 

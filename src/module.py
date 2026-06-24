@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from torch import nn
 
 from .metrics import WireframeScore
 from .models.edge_set_criterion import EdgeSetCriterion
@@ -155,15 +156,16 @@ class WireframeAEModule(_BaseModule):
         quantizer: dict[str, Any] | None = None,
         decoder: dict[str, Any] | None = None,
         # ----- loss weights (edge-set criterion) -----
-        w_exist: float = 1.0,
+        w_exist: float = 2.0,
         w_points: float = 5.0,
-        w_endpoint: float = 5.0,
+        w_endpoint: float = 8.0,
         w_smooth: float = 0.5,
         w_seglen: float = 0.1,
+        w_consistency: float = 1.0,
         w_commit: float = 0.25,
         # existence focal-loss params.
         focal_gamma: float = 2.0,
-        focal_alpha: float = 0.25,
+        focal_alpha: float = 0.5,
         # Hungarian matching cost = match_w_geo * endpoint_L1 - match_w_exist * p.
         match_w_geo: float = 1.0,
         match_w_exist: float = 0.5,
@@ -179,9 +181,15 @@ class WireframeAEModule(_BaseModule):
         eval_w_ccd: float = 0.3,
         eval_w_ta: float = 0.4,
         eval_w_vpe: float = 0.3,
-        eval_ccd_tau: float = 0.1,
-        eval_vpe_tau: float = 0.1,
         eval_match_thresh: float = 0.1,
+        # ----- threshold-robust checkpoint selection -----
+        # At validation, score is recomputed over this grid of decode params and
+        # the MAX is logged as ``val/score_best`` (what ModelCheckpoint should
+        # monitor), so checkpoint selection does not hinge on a single,
+        # possibly-miscalibrated ``edge_thresh``. ``None`` -> just the baked-in
+        # (edge_thresh, tau_merge).
+        val_edge_thresh_grid: list[float] | None = None,
+        val_tau_merge_grid: list[float] | None = None,
         # ----- optimization -----
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
@@ -207,16 +215,36 @@ class WireframeAEModule(_BaseModule):
 
         self.criterion = EdgeSetCriterion(
             w_exist=w_exist, w_points=w_points, w_endpoint=w_endpoint,
-            w_smooth=w_smooth, w_seglen=w_seglen,
+            w_smooth=w_smooth, w_seglen=w_seglen, w_consistency=w_consistency,
             focal_gamma=focal_gamma, focal_alpha=focal_alpha,
             match_w_geo=match_w_geo, match_w_exist=match_w_exist,
         )
 
-        self.val_metrics = WireframeScore(
-            w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
-            ccd_tau=eval_ccd_tau, vpe_tau=eval_vpe_tau,
-            match_thresh=eval_match_thresh, num_per_edge=num_per_edge,
-        )
+        # Threshold-robust validation: one WireframeScore per (edge_thresh,
+        # tau_merge) grid point. The baked-in pair is always included (primary).
+        et_grid = list(val_edge_thresh_grid) if val_edge_thresh_grid \
+            else [edge_thresh]
+        tau_grid = list(val_tau_merge_grid) if val_tau_merge_grid \
+            else [tau_merge]
+        grid = [(float(et), float(t)) for et in et_grid for t in tau_grid]
+        if (float(edge_thresh), float(tau_merge)) not in grid:
+            grid.append((float(edge_thresh), float(tau_merge)))
+        self._val_grid = grid
+        self._val_primary_key = self._grid_key(edge_thresh, tau_merge)
+        self.val_metrics = nn.ModuleDict({
+            self._grid_key(et, t): WireframeScore(
+                w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
+                match_thresh=eval_match_thresh, num_per_edge=num_per_edge,
+            )
+            for et, t in grid
+        })
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _grid_key(edge_thresh: float, tau_merge: float) -> str:
+        """Stable ModuleDict key for a (edge_thresh, tau_merge) grid point."""
+        return (f"et{int(round(float(edge_thresh) * 1000)):04d}"
+                f"_tau{int(round(float(tau_merge) * 10000)):05d}")
 
     # ------------------------------------------------------------------
     def _commit_weight(self) -> float:
@@ -278,28 +306,43 @@ class WireframeAEModule(_BaseModule):
         return loss
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _aggregate(
+        exist_prob_np: np.ndarray,        # (B, Q)
+        edge_points_np: np.ndarray,       # (B, Q, P, 3)
+        *,
+        edge_threshold: float,
+        tau_merge: float,
+        topk_edges: int,
+        num_per_edge: int,
+    ) -> list[dict[str, np.ndarray]]:
+        """Endpoint-aggregate a batch of edge sets at the given decode params."""
+        return [
+            aggregate_wireframe(
+                edge_points_np[i], exist_prob_np[i],
+                edge_threshold=edge_threshold, tau_merge=tau_merge,
+                topk_edges=topk_edges, num_per_edge=num_per_edge,
+            )
+            for i in range(exist_prob_np.shape[0])
+        ]
+
     @torch.no_grad()
     def decode_to_wireframes(
         self, out: dict[str, torch.Tensor]
     ) -> list[dict[str, np.ndarray]]:
-        """Endpoint-aggregate each shape's edge set into a wireframe (numpy)."""
-        exist_prob = torch.sigmoid(out["edge_exist_logit"])   # (B, Q)
-        edge_points = out["edge_points"]                       # (B, Q, P, 3)
-        b = exist_prob.shape[0]
-        et = float(self.hparams.edge_thresh)
-        tau = float(self.hparams.tau_merge)
-        topk = int(self.hparams.topk_edges)
-        npe = int(self.hparams.num_per_edge)
+        """Endpoint-aggregate each shape's edge set into a wireframe (numpy).
 
-        wfs: list[dict[str, np.ndarray]] = []
-        for i in range(b):
-            wfs.append(aggregate_wireframe(
-                edge_points[i].detach().cpu().numpy(),
-                exist_prob[i].detach().cpu().numpy(),
-                edge_threshold=et, tau_merge=tau, topk_edges=topk,
-                num_per_edge=npe,
-            ))
-        return wfs
+        Uses the baked-in decode params (``edge_thresh`` / ``tau_merge`` /
+        ``topk_edges``); used by ``predict_step`` / export.
+        """
+        return self._aggregate(
+            torch.sigmoid(out["edge_exist_logit"]).detach().cpu().numpy(),
+            out["edge_points"].detach().cpu().numpy(),
+            edge_threshold=float(self.hparams.edge_thresh),
+            tau_merge=float(self.hparams.tau_merge),
+            topk_edges=int(self.hparams.topk_edges),
+            num_per_edge=int(self.hparams.num_per_edge),
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -354,22 +397,64 @@ class WireframeAEModule(_BaseModule):
         )
         self.log_dict(self._perplexity_logs(out), batch_size=bs,
                       on_step=False, on_epoch=True, sync_dist=True)
-        preds = self.decode_to_wireframes(out)
+
+        # Decode once to numpy, then score the whole (edge_thresh, tau_merge)
+        # grid so checkpoint selection is robust to a single threshold choice.
+        exist_np = torch.sigmoid(out["edge_exist_logit"]).detach().cpu().numpy()
+        pts_np = out["edge_points"].detach().cpu().numpy()
+        topk = int(self.hparams.topk_edges)
+        npe = int(self.hparams.num_per_edge)
         gts = self._gt_to_numpy(batch["gt_wireframes"])
-        self.log_dict(
-            self._recon_stats(preds, gts), batch_size=bs,
-            on_step=False, on_epoch=True, sync_dist=True,
-        )
-        self.val_metrics.update(preds, gts)
+
+        for et, tau in self._val_grid:
+            preds = self._aggregate(
+                exist_np, pts_np, edge_threshold=et, tau_merge=tau,
+                topk_edges=topk, num_per_edge=npe,
+            )
+            key = self._grid_key(et, tau)
+            self.val_metrics[key].update(preds, gts)
+            if key == self._val_primary_key:
+                self.log_dict(
+                    self._recon_stats(preds, gts), batch_size=bs,
+                    on_step=False, on_epoch=True, sync_dist=True,
+                )
 
     def on_validation_epoch_end(self) -> None:
-        res = self.val_metrics.compute()
+        best_score = float("-inf")
+        best_res: dict[str, torch.Tensor] | None = None
+        best_et, best_tau = None, None
+        primary_res: dict[str, torch.Tensor] | None = None
+
+        for et, tau in self._val_grid:
+            key = self._grid_key(et, tau)
+            res = self.val_metrics[key].compute()
+            if key == self._val_primary_key:
+                primary_res = res
+            # Per-grid-point score for diagnostics.
+            self.log(f"val/grid/score@{key}", res["score"], sync_dist=False)
+            score = float(res["score"])
+            if score > best_score:
+                best_score, best_res = score, res
+                best_et, best_tau = et, tau
+            self.val_metrics[key].reset()
+
+        if best_res is None:  # no validation batches
+            return
+
+        # Primary (baked-in) score kept for continuity / comparison.
+        if primary_res is not None:
+            self.log("val/score", primary_res["score"], prog_bar=True,
+                     sync_dist=False)
+
+        # Threshold-robust monitor for ModelCheckpoint, plus the components and
+        # the winning decode params at the best grid point.
+        self.log("val/score_best", best_score, prog_bar=True, sync_dist=False)
         self.log_dict(
-            {f"val/{k}": v for k, v in res.items() if k != "score"},
+            {f"val/{k}": v for k, v in best_res.items() if k != "score"},
             prog_bar=False, sync_dist=False,
         )
-        self.log("val/score", res["score"], prog_bar=True, sync_dist=False)
-        self.val_metrics.reset()
+        self.log("val/best_edge_thresh", float(best_et), sync_dist=False)
+        self.log("val/best_tau_merge", float(best_tau), sync_dist=False)
 
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """Per-shape flat indices (submission) + decoded wireframe.

@@ -211,20 +211,21 @@ def _topology_accuracy(pred, gt, match_thresh: float) -> float:
     return 2.0 * precision * recall / (precision + recall)
 
 
-def _dist_to_score(d: float, tau: float) -> float:
+def _dist_to_score(d: float) -> float:
+    """Clamped mapping ``1 - min(d, 1)`` (matches src.metrics.WireframeScore)."""
     if not np.isfinite(d):
         return 0.0
-    return float(np.exp(-max(0.0, d) / max(1e-9, tau)))
+    return 1.0 - min(1.0, max(0.0, d))
 
 
-def score_reconstruction(pred, gt, *, num_per_edge, ccd_tau, vpe_tau,
+def score_reconstruction(pred, gt, *, num_per_edge,
                          match_thresh, w_ccd, w_ta, w_vpe) -> dict[str, float]:
     ccd = _chamfer(
         _flatten_curves(pred, num_per_edge), _flatten_curves(gt, num_per_edge))
     vpe = _chamfer(pred.get("vertices"), gt.get("vertices"))
     ta = _topology_accuracy(pred, gt, match_thresh)
-    ccd_s = _dist_to_score(ccd, ccd_tau)
-    vpe_s = _dist_to_score(vpe, vpe_tau)
+    ccd_s = _dist_to_score(ccd)
+    vpe_s = _dist_to_score(vpe)
     score = w_ccd * ccd_s + w_ta * ta + w_vpe * vpe_s
     return {"ccd": ccd, "vpe": vpe, "ta": ta,
             "ccd_score": ccd_s, "vpe_score": vpe_s, "score": score}
@@ -454,6 +455,107 @@ def _visualize(rows, out_path, args, has_gt, has_baseline) -> None:
 
 
 # ----------------------------------------------------------------------
+# Conditioning diagnostics (z vs z_q decode, exist dist, index agreement)
+# ----------------------------------------------------------------------
+def _prob_stats(p: np.ndarray) -> dict[str, float]:
+    """max / mean / p50 / p90 / p99 of a 1-D probability array."""
+    p = np.asarray(p, dtype=np.float64).reshape(-1)
+    if p.size == 0:
+        return {k: float("nan") for k in ("max", "mean", "p50", "p90", "p99")}
+    q = np.quantile(p, [0.5, 0.9, 0.99])
+    return {"max": float(p.max()), "mean": float(p.mean()),
+            "p50": float(q[0]), "p90": float(q[1]), "p99": float(q[2])}
+
+
+def _index_agreement(idx_rows: list[np.ndarray]) -> tuple[float, int, int]:
+    """Cross-sample flat-index similarity (codebook-collapse probe).
+
+    Returns ``(mean_pairwise_agreement, n_unique_rows, n)`` where the agreement
+    is the average over distinct sample pairs of the fraction of *identical*
+    index positions. ~1.0 => every shape maps to (nearly) the same indices
+    (z_q carries no shape information -> the decoder cannot condition on it).
+    """
+    n = len(idx_rows)
+    if n < 2:
+        return float("nan"), n, n
+    arr = np.stack([np.asarray(r).reshape(-1) for r in idx_rows], axis=0)
+    eq_sum, cnt = 0.0, 0
+    for a in range(n):
+        for b in range(a + 1, n):
+            eq_sum += float(np.mean(arr[a] == arr[b]))
+            cnt += 1
+    n_unique = int(np.unique(arr, axis=0).shape[0])
+    return eq_sum / max(1, cnt), n_unique, n
+
+
+def print_diagnostics(
+    names: list[str],
+    idx_rows: list[np.ndarray],
+    zq_probs: list[np.ndarray],
+    z_probs: list[np.ndarray],
+    et: float,
+) -> None:
+    """Print the z-vs-z_q conditioning diagnostics for the processed shapes."""
+    n = len(names)
+    if n == 0:
+        return
+    print("\n" + "=" * 78)
+    print("CONDITIONING DIAGNOSTICS (is the decoder using z_q?)")
+    print("=" * 78)
+
+    # Per-shape: exist max + #(>=et) for z_q vs continuous z.
+    print(f"{'shape':<42} | {'zq_max':>6} {'zq>=et':>6} | "
+          f"{'z_max':>6} {'z>=et':>6}")
+    print("-" * 78)
+    for i in range(n):
+        sq = _prob_stats(zq_probs[i])
+        sz = _prob_stats(z_probs[i])
+        kq = int((np.asarray(zq_probs[i]) >= et).sum())
+        kz = int((np.asarray(z_probs[i]) >= et).sum())
+        print(f"{names[i][:42]:<42} | {sq['max']:>6.3f} {kq:>6d} | "
+              f"{sz['max']:>6.3f} {kz:>6d}")
+    print("-" * 78)
+
+    # Aggregate exist distribution.
+    def _agg(arrs: list[np.ndarray]) -> dict[str, float]:
+        return _prob_stats(np.concatenate([np.asarray(a).reshape(-1)
+                                           for a in arrs])) if arrs else {}
+    aq = _agg(zq_probs)
+    az = _agg(z_probs)
+    mean_keep_q = float(np.mean([(np.asarray(p) >= et).sum() for p in zq_probs]))
+    mean_keep_z = float(np.mean([(np.asarray(p) >= et).sum() for p in z_probs]))
+    print(f"exist prob (z_q)  max={aq['max']:.3f} mean={aq['mean']:.3f} "
+          f"p50={aq['p50']:.3f} p90={aq['p90']:.3f} p99={aq['p99']:.3f}  "
+          f"| mean #edges>=et({et:g})={mean_keep_q:.1f}")
+    print(f"exist prob (z)    max={az['max']:.3f} mean={az['mean']:.3f} "
+          f"p50={az['p50']:.3f} p90={az['p90']:.3f} p99={az['p99']:.3f}  "
+          f"| mean #edges>=et({et:g})={mean_keep_z:.1f}")
+
+    # Cross-sample index agreement (codebook collapse probe).
+    agree, n_uniq, n_idx = _index_agreement(idx_rows)
+    k = int(np.asarray(idx_rows[0]).reshape(-1).shape[0]) if idx_rows else 0
+    print(f"flat indices: K={k}  unique rows={n_uniq}/{n_idx}  "
+          f"mean pairwise agreement={agree:.3f}")
+
+    # Interpretation hints.
+    print("-" * 78)
+    if aq.get("max", 0.0) < et:
+        print(f"[hint] z_q exist max < edge_thresh ({et:g}) -> all edges "
+              f"thresholded out. Under-confident exist head (early training) "
+              f"or threshold too high; try lowering --edge-thresh / --max-edges.")
+    if np.isfinite(agree) and agree > 0.9:
+        print("[hint] indices nearly identical across shapes -> codebook "
+              "collapse / non-discriminative z_q (decoder cannot condition).")
+    if (np.isfinite(aq.get("mean", np.nan))
+            and np.isfinite(az.get("mean", np.nan))
+            and abs(aq["mean"] - az["mean"]) > 0.1):
+        print("[hint] z and z_q exist distributions differ a lot -> the "
+              "decoder behaves very differently on z_q than the continuous z "
+              "it was trained on (z->z_q warmup mismatch; eval after warmup).")
+    print("=" * 78 + "\n")
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
@@ -482,17 +584,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-edge-points", type=int, default=32)
     p.add_argument("--max-pc-points", type=int, default=0)
     # decode post-processing (override the thresholds baked into the ckpt)
-    p.add_argument("--edge-thresh", type=float, default=0.5,
+    p.add_argument("--edge-thresh", type=float, default=0.0,
                    help="keep an edge iff sigmoid(exist) >= this "
                         "(default: use ckpt value)")
     p.add_argument("--tau-merge", type=float, default=0.015,
                    help="union-find endpoint merge radius (shared-vertex tol)")
-    p.add_argument("--max-edges", type=int, default=1024,
+    p.add_argument("--max-edges", type=int, default=128,
                    help="hard cap on edges per shape: among edges passing "
                         "--edge-thresh, keep the top-k by probability "
                         "(0 = no cap). Mirrors the official top-k strategy.")
-    p.add_argument("--ccd-tau", type=float, default=0.1)
-    p.add_argument("--vpe-tau", type=float, default=0.1)
     p.add_argument("--match-thresh", type=float, default=0.1)
     p.add_argument("--w-ccd", type=float, default=0.3)
     p.add_argument("--w-ta", type=float, default=0.4)
@@ -513,6 +613,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dpi", type=int, default=150)
     p.add_argument("--out", default=None)
     p.add_argument("--no-viz", action="store_true")
+    p.add_argument("--no-diag", action="store_true",
+                   help="skip the conditioning diagnostics (z vs z_q decode, "
+                        "exist probability distribution, cross-sample index "
+                        "agreement)")
     return p.parse_args()
 
 
@@ -568,6 +672,12 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     agg: dict[str, list[float]] = {k: [] for k in ("ta", "ccd", "vpe", "score")}
 
+    diag = not args.no_diag
+    diag_names: list[str] = []
+    diag_idx: list[np.ndarray] = []
+    diag_zq: list[np.ndarray] = []   # per-sample exist prob from z_q
+    diag_z: list[np.ndarray] = []    # per-sample exist prob from continuous z
+
     bs = max(1, args.batch_size)
     for start in range(0, len(indices), bs):
         chunk = indices[start:start + bs]
@@ -578,14 +688,28 @@ def main() -> None:
 
         with torch.no_grad():
             z_list = encoder(pc, offset)
-            indices = quantizer(z_list)["indices"]
-            z_q = quantizer.decode_indices(indices)
+            flat_idx = quantizer(z_list)["indices"]
+            z_q = quantizer.decode_indices(flat_idx)
             out = decoder(z_q)
             preds = decode_batch(
                 decoder, out, hp,
                 edge_thresh=args.edge_thresh,
                 tau_merge=args.tau_merge,
                 max_edges=args.max_edges)
+
+            if diag:
+                # Decode the SAME shapes from the continuous z (bypassing the
+                # quantizer) to isolate a z->z_q mismatch from plain under-
+                # training, and collect exist probs + flat indices per sample.
+                out_z = decoder(z_list)
+                pzq = torch.sigmoid(out["edge_exist_logit"]).cpu().numpy()
+                pz = torch.sigmoid(out_z["edge_exist_logit"]).cpu().numpy()
+                idx_np = flat_idx.cpu().numpy()
+                for j in range(len(samples)):
+                    diag_names.append(str(samples[j]["shape_id"]))
+                    diag_idx.append(idx_np[j])
+                    diag_zq.append(pzq[j])
+                    diag_z.append(pz[j])
 
         for j, s in enumerate(samples):
             name = str(s["shape_id"])
@@ -604,7 +728,6 @@ def main() -> None:
                 }
                 m = score_reconstruction(
                     pred, gt, num_per_edge=args.num_edge_points,
-                    ccd_tau=args.ccd_tau, vpe_tau=args.vpe_tau,
                     match_thresh=args.match_thresh,
                     w_ccd=args.w_ccd, w_ta=args.w_ta, w_vpe=args.w_vpe)
                 row["gt"] = gt
@@ -628,6 +751,9 @@ def main() -> None:
         print(f"mean±std over {len(rows)} shapes:  TA={_ms(agg['ta'])}  "
               f"CCD={_ms(agg['ccd'])}  VPE={_ms(agg['vpe'])}  "
               f"score={_ms(agg['score'])}")
+
+    if diag:
+        print_diagnostics(diag_names, diag_idx, diag_zq, diag_z, float(et))
 
     if not args.no_viz:
         _visualize(rows, out_path, args, has_gt, has_baseline)
