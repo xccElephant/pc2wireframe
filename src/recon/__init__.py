@@ -1,9 +1,12 @@
-"""Wireframe reconstruction from the edge-set decoder fields.
+"""Wireframe reconstruction from the joint decoder fields.
 
-Turns the decoder's per-edge existence + ordered curve points into an explicit
-wireframe ``{vertices, edge_index, edge_points}`` by union-find endpoint
-aggregation. See :mod:`src.recon.wireframe`.
+:func:`assemble_wireframe` turns the joint vertex+edge decoder's predictions into
+the GT schema ``{vertices, edge_index, edge_points}`` consumed by
+:mod:`src.metrics` and the submission export: it thresholds the predicted
+vertices/edges, picks each edge's endpoints from the edge->vertex association
+matrix (top-2 per edge) and denormalises the decoded canonical curves onto them
+(see :mod:`src.recon.joint_wireframe`).
 """
-from .wireframe import aggregate_wireframe
+from .joint_wireframe import assemble_wireframe
 
-__all__ = ["aggregate_wireframe"]
+__all__ = ["assemble_wireframe"]

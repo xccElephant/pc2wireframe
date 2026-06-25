@@ -25,8 +25,18 @@ data:
     # with more than 512 vertices is skipped (must match decoder.num_queries).
     # The dataset is already unit-normalized ([-1, 1]); no extra normalization.
     max_vertices: 512
-    max_edges: 0
+    # max_edges doubles as the decoder edge-query budget cap: a wireframe with
+    # more than 512 edges (after loop splitting) is skipped (must match
+    # decoder.num_edge_queries).
+    max_edges: 512
     num_edge_points: 32
+    # Closed-loop edges (a circle = single junction vertex, start ~= end) cannot
+    # be anchored by two endpoints, so split them into two open arcs at the far
+    # point: an edge is treated as a loop when |end - start| < loop_close_tol AND
+    # its polyline arc length > loop_min_arc (a real loop, not a tiny stub).
+    split_loops: true
+    loop_close_tol: 0.01
+    loop_min_arc: 0.05
     # Input point cloud kept at NATIVE size and packed for PTv3 (coord+offset);
     # 0 = keep all points. Set positive only as a memory safety cap.
     max_pc_points: 0

@@ -29,6 +29,7 @@ plotly
 opencv-python
 trimesh
 einops
+torchtyping     # TensorType annotations in the per-curve VAE (joint branch)
 
 # --------- misc --------- #
 tqdm

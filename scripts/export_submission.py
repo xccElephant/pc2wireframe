@@ -22,7 +22,7 @@ Pipeline per shape::
         --[UtoniaEncoder -> multi-scale z_s]-->
         --[MultiScaleResidualVQ -> flat indices (K,)]-->     # the submission
     flat indices
-        --[decode_indices -> z_q -> EdgeSetDecoder -> aggregate_wireframe]-->
+        --[decode_indices -> z_q -> JointSetDecoder -> assemble_wireframe]-->
     wireframe {vertices, edge_index, edge_points}
 
 The wireframe is reconstructed from the **submitted indices** alone
@@ -77,10 +77,12 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.data.dataset import PointCloudDataset, collate_ae_batch  # noqa: E402
-from src.models.edge_set_decoder import EdgeSetDecoder  # noqa: E402
+from src.models.joint_set_decoder import JointSetDecoder  # noqa: E402
 from src.models.quantizer import MultiScaleResidualVQ  # noqa: E402
 from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.recon import aggregate_wireframe  # noqa: E402
+from src.models.vae import AutoencoderKL1D  # noqa: E402
+from src.models.vae.curve_packing import decode_curve_latent  # noqa: E402
+from src.recon import assemble_wireframe  # noqa: E402
 
 NUM_EDGE_POINTS = 32
 LATENT_BUDGET = 4096
@@ -118,10 +120,11 @@ def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
 
 def load_model(ckpt_path: str, device: str
                ) -> tuple[UtoniaEncoder, MultiScaleResidualVQ,
-                          EdgeSetDecoder, dict[str, Any]]:
-    """Build the multi-scale encoder + RVQ + edge-set decoder from a checkpoint."""
+                          JointSetDecoder, AutoencoderKL1D, dict[str, Any]]:
+    """Build the encoder + RVQ + joint decoder + curve VAE from a checkpoint."""
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters", {}) or {}
+    state = ck["state_dict"] if "state_dict" in ck else ck
 
     encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
     quantizer = MultiScaleResidualVQ(
@@ -129,18 +132,22 @@ def load_model(ckpt_path: str, device: str
         dim=encoder.latent_dim,
         **(hp.get("quantizer") or {}),
     )
+    curve_vae = AutoencoderKL1D(**(hp.get("curve_vae") or {}))
     dec_cfg = dict(hp.get("decoder") or {})
     dec_cfg.setdefault("num_scales", len(encoder.scale_tokens))
     dec_cfg.setdefault("latent_dim", encoder.latent_dim)
-    decoder = EdgeSetDecoder(**dec_cfg)
+    dec_cfg["curve_latent_dim"] = int(
+        curve_vae.config.latent_channels * curve_vae.latent_len)
+    decoder = JointSetDecoder(**dec_cfg)
 
-    state = ck["state_dict"] if "state_dict" in ck else ck
     miss_e, unexp_e = encoder.load_state_dict(
         _strip_prefix(state, "encoder."), strict=False)
     miss_q, unexp_q = quantizer.load_state_dict(
         _strip_prefix(state, "quantizer."), strict=False)
     miss_d, unexp_d = decoder.load_state_dict(
         _strip_prefix(state, "decoder."), strict=False)
+    miss_c, unexp_c = curve_vae.load_state_dict(
+        _strip_prefix(state, "curve_vae."), strict=False)
 
     comp_missing = [k for k in miss_e if not k.startswith("backbone.")]
     if comp_missing:
@@ -155,11 +162,18 @@ def load_model(ckpt_path: str, device: str
         print(f"[warn] missing decoder keys: {miss_d}")
     if unexp_d:
         print(f"[warn] unexpected decoder keys: {unexp_d}")
+    if miss_c:
+        print(f"[warn] missing curve_vae keys: {miss_c[:8]}"
+              f"{' ...' if len(miss_c) > 8 else ''}")
+    if unexp_c:
+        print(f"[warn] unexpected curve_vae keys: {unexp_c[:8]}"
+              f"{' ...' if len(unexp_c) > 8 else ''}")
 
     encoder.eval().to(device)
     quantizer.eval().to(device)
     decoder.eval().to(device)
-    return encoder, quantizer, decoder, hp
+    curve_vae.eval().to(device)
+    return encoder, quantizer, decoder, curve_vae, hp
 
 
 # ----------------------------------------------------------------------
@@ -167,48 +181,45 @@ def load_model(ckpt_path: str, device: str
 # ----------------------------------------------------------------------
 @torch.no_grad()
 def decode_batch(
-    decoder: EdgeSetDecoder,
     out: dict[str, torch.Tensor],
+    curve_vae: AutoencoderKL1D,
     hp: dict[str, Any],
     *,
-    edge_thresh: float | None = None,
-    tau_merge: float | None = None,
-    max_edges: int = 0,
+    vthr: float | None = None,
+    ethr: float | None = None,
     min_edges: int | None = None,
 ) -> list[dict[str, np.ndarray]]:
-    """Decode a batch of edge-set decoder outputs into wireframes (numpy).
+    """Assemble joint vertex+edge decoder outputs into wireframes (numpy).
 
-    ``edge_thresh`` / ``tau_merge`` override the values baked into the
-    checkpoint hyper-parameters when provided. ``max_edges`` caps the number of
-    edges per shape: among the edges that clear ``edge_thresh`` only the
-    top-``max_edges`` by existence probability are kept (0 = no cap). This
-    mirrors the official baseline's ``topk`` strategy and prevents an
-    under-trained model from emitting many false edges. ``min_edges`` is the
-    floor: if too few edges clear ``edge_thresh`` it falls back to the
-    top-``min_edges`` queries so a miscalibrated threshold never writes an empty
-    (zero-scoring) wireframe.
+    ``vthr`` / ``ethr`` (vertex / edge existence thresholds) override the values
+    baked into the checkpoint when provided. Each edge's endpoints are the top-2
+    vertices under the association matrix; the decoded canonical curve is then
+    denormalised onto them. ``min_edges`` is the floor so the wireframe is never
+    empty.
     """
-    exist_prob = torch.sigmoid(out["edge_exist_logit"])     # (B, Q)
-    edge_points = out["edge_points"]                         # (B, Q, P, 3)
-    b = exist_prob.shape[0]
-    et = float(edge_thresh if edge_thresh is not None
-               else hp.get("edge_thresh", 0.5))
-    tau = float(tau_merge if tau_merge is not None
-                else hp.get("tau_merge", 0.015))
     npe = int(hp.get("num_per_edge", NUM_EDGE_POINTS))
-    me = max(0, int(max_edges))
-    mn = int(min_edges if min_edges is not None
-             else hp.get("min_edges", 1))
+    vt = float(vthr if vthr is not None else hp.get("vthr", 0.5))
+    et = float(ethr if ethr is not None else hp.get("ethr", 0.5))
+    mn = int(min_edges if min_edges is not None else hp.get("min_edges", 1))
+    mv = int(hp.get("min_vertices", 2))
 
-    wfs: list[dict[str, np.ndarray]] = []
-    for i in range(b):
-        wfs.append(aggregate_wireframe(
-            edge_points[i].cpu().numpy(),
-            exist_prob[i].cpu().numpy(),
-            edge_threshold=et, tau_merge=tau, topk_edges=me,
-            min_edges=mn, num_per_edge=npe,
-        ))
-    return wfs
+    vprob = torch.sigmoid(out["vertex_exist_logit"]).cpu().numpy()
+    vcoord = out["vertex_coord"].cpu().numpy()
+    eprob = torch.sigmoid(out["edge_exist_logit"]).cpu().numpy()
+    assoc = torch.sigmoid(out["assoc_logit"]).cpu().numpy()
+    b, ne, _ = out["curve_latent"].shape
+    flat = out["curve_latent"].reshape(b * ne, -1)
+    curves = decode_curve_latent(
+        curve_vae, flat, num_points=npe, pin_endpoints=True)
+    curves = curves.reshape(b, ne, npe, 3).cpu().numpy()
+    return [
+        assemble_wireframe(
+            vprob[i], vcoord[i], eprob[i], assoc[i], curves[i],
+            vthr=vt, ethr=et, num_per_edge=npe,
+            min_vertices=mv, min_edges=mn,
+        )
+        for i in range(b)
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -302,18 +313,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-pc-points", type=int, default=0,
                    help="cap input cloud size (0 = native); memory knob only")
     # decode post-processing (override the thresholds baked into the ckpt)
-    p.add_argument("--edge-thresh", type=float, default=0.0,
-                   help="keep an edge iff sigmoid(exist) >= this")
-    p.add_argument("--tau-merge", type=float, default=0.015,
-                   help="union-find endpoint merge radius (shared-vertex tol)")
-    p.add_argument("--max-edges", type=int, default=128,
-                   help="hard cap on edges per shape: among edges passing "
-                        "--edge-thresh, keep the top-k by probability "
-                        "(0 = no cap). Mirrors the official top-k strategy.")
+    p.add_argument("--vthr", type=float, default=None,
+                   help="keep a vertex iff sigmoid(exist) >= this "
+                        "(default: the value baked into the checkpoint)")
+    p.add_argument("--ethr", type=float, default=None,
+                   help="keep an edge iff sigmoid(exist) >= this "
+                        "(default: the value baked into the checkpoint)")
     p.add_argument("--min-edges", type=int, default=1,
-                   help="floor on edges per shape: if fewer pass --edge-thresh, "
-                        "fall back to the top-k by probability so the wireframe "
-                        "is never empty (0 = allow empty).")
+                   help="floor on edges per shape: if fewer pass --ethr, fall "
+                        "back to the top-k by probability so the wireframe is "
+                        "never empty (0 = allow empty).")
     p.add_argument("--limit", type=int, default=0,
                    help="only export the first N shapes (0 = all; debugging)")
     p.add_argument("--no-progress", action="store_true")
@@ -347,11 +356,9 @@ def run_worker(args: argparse.Namespace) -> None:
 
     ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
     print(f"[rank {rank}] ckpt: {ckpt}")
-    print(f"[rank {rank}] decode: edge_thresh={args.edge_thresh} "
-          f"tau_merge={args.tau_merge} "
-          f"max_edges={args.max_edges or 'inf'} "
+    print(f"[rank {rank}] decode: vthr={args.vthr} ethr={args.ethr} "
           f"min_edges={args.min_edges}")
-    encoder, quantizer, decoder, hp = load_model(ckpt, args.device)
+    encoder, quantizer, decoder, curve_vae, hp = load_model(ckpt, args.device)
 
     k_latent = int(quantizer.total_indices)
 
@@ -458,11 +465,8 @@ def run_worker(args: argparse.Namespace) -> None:
             z_q = quantizer.decode_indices(indices)
             out = decoder(z_q)
             preds = decode_batch(
-                decoder, out, hp,
-                edge_thresh=args.edge_thresh,
-                tau_merge=args.tau_merge,
-                max_edges=args.max_edges,
-                min_edges=args.min_edges)
+                out, curve_vae, hp,
+                vthr=args.vthr, ethr=args.ethr, min_edges=args.min_edges)
 
         for j, s in enumerate(samples):
             stem = str(s["shape_id"])
@@ -615,11 +619,12 @@ def orchestrate(args: argparse.Namespace) -> None:
         "--out-dir", args.out_dir,
         "--batch-size", str(args.batch_size),
         "--max-pc-points", str(args.max_pc_points),
-        "--edge-thresh", str(args.edge_thresh),
-        "--tau-merge", str(args.tau_merge),
-        "--max-edges", str(args.max_edges),
         "--min-edges", str(args.min_edges),
     ]
+    if args.vthr is not None:
+        base += ["--vthr", str(args.vthr)]
+    if args.ethr is not None:
+        base += ["--ethr", str(args.ethr)]
     if args.limit and args.limit > 0:
         base += ["--limit", str(args.limit)]
     if args.resume:

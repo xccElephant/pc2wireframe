@@ -85,6 +85,50 @@ def _resample_polyline(points: np.ndarray, num_points: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _clean_polyline(points: np.ndarray) -> np.ndarray:
+    """Drop NaN/Inf + clip a raw ``(K, 3)`` polyline (no resampling)."""
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+    p = p[np.isfinite(p).all(axis=1)]
+    if p.shape[0]:
+        p = np.clip(p, -_PC_COORD_CLIP, _PC_COORD_CLIP)
+    return p
+
+
+def _polyline_length(points: np.ndarray) -> float:
+    """Total arc length of an ordered ``(K, 3)`` polyline."""
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if p.shape[0] < 2:
+        return 0.0
+    return float(np.linalg.norm(p[1:] - p[:-1], axis=1).sum())
+
+
+def _split_loop(
+    pts_full: np.ndarray, num_points: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Split a closed polyline into two arcs at its point farthest from start.
+
+    Returns ``(far_point, arc1, arc2)`` where ``arc1`` runs start -> far and
+    ``arc2`` runs far -> end (~start), each resampled to ``num_points``. The two
+    arcs share the inserted ``far`` vertex and the loop's junction vertex, so the
+    closed edge becomes two open edges (a faithful 2-cycle). Returns ``None`` if
+    the polyline is too short to split.
+    """
+    k = pts_full.shape[0]
+    if k < 3:
+        return None
+    d = np.linalg.norm(pts_full - pts_full[0], axis=1)
+    m = int(np.argmax(d))
+    if m <= 0 or m >= k - 1:
+        m = k // 2
+    if m <= 0 or m >= k - 1:
+        return None
+    far = pts_full[m].astype(np.float32)
+    arc1 = _resample_polyline(pts_full[: m + 1], num_points)
+    arc2 = _resample_polyline(pts_full[m:], num_points)
+    return far, arc1, arc2
+
+
 def _clean_point_cloud(points: np.ndarray, max_points: int = 0) -> np.ndarray:
     """Clean a *variable-size* point cloud (no resampling to a fixed count).
 
@@ -277,6 +321,10 @@ class WireframeGraphDataset(Dataset):
         min_edges: int = 1,
         min_pc_points: int = 100,
         max_load_retries: int = 64,
+        # ----- closed-loop edge splitting -----
+        split_loops: bool = True,
+        loop_close_tol: float = 1e-2,
+        loop_min_arc: float = 5e-2,
     ) -> None:
         super().__init__()
         self.format = GraphFormat(
@@ -287,6 +335,9 @@ class WireframeGraphDataset(Dataset):
             max_pc_points=max_pc_points,
         )
         self.split = split
+        self.split_loops = bool(split_loops)
+        self.loop_close_tol = float(loop_close_tol)
+        self.loop_min_arc = float(loop_min_arc)
         self.pointcloud_dirs = [
             os.path.expandvars(os.path.expanduser(d))
             for d in (pointcloud_dirs or [])
@@ -353,13 +404,39 @@ class WireframeGraphDataset(Dataset):
         for i in range(n_raw):
             if not (np.isfinite(start[i]).all() and np.isfinite(end[i]).all()):
                 continue
+            pts_full = _clean_polyline(raw_edge_points[i])
+            if pts_full.shape[0] < 2:
+                continue
+
+            # Closed-loop edge: endpoints (near-)coincident but the polyline
+            # traverses a real arc (length >> chord). The endpoint-anchored curve
+            # frame is undefined for these (and used to be dropped by the u == v
+            # guard / blow up the curve VAE), so split the loop into two open
+            # arcs at the far point -- inserting a midpoint vertex turns it into
+            # a faithful 2-cycle between the junction and that far vertex.
+            chord = float(np.linalg.norm(end[i] - start[i]))
+            if self.split_loops and chord < self.loop_close_tol:
+                arclen = _polyline_length(pts_full)
+                if arclen > self.loop_min_arc and arclen > 4.0 * chord:
+                    split = _split_loop(pts_full, fmt.num_edge_points)
+                    if split is not None:
+                        far, arc1, arc2 = split
+                        u = get_vertex_id(start[i])
+                        w = get_vertex_id(far)
+                        if u is not None and w is not None and u != w:
+                            edge_index.append((u, w))
+                            edge_points.append(arc1)
+                            edge_index.append((w, u))
+                            edge_points.append(arc2)
+                            continue
+
             u = get_vertex_id(start[i])
             v = get_vertex_id(end[i])
             if u is None or v is None or u == v:
                 continue
             edge_index.append((u, v))
-            edge_points.append(_resample_polyline(
-                raw_edge_points[i], fmt.num_edge_points))
+            edge_points.append(
+                _resample_polyline(pts_full, fmt.num_edge_points))
 
         nv = len(vertices)
         ne = len(edge_index)

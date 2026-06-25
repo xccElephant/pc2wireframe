@@ -66,6 +66,13 @@ class WireframeDataModule(pl.LightningDataModule):
         # loader retries the next file). Does not affect predict/test.
         min_pc_points: int = 100,
         max_load_retries: int = 64,
+        # ----- closed-loop edge splitting -----
+        # A closed edge (endpoints within loop_close_tol but arc length >
+        # loop_min_arc) is split into two open arcs at its far point so loops
+        # are representable by the endpoint-anchored curve VAE.
+        split_loops: bool = True,
+        loop_close_tol: float = 1e-2,
+        loop_min_arc: float = 5e-2,
         # ----- data loader -----
         shuffle: bool = True,
         num_workers: int = 8,
@@ -108,6 +115,9 @@ class WireframeDataModule(pl.LightningDataModule):
             min_edges=self.hparams.min_edges,
             min_pc_points=self.hparams.min_pc_points,
             max_load_retries=self.hparams.max_load_retries,
+            split_loops=self.hparams.split_loops,
+            loop_close_tol=self.hparams.loop_close_tol,
+            loop_min_arc=self.hparams.loop_min_arc,
         )
 
     # ------------------------------------------------------------------

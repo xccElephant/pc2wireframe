@@ -1,17 +1,20 @@
-# VQVAE WireframeAE -- end-to-end discrete autoencoder (single GPU).
+# VQVAE WireframeAE -- single-stage end-to-end joint vertex+edge model (1 GPU).
 # Run with:
 #   python -m src.main fit --config configs/data.yaml --config configs/vqvae.yaml
 #
 # point cloud -> frozen Utonia PTv3 (multi-scale per-stage features)
 # -> per-scale continuous tokens -> per-scale ResidualVQ -> flat indices
-# (<=4096, the submission) -> EdgeSetDecoder (512 edge queries: self-attn edges
-# + cross-attn z_q -> per-edge existence + 32 ordered curve points) -> wireframe
-# {vertices, edge_index, edge_points} (vertices from union-find endpoint merge).
+# (<=4096, the submission) -> JointSetDecoder (512 vertex queries + 512 edge
+# queries, mutual cross-attn) -> vertex (existence + coord), edge (existence +
+# 12-d curve VAE latent), edge->vertex association matrix A -> wireframe
+# {vertices, edge_index, edge_points}. The per-curve VAE is trained JOINTLY
+# (no freezing); reconstruction picks endpoints as the top-2 vertices per edge
+# under A and denormalises the decoded canonical curve onto them.
 # For 8x A800 DDP use vqvae_ddp.yaml.
 seed_everything: 3407
 
 model:
-  class_path: src.module.WireframeAEModule
+  class_path: src.module.JointWireframeModule
   init_args:
     # ----- point-cloud encoder: frozen Utonia PTv3, multi-scale compressors -----
     pc_encoder:
@@ -30,57 +33,68 @@ model:
     quantizer:
       # budget = sum_s N_s * n_q = (192+128+96+64+32)*8 = 512*8 = 4096 (== cap).
       n_q: 8
-      # per-scale codebook sizes (finer -> coarser): shrink the coarse scales
-      # (few tokens never fill a big book -> collapse) to match utilisation.
-      codebook_size: [8192, 4096, 2048, 1024, 512]
+      codebook_size: [8192, 4096, 2048, 1024, 512]  # shrink coarse scales
       kmeans_init: true
       kmeans_iters: 10
       threshold_ema_dead_code: 4   # revive dead codes more aggressively
-      decay: 0.95                  # faster EMA (was 0.99) -> coarse books adapt
+      decay: 0.95                  # faster EMA -> coarse books adapt
       commitment_weight: 0.25
 
-    # ----- edge-set decoder (512 edge queries: self-attn + cross-attn z_q) -----
+    # ----- per-curve VAE (trained jointly; 12-d per-edge latent contract) -----
+    curve_vae:
+      latent_channels: 3              # 3 channels x 4 latent positions = 12-d
+      sample_points_num: 32           # encoder length; decode can query any length
+      down_block_types: ["DownBlock1D", "DownBlock1D", "DownBlock1D"]
+      block_out_channels: [128, 256, 256]
+      layers_per_block: 2
+
+    # ----- joint vertex+edge decoder -----
     decoder:
       latent_dim: 256           # = pc_encoder.latent_dim
+      num_vertex_queries: 512   # vertex-set size (= data.max_vertices)
       num_edge_queries: 512     # edge-set size (max edges per shape)
-      sample_points_num: 32     # ordered points per edge (= data.num_edge_points)
       d_model: 256
       nhead: 8
-      num_layers: 6             # transformer decoder layers (self + cross attn)
+      num_layers: 6             # joint decoder layers (self + mem-cross + mutual)
       mlp_ratio: 4.0
       dropout: 0.0
-      points_hidden: 256        # per-edge points MLP hidden width
-      chord_residual: true      # endpoints absolute + interior = chord + offset
+      assoc_dim: 64             # low-rank edge<->vertex association projection
+      coord_tanh: true          # squash vertex coords into the unit cube [-1,1]
 
-    # ----- loss weights (edge-set criterion) -----
-    w_exist: 2.0                # edge existence (calibrated BCE, see focal_gamma)
-    w_points: 5.0               # ordered per-point L1 (matched edges, dir-min)
-    w_endpoint: 8.0             # endpoint (pts[0]/pts[-1]) L1 (shared vertices)
-    w_sagitta: 2.0              # chord-residual match (learn real curvature)
-    w_smooth: 0.05              # GT-relative 2nd-diff smoothness (only straightens
-                                # GT-straight edges; small)
-    w_seglen: 0.0               # segment-length-variance (off; penalised curvature)
-    w_consistency: 2.0          # shared-GT-vertex variance + abs anchor (anti-float)
+    # ----- loss weights (joint set criterion) -----
+    w_vexist: 2.0               # vertex existence (calibrated BCE)
+    w_vcoord: 5.0               # matched-vertex coordinate L1
+    w_eexist: 2.0               # edge existence (calibrated BCE)
+    w_curve: 5.0                # curve-space L1 (decode(lat_pred) vs GT canonical)
+    w_curve_endpoint: 2.0       # curve endpoint L1 (canonical [-1,0,0]/[1,0,0])
+    w_lat_reg: 0.1              # small on-manifold L2(lat_pred, sg(mu_k))
+    w_anchor: 5.0               # curve-VAE autoencoding recon L1 (anti-collapse)
+    w_anchor_endpoint: 2.0      # curve-VAE autoencoding endpoint L1
+    w_assoc: 2.0                # association BCE (matched rows / vertex cols)
+    assoc_pos_weight_max: 64.0  # cap on association BCE pos_weight (2-of-V sparse)
     w_commit: 0.25              # VQ commitment loss (ramped in after warmup)
-    focal_gamma: 0.0            # 0 -> calibrated BCE (pos_weight + label smooth);
-                                # >0 restores the old focal existence loss
-    focal_alpha: 0.5            # focal balance (only used when focal_gamma > 0)
-    exist_label_smoothing: 0.02 # existence BCE label smoothing (anti-saturation)
-    exist_pos_weight_max: 20.0  # cap on per-shape BCE pos_weight (#neg / #pos)
-    curv_l1_scale: 4.0          # up-weight per-point L1 of curved GT edges by sagitta
-    match_w_geo: 1.0            # Hungarian cost: endpoint-L1 weight
+    focal_gamma: 0.0            # 0 -> calibrated BCE; >0 restores focal existence
+    focal_alpha: 0.5
+    exist_label_smoothing: 0.02
+    exist_pos_weight_max: 20.0
+    match_w_vcoord: 1.0         # vertex Hungarian cost: coord-L1 weight
     match_w_exist: 0.5          # Hungarian cost: existence reward
+    match_w_inc: 1.0            # edge Hungarian cost: incidence (-logA) weight
+    match_w_lat: 1.0            # edge Hungarian cost: latent-L1 weight
 
-    # ----- quantization schedule -----
+    # ----- schedules -----
     quant_warmup_steps: 2000    # continuous-z warmup (codebooks still EMA-update)
     commit_ramp_steps: 2000     # commit weight 0 -> w_commit linear ramp
+    kl_weight: 1.0e-6           # final curve-VAE KL weight
+    kl_ramp_steps: 2000         # KL weight 0 -> kl_weight ramp
+    match_warmup_steps: 2000    # steps with w_inc=0 (A is random early)
+    match_inc_ramp_steps: 2000  # then w_inc 0 -> 1 ramp (incidence drives match)
 
-    # ----- decode (validation / predict): endpoint aggregation -----
-    edge_thresh: 0.5            # edge existence sigmoid threshold
-    tau_merge: 0.015            # union-find endpoint merge radius (shared vertex)
-    topk_edges: 0               # keep top-k most-confident kept edges (0 = all)
-    min_edges: 1                # floor: fall back to top-k if too few clear the
-                                # threshold (never emit an empty wireframe)
+    # ----- decode (validation / predict): threshold the predicted sets -----
+    vthr: 0.5                   # vertex existence sigmoid threshold
+    ethr: 0.5                   # edge existence sigmoid threshold
+    min_vertices: 2             # floor: never emit < 2 vertices
+    min_edges: 1                # floor: never emit an empty wireframe
     num_per_edge: 32            # points per reconstructed edge curve
 
     # ----- eval metric: CCD / TA / VPE -> weighted final score -----
@@ -89,24 +103,25 @@ model:
     eval_w_vpe: 0.3
     eval_match_thresh: 0.1
 
-    # ----- threshold-robust checkpoint selection -----
+    # ----- threshold-robust checkpoint selection (vthr, ethr grid) -----
     # val/score is recomputed over this grid each epoch; the max is logged as
-    # val/score_best (monitored by ModelCheckpoint). tau grid null -> uses
-    # tau_merge above.
-    val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
-    val_tau_merge_grid: null
-    val_topk_edges_grid: [0, 64, 128]   # also sweep the top-k edge cap
+    # val/score_best (monitored by ModelCheckpoint).
+    val_vthr_grid: [0.3, 0.4, 0.5, 0.6]
+    val_ethr_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
 
     # ----- optimization -----
     lr: 3.0e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     warmup_steps: 1000
-    max_steps: 100000
+    # LR cosine horizon: only a fallback -- the scheduler primarily uses
+    # trainer.estimated_stepping_batches (tracks max_epochs/devices). Kept
+    # proportional to max_epochs (~1000 steps/epoch on 1 GPU x 300 epochs).
+    max_steps: 300000
     grad_clip: 1.0
 
 trainer:
-  max_epochs: 100
+  max_epochs: 300
   check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 1                    # single GPU; use configs/vqvae_ddp.yaml for 8x A800

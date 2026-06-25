@@ -1,4 +1,4 @@
-# VQVAE WireframeAE (8x A800 DDP) -- end-to-end discrete autoencoder.
+# VQVAE WireframeAE (8x A800 DDP) -- single-stage end-to-end joint vertex+edge.
 # Run with:
 #   python -m src.main fit --config configs/data.yaml --config configs/vqvae_ddp.yaml
 #
@@ -7,14 +7,13 @@
 seed_everything: 3407
 
 model:
-  class_path: src.module.WireframeAEModule
+  class_path: src.module.JointWireframeModule
   init_args:
     # ----- point-cloud encoder: frozen Utonia PTv3, multi-scale compressors -----
     pc_encoder:
       utonia: logs/utonia/utonia.pth
       grid_size: 0.01
       freeze: true
-      # all 5 PTv3 enc stages (finer -> coarser); finest get the most tokens.
       scale_tokens: [192, 128, 96, 64, 32]
       scale_stages: [0, 1, 2, 3, 4]
       latent_dim: 256
@@ -31,44 +30,60 @@ model:
       decay: 0.95
       commitment_weight: 0.25
 
-    # ----- edge-set decoder (512 edge queries: self-attn + cross-attn z_q) -----
+    # ----- per-curve VAE (trained jointly; 12-d per-edge latent contract) -----
+    curve_vae:
+      latent_channels: 3              # 3 channels x 4 latent positions = 12-d
+      sample_points_num: 32
+      down_block_types: ["DownBlock1D", "DownBlock1D", "DownBlock1D"]
+      block_out_channels: [128, 256, 256]
+      layers_per_block: 2
+
+    # ----- joint vertex+edge decoder -----
     decoder:
       latent_dim: 256
+      num_vertex_queries: 512
       num_edge_queries: 512
-      sample_points_num: 32
       d_model: 256
       nhead: 8
       num_layers: 6
       mlp_ratio: 4.0
       dropout: 0.0
-      points_hidden: 256
-      chord_residual: true
+      assoc_dim: 64
+      coord_tanh: true
 
-    # ----- loss weights (edge-set criterion) -----
-    w_exist: 2.0
-    w_points: 5.0
-    w_endpoint: 8.0
-    w_sagitta: 2.0
-    w_smooth: 0.05
-    w_seglen: 0.0
-    w_consistency: 2.0
+    # ----- loss weights (joint set criterion) -----
+    w_vexist: 2.0
+    w_vcoord: 5.0
+    w_eexist: 2.0
+    w_curve: 5.0
+    w_curve_endpoint: 2.0
+    w_lat_reg: 0.1
+    w_anchor: 5.0
+    w_anchor_endpoint: 2.0
+    w_assoc: 2.0
+    assoc_pos_weight_max: 64.0
     w_commit: 0.25
     focal_gamma: 0.0             # 0 -> calibrated BCE; >0 restores focal
     focal_alpha: 0.5
     exist_label_smoothing: 0.02
     exist_pos_weight_max: 20.0
-    curv_l1_scale: 4.0
-    match_w_geo: 1.0
+    match_w_vcoord: 1.0
     match_w_exist: 0.5
+    match_w_inc: 1.0
+    match_w_lat: 1.0
 
-    # ----- quantization schedule -----
+    # ----- schedules -----
     quant_warmup_steps: 2000
     commit_ramp_steps: 2000
+    kl_weight: 1.0e-6
+    kl_ramp_steps: 2000
+    match_warmup_steps: 2000
+    match_inc_ramp_steps: 2000
 
-    # ----- decode (validation / predict): endpoint aggregation -----
-    edge_thresh: 0.5
-    tau_merge: 0.015
-    topk_edges: 0
+    # ----- decode (validation / predict): threshold the predicted sets -----
+    vthr: 0.5
+    ethr: 0.5
+    min_vertices: 2
     min_edges: 1
     num_per_edge: 32
 
@@ -78,10 +93,9 @@ model:
     eval_w_vpe: 0.3
     eval_match_thresh: 0.1
 
-    # ----- threshold-robust checkpoint selection -----
-    val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
-    val_tau_merge_grid: null
-    val_topk_edges_grid: [0, 64, 128]
+    # ----- threshold-robust checkpoint selection (vthr, ethr grid) -----
+    val_vthr_grid: [0.3, 0.4, 0.5, 0.6]
+    val_ethr_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
 
     # ----- optimization -----
     # LR ~sqrt(8)x the single-GPU 3e-4 (global batch is 8x larger under DDP).
@@ -89,11 +103,14 @@ model:
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     warmup_steps: 1000
-    max_steps: 100000
+    # LR cosine horizon: only a fallback -- the scheduler primarily uses
+    # trainer.estimated_stepping_batches (tracks max_epochs/devices). Kept
+    # proportional to max_epochs (DDP does ~1/8 the steps/epoch of 1 GPU).
+    max_steps: 300000
     grad_clip: 1.0
 
 trainer:
-  max_epochs: 100
+  max_epochs: 300
   check_val_every_n_epoch: 5
   accelerator: gpu
   devices: 8                    # 8x A800; for single GPU use configs/vqvae.yaml
