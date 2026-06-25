@@ -58,6 +58,11 @@ class EdgeSetDecoder(nn.Module):
         mlp_ratio: feed-forward expansion.
         dropout: dropout in attention / heads.
         points_hidden: hidden width of the per-edge points MLP.
+        learn_exist_temperature: add a learnable scalar **temperature** that
+            divides the existence logits (initialised to 1, i.e. a no-op). It
+            lets the model calibrate the existence head's sharpness jointly with
+            the BCE so ``sigmoid(logit)`` lands near ``0.5`` at the boundary;
+            applied consistently at train / val / export. ``False`` -> identity.
     """
 
     def __init__(
@@ -73,6 +78,7 @@ class EdgeSetDecoder(nn.Module):
         dropout: float = 0.0,
         points_hidden: int = 256,
         chord_residual: bool = True,
+        learn_exist_temperature: bool = False,
     ) -> None:
         super().__init__()
         self.num_edge_queries = int(num_edge_queries)
@@ -80,6 +86,7 @@ class EdgeSetDecoder(nn.Module):
         self.d_model = int(d_model)
         self.num_scales = int(num_scales)
         self.chord_residual = bool(chord_residual)
+        self.learn_exist_temperature = bool(learn_exist_temperature)
 
         self.latent_proj = (
             nn.Linear(latent_dim, d_model)
@@ -103,6 +110,10 @@ class EdgeSetDecoder(nn.Module):
         self.exist_head = _mlp(d_model, d_model, 1)
         self.points_head = _mlp(
             d_model, points_hidden, self.sample_points_num * 3)
+        # Optional post-hoc existence-logit temperature (log-param -> T = exp,
+        # init T = 1). Divides the logits, learned jointly with the BCE.
+        if self.learn_exist_temperature:
+            self.exist_log_temp = nn.Parameter(torch.zeros(1))
 
     # ------------------------------------------------------------------
     def _build_memory(self, z_q_list: list[torch.Tensor]) -> torch.Tensor:
@@ -133,6 +144,8 @@ class EdgeSetDecoder(nn.Module):
         h = self.decoder(tgt=q, memory=mem)              # (B, Q, d_model)
 
         edge_exist_logit = self.exist_head(h).squeeze(-1)            # (B, Q)
+        if self.learn_exist_temperature:
+            edge_exist_logit = edge_exist_logit / self.exist_log_temp.exp()
         raw = self.points_head(h).reshape(
             b, self.num_edge_queries, self.sample_points_num, 3)     # (B, Q, P, 3)
 

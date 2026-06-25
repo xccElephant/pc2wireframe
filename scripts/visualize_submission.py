@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
                    help="number of random shapes (ignored if --stems given)")
     p.add_argument("--stems", nargs="*", default=None,
                    help="explicit shape stems to render")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--elev", type=float, default=20.0)
     p.add_argument("--azim", type=float, default=-60.0)
     return p.parse_args()

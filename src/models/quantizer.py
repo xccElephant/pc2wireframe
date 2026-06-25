@@ -43,8 +43,11 @@ class MultiScaleResidualVQ(nn.Module):
             e.g. ``[256, 128, 64]``). Defines the index layout and budget.
         dim: per-token channel width ``D`` (= encoder ``latent_dim``).
         n_q: residual quantizer levels per scale (``num_quantizers``).
-        codebook_size: codebook entries per level (budget is index *count*, not
-            bits, so this can be large for free).
+        codebook_size: codebook entries per level -- a single ``int`` shared by
+            every scale, or a per-scale ``list`` (finer -> coarser). The budget
+            is the index *count*, not bits, so size is otherwise free; shrinking
+            the coarse scales (few tokens) to match their real utilisation is a
+            codebook-collapse remedy.
         kmeans_init: k-means codebook init on the first training batch.
         threshold_ema_dead_code: dead-code revival threshold (EMA count).
         decay: codebook EMA decay.
@@ -61,7 +64,7 @@ class MultiScaleResidualVQ(nn.Module):
         scale_tokens: list[int],
         dim: int = 256,
         n_q: int = 8,
-        codebook_size: int = 8192,
+        codebook_size: int | list[int] = 8192,
         kmeans_init: bool = True,
         kmeans_iters: int = 10,
         threshold_ema_dead_code: int = 2,
@@ -75,7 +78,17 @@ class MultiScaleResidualVQ(nn.Module):
         self.scale_tokens = [int(n) for n in scale_tokens]
         self.n_q = int(n_q)
         self.dim = int(dim)
-        self.codebook_size = int(codebook_size)
+        # codebook_size: a shared int or one entry per scale (finer -> coarser).
+        if isinstance(codebook_size, (list, tuple)):
+            self.codebook_sizes = [int(c) for c in codebook_size]
+            if len(self.codebook_sizes) != len(self.scale_tokens):
+                raise ValueError(
+                    f"codebook_size list {self.codebook_sizes} must have one "
+                    f"entry per scale ({len(self.scale_tokens)})")
+        else:
+            self.codebook_sizes = [int(codebook_size)] * len(self.scale_tokens)
+        # Max size (for perplexity bincount minlength; per-scale RVQs differ).
+        self.codebook_size = int(max(self.codebook_sizes))
         # per-scale flat sizes: N_s * n_q (used for split + reshape round-trip).
         self.scale_sizes = [n * self.n_q for n in self.scale_tokens]
         self.total_indices = int(sum(self.scale_sizes))
@@ -92,14 +105,14 @@ class MultiScaleResidualVQ(nn.Module):
             ResidualVQ(
                 dim=self.dim,
                 num_quantizers=self.n_q,
-                codebook_size=self.codebook_size,
+                codebook_size=cb,
                 kmeans_init=kmeans_init,
                 kmeans_iters=kmeans_iters,
                 threshold_ema_dead_code=threshold_ema_dead_code,
                 decay=decay,
                 commitment_weight=commitment_weight,
             )
-            for _ in self.scale_tokens
+            for cb in self.codebook_sizes
         ])
 
     # ------------------------------------------------------------------

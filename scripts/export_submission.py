@@ -174,6 +174,7 @@ def decode_batch(
     edge_thresh: float | None = None,
     tau_merge: float | None = None,
     max_edges: int = 0,
+    min_edges: int | None = None,
 ) -> list[dict[str, np.ndarray]]:
     """Decode a batch of edge-set decoder outputs into wireframes (numpy).
 
@@ -182,7 +183,10 @@ def decode_batch(
     edges per shape: among the edges that clear ``edge_thresh`` only the
     top-``max_edges`` by existence probability are kept (0 = no cap). This
     mirrors the official baseline's ``topk`` strategy and prevents an
-    under-trained model from emitting many false edges.
+    under-trained model from emitting many false edges. ``min_edges`` is the
+    floor: if too few edges clear ``edge_thresh`` it falls back to the
+    top-``min_edges`` queries so a miscalibrated threshold never writes an empty
+    (zero-scoring) wireframe.
     """
     exist_prob = torch.sigmoid(out["edge_exist_logit"])     # (B, Q)
     edge_points = out["edge_points"]                         # (B, Q, P, 3)
@@ -193,6 +197,8 @@ def decode_batch(
                 else hp.get("tau_merge", 0.015))
     npe = int(hp.get("num_per_edge", NUM_EDGE_POINTS))
     me = max(0, int(max_edges))
+    mn = int(min_edges if min_edges is not None
+             else hp.get("min_edges", 1))
 
     wfs: list[dict[str, np.ndarray]] = []
     for i in range(b):
@@ -200,7 +206,7 @@ def decode_batch(
             edge_points[i].cpu().numpy(),
             exist_prob[i].cpu().numpy(),
             edge_threshold=et, tau_merge=tau, topk_edges=me,
-            num_per_edge=npe,
+            min_edges=mn, num_per_edge=npe,
         ))
     return wfs
 
@@ -304,6 +310,10 @@ def parse_args() -> argparse.Namespace:
                    help="hard cap on edges per shape: among edges passing "
                         "--edge-thresh, keep the top-k by probability "
                         "(0 = no cap). Mirrors the official top-k strategy.")
+    p.add_argument("--min-edges", type=int, default=1,
+                   help="floor on edges per shape: if fewer pass --edge-thresh, "
+                        "fall back to the top-k by probability so the wireframe "
+                        "is never empty (0 = allow empty).")
     p.add_argument("--limit", type=int, default=0,
                    help="only export the first N shapes (0 = all; debugging)")
     p.add_argument("--no-progress", action="store_true")
@@ -339,7 +349,8 @@ def run_worker(args: argparse.Namespace) -> None:
     print(f"[rank {rank}] ckpt: {ckpt}")
     print(f"[rank {rank}] decode: edge_thresh={args.edge_thresh} "
           f"tau_merge={args.tau_merge} "
-          f"max_edges={args.max_edges or 'inf'}")
+          f"max_edges={args.max_edges or 'inf'} "
+          f"min_edges={args.min_edges}")
     encoder, quantizer, decoder, hp = load_model(ckpt, args.device)
 
     k_latent = int(quantizer.total_indices)
@@ -450,7 +461,8 @@ def run_worker(args: argparse.Namespace) -> None:
                 decoder, out, hp,
                 edge_thresh=args.edge_thresh,
                 tau_merge=args.tau_merge,
-                max_edges=args.max_edges)
+                max_edges=args.max_edges,
+                min_edges=args.min_edges)
 
         for j, s in enumerate(samples):
             stem = str(s["shape_id"])
@@ -606,6 +618,7 @@ def orchestrate(args: argparse.Namespace) -> None:
         "--edge-thresh", str(args.edge_thresh),
         "--tau-merge", str(args.tau_merge),
         "--max-edges", str(args.max_edges),
+        "--min-edges", str(args.min_edges),
     ]
     if args.limit and args.limit > 0:
         base += ["--limit", str(args.limit)]

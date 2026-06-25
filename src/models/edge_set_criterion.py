@@ -16,19 +16,35 @@ module matches those queries to the GT edges and supervises them:
 
   * **losses** -- only matched queries get the geometric terms:
 
-      - ``exist``    focal BCE over all ``Q`` queries (matched = positive);
+      - ``exist``    **calibrated** existence BCE over all ``Q`` queries
+        (matched = positive). A per-shape ``pos_weight`` (= #neg / #pos,
+        capped) rebalances the heavy negative majority and a small label
+        smoothing keeps the head honest, so the learned probabilities sit near
+        ``0.5`` at the decision boundary (a plain ``edge_thresh=0.5`` works)
+        instead of being squashed by a focal loss. Setting ``focal_gamma > 0``
+        restores the old focal behaviour;
       - ``points``   ordered per-point L1 of the matched query's ``P`` points to
         the GT curve, taking the min over the two point orderings (the root of
-        "points do not drift" -- far stronger than a chamfer);
+        "points do not drift" -- far stronger than a chamfer). Curved GT edges
+        are **up-weighted** by their sagitta so the straight-edge majority does
+        not drown them out;
       - ``endpoint`` an extra, higher-weight L1 on ``pts[0]`` / ``pts[-1]`` to
         the GT endpoints. GT edges sharing a vertex have *identical* endpoint
         coordinates, so this pulls the endpoints that should coincide onto the
         same point (the basis for the union-find merge / topology accuracy);
-      - ``smooth``   small second-difference penalty (anti-jitter);
-      - ``seglen``   small segment-length-variance penalty (even spacing);
+      - ``sagitta``  matches each edge's *chord residual* (offset of every
+        interior point from its own endpoint chord) to the GT residual, so the
+        decoder reproduces real curvature instead of collapsing arcs to the
+        straight ``chord_residual`` default;
+      - ``smooth``   second-difference penalty taken **relative to GT** (only
+        straight GT edges are pushed straight -- arcs keep their curvature);
+      - ``seglen``   optional segment-length-variance penalty (even spacing;
+        defaults to off);
       - ``consistency`` groups matched endpoints by their GT vertex id and
-        penalises the intra-group variance, so endpoints that should share a
-        vertex coincide (makes the union-find merge work / kills floating edges).
+        penalises both the intra-group variance *and* the distance to the GT
+        vertex's absolute coordinate, so endpoints that should share a vertex
+        coincide there (makes the union-find merge work / kills the ~2x vertex
+        over-prediction / floating edges).
 """
 from __future__ import annotations
 
@@ -55,6 +71,29 @@ def _focal_bce(
     return (alpha_t * (1.0 - p_t).clamp_min(0.0) ** gamma * ce).mean()
 
 
+def _balanced_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_weight: float,
+    label_smoothing: float,
+) -> torch.Tensor:
+    """Calibrated existence BCE: per-shape ``pos_weight`` + label smoothing.
+
+    ``pos_weight`` (= #neg / #pos, capped by the caller) rebalances the heavy
+    negative majority without squashing the probabilities the way a focal loss
+    does, so ``sigmoid(logit)`` stays near ``0.5`` at the decision boundary.
+    A small ``label_smoothing`` pulls the hard ``{0, 1}`` targets towards the
+    centre, which keeps the head from saturating into over-confident logits.
+    """
+    if logits.numel() == 0:
+        return logits.new_zeros(())
+    if label_smoothing > 0.0:
+        targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
+    pw = logits.new_tensor(float(pos_weight))
+    return F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pw, reduction="mean")
+
+
 def _resample_curve(points: torch.Tensor, num: int) -> torch.Tensor:
     """Resample ``(E, U, 3)`` ordered polylines to ``(E, num, 3)`` (linear).
 
@@ -72,6 +111,21 @@ def _resample_curve(points: torch.Tensor, num: int) -> torch.Tensor:
     return x.permute(0, 2, 1).contiguous()            # (E, num, 3)
 
 
+def _chord_residual(curve: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(M, P, 3)`` -> (straight endpoint chord, residual = curve - chord).
+
+    The residual is each interior point's offset from the straight line joining
+    the two endpoints; its magnitude is the local sagitta (0 for a straight
+    edge). Used both for the curvature-aware point weighting and the sagitta
+    loss.
+    """
+    p = curve.shape[1]
+    t = torch.linspace(0.0, 1.0, p, device=curve.device, dtype=curve.dtype)
+    chord = (curve[:, :1] * (1.0 - t)[None, :, None]
+             + curve[:, -1:] * t[None, :, None])      # (M, P, 3)
+    return chord, curve - chord
+
+
 class EdgeSetCriterion(nn.Module):
     """Hungarian edge-set matching + existence / point / smoothness losses."""
 
@@ -81,11 +135,15 @@ class EdgeSetCriterion(nn.Module):
         w_exist: float = 2.0,
         w_points: float = 5.0,
         w_endpoint: float = 8.0,
-        w_smooth: float = 0.5,
-        w_seglen: float = 0.1,
-        w_consistency: float = 1.0,
-        focal_gamma: float = 2.0,
+        w_smooth: float = 0.05,
+        w_seglen: float = 0.0,
+        w_sagitta: float = 2.0,
+        w_consistency: float = 2.0,
+        focal_gamma: float = 0.0,
         focal_alpha: float = 0.5,
+        exist_label_smoothing: float = 0.02,
+        exist_pos_weight_max: float = 20.0,
+        curv_l1_scale: float = 4.0,
         match_w_geo: float = 1.0,
         match_w_exist: float = 0.5,
     ) -> None:
@@ -95,11 +153,33 @@ class EdgeSetCriterion(nn.Module):
         self.w_endpoint = float(w_endpoint)
         self.w_smooth = float(w_smooth)
         self.w_seglen = float(w_seglen)
+        self.w_sagitta = float(w_sagitta)
         self.w_consistency = float(w_consistency)
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
+        self.exist_label_smoothing = float(exist_label_smoothing)
+        self.exist_pos_weight_max = float(exist_pos_weight_max)
+        self.curv_l1_scale = float(curv_l1_scale)
         self.match_w_geo = float(match_w_geo)
         self.match_w_exist = float(match_w_exist)
+
+    # ------------------------------------------------------------------
+    def _exist_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        n_pos: int,
+    ) -> torch.Tensor:
+        """Existence loss: focal (``focal_gamma > 0``) else calibrated BCE."""
+        if self.focal_gamma > 0.0:
+            return _focal_bce(
+                logits, targets, self.focal_gamma, self.focal_alpha)
+        q = int(logits.numel())
+        n_neg = max(0, q - int(n_pos))
+        pos_weight = n_neg / max(1, int(n_pos))
+        pos_weight = float(min(self.exist_pos_weight_max, max(1.0, pos_weight)))
+        return _balanced_bce(
+            logits, targets, pos_weight, self.exist_label_smoothing)
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -145,6 +225,7 @@ class EdgeSetCriterion(nn.Module):
         l_exist = edge_points.new_zeros(())
         l_points = edge_points.new_zeros(())
         l_endpoint = edge_points.new_zeros(())
+        l_sagitta = edge_points.new_zeros(())
         l_smooth = edge_points.new_zeros(())
         l_seglen = edge_points.new_zeros(())
         l_consistency = edge_points.new_zeros(())
@@ -164,9 +245,8 @@ class EdgeSetCriterion(nn.Module):
 
             exist_target = edge_exist_logit.new_zeros(q)
             if e == 0:
-                l_exist = l_exist + _focal_bce(
-                    edge_exist_logit[i], exist_target,
-                    self.focal_gamma, self.focal_alpha)
+                l_exist = l_exist + self._exist_loss(
+                    edge_exist_logit[i], exist_target, n_pos=0)
                 n_exist += 1
                 continue
 
@@ -176,9 +256,8 @@ class EdgeSetCriterion(nn.Module):
             row, col = self._match(
                 v1, v2, ga, gb, torch.sigmoid(edge_exist_logit[i]))
             exist_target[row] = 1.0
-            l_exist = l_exist + _focal_bce(
-                edge_exist_logit[i], exist_target,
-                self.focal_gamma, self.focal_alpha)
+            l_exist = l_exist + self._exist_loss(
+                edge_exist_logit[i], exist_target, n_pos=int(row.shape[0]))
             n_exist += 1
 
             m = row.shape[0]
@@ -195,27 +274,46 @@ class EdgeSetCriterion(nn.Module):
             use_rev = use_rev_1d[:, None, None]
             gt_aligned = torch.where(use_rev, gt_rev, gt_m)   # (M, P, 3)
 
-            l_points = l_points + (pred_m - gt_aligned).abs().mean()
+            # Curvature-aware per-point L1: up-weight edges whose GT curve bows
+            # away from its chord (large sagitta), so the straight-edge majority
+            # does not drown out the rarer arcs / splines.
+            gt_chord, gt_res = _chord_residual(gt_aligned)
+            _, pred_res = _chord_residual(pred_m)
+            gt_sag = gt_res.norm(dim=-1).amax(dim=1)           # (M,) max sagitta
+            per_edge_l1 = (pred_m - gt_aligned).abs().mean(dim=(1, 2))  # (M,)
+            w_e = 1.0 + self.curv_l1_scale * gt_sag           # (M,)
+            l_points = l_points + (
+                (per_edge_l1 * w_e).sum() / w_e.sum().clamp_min(1e-6))
 
             pred_ep = torch.stack([pred_m[:, 0], pred_m[:, -1]], dim=1)
             gt_ep = torch.stack([gt_aligned[:, 0], gt_aligned[:, -1]], dim=1)
             l_endpoint = l_endpoint + (pred_ep - gt_ep).abs().mean()
 
+            # Sagitta: match the interior chord residual to GT, so the decoder
+            # learns real curvature rather than the straight-chord default.
             if p >= 3:
-                second = pred_m[:, 2:] - 2.0 * pred_m[:, 1:-1] + pred_m[:, :-2]
-                l_smooth = l_smooth + (second ** 2).sum(dim=-1).mean()
-            if p >= 3:
-                seg = (pred_m[:, 1:] - pred_m[:, :-1]).norm(dim=-1)   # (M, P-1)
-                l_seglen = l_seglen + seg.var(dim=-1).mean()
+                l_sagitta = l_sagitta + (pred_res - gt_res).abs().mean()
+                # Smoothness *relative to GT*: only straight GT edges (zero GT
+                # 2nd difference) are pushed straight; arcs keep their bend.
+                pred_2nd = pred_m[:, 2:] - 2.0 * pred_m[:, 1:-1] + pred_m[:, :-2]
+                gt_2nd = gt_aligned[:, 2:] - 2.0 * gt_aligned[:, 1:-1] \
+                    + gt_aligned[:, :-2]
+                l_smooth = l_smooth + (
+                    (pred_2nd - gt_2nd) ** 2).sum(dim=-1).mean()
+                if self.w_seglen > 0.0:
+                    seg = (pred_m[:, 1:] - pred_m[:, :-1]).norm(dim=-1)
+                    l_seglen = l_seglen + seg.var(dim=-1).mean()
             n_geom += 1
 
             # ---- vertex consistency: predicted endpoints that map to the SAME
-            # GT vertex should coincide. Group matched endpoints by their GT
-            # vertex id and penalise the intra-group variance (the "share a
-            # vertex -> connected wireframe" pressure that makes union-find work
-            # and kills floating edges).
+            # GT vertex should coincide *at that vertex*. Group matched
+            # endpoints by their GT vertex id and penalise both the intra-group
+            # variance and the distance to the GT vertex's absolute coordinate
+            # (the "share a vertex -> connected wireframe" pressure that makes
+            # union-find merge and kills the ~2x vertex over-prediction).
             if self.w_consistency > 0.0:
                 gei = g["edge_index"].to(device).long().reshape(-1, 2)
+                gverts = g["vertices"].to(device).float().reshape(-1, 3)
                 if m > 0 and gei.shape[0] > int(col.max().item()):
                     u = gei[col, 0]                            # (M,) GT vid of ga
                     v = gei[col, 1]                            # (M,) GT vid of gb
@@ -235,8 +333,13 @@ class EdgeSetCriterion(nn.Module):
                     dev = coords - g_mean[inv]                 # (2M, 3)
                     shared = g_cnt[inv] >= 2                   # only multi-edge v
                     if shared.any():
-                        l_consistency = l_consistency + (
-                            dev[shared] ** 2).sum(dim=-1).mean()
+                        var_term = (dev[shared] ** 2).sum(dim=-1).mean()
+                        if vids.max() < gverts.shape[0]:
+                            anchor = ((coords - gverts[vids])[shared] ** 2
+                                      ).sum(dim=-1).mean()
+                        else:
+                            anchor = var_term.new_zeros(())
+                        l_consistency = l_consistency + var_term + anchor
                         n_cons += 1
 
         if n_exist > 0:
@@ -244,6 +347,7 @@ class EdgeSetCriterion(nn.Module):
         if n_geom > 0:
             l_points = l_points / n_geom
             l_endpoint = l_endpoint / n_geom
+            l_sagitta = l_sagitta / n_geom
             l_smooth = l_smooth / n_geom
             l_seglen = l_seglen / n_geom
         if n_cons > 0:
@@ -253,6 +357,7 @@ class EdgeSetCriterion(nn.Module):
             self.w_exist * l_exist
             + self.w_points * l_points
             + self.w_endpoint * l_endpoint
+            + self.w_sagitta * l_sagitta
             + self.w_smooth * l_smooth
             + self.w_seglen * l_seglen
             + self.w_consistency * l_consistency
@@ -263,6 +368,7 @@ class EdgeSetCriterion(nn.Module):
             "loss_exist": l_exist.detach(),
             "loss_points": l_points.detach(),
             "loss_endpoint": l_endpoint.detach(),
+            "loss_sagitta": l_sagitta.detach(),
             "loss_smooth": l_smooth.detach(),
             "loss_seglen": l_seglen.detach(),
             "loss_consistency": l_consistency.detach(),

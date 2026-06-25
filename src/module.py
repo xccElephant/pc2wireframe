@@ -15,8 +15,8 @@ The flat **indices** (``T = sum_s N_s * n_q <= 4096``) are the competition
 submission; the decoder reconstructs the wireframe from them alone (indices ->
 codebooks -> z_q -> decoder). Training is an **edge** set-prediction problem:
 the ``Q`` edge queries are Hungarian-matched to the GT edges (endpoint cost),
-supervised with an existence focal loss + ordered per-point L1 + endpoint L1 +
-small smoothness / segment-length regularizers (see
+supervised with a calibrated existence BCE + ordered per-point L1 + endpoint L1
++ a sagitta / GT-relative smoothness curvature term (see
 :class:`~src.models.edge_set_criterion.EdgeSetCriterion`). Vertices are not
 predicted directly: they emerge at inference from a union-find merge of the
 edge endpoints. A VQ commitment loss (ramped in after a continuous-``z`` warmup)
@@ -48,25 +48,30 @@ def _default_pc_encoder() -> dict[str, Any]:
         utonia="logs/utonia/utonia.pth",
         grid_size=0.01,
         freeze=True,
-        # multi-scale token allocation (finer -> coarser).
-        scale_tokens=[256, 128, 64],
-        scale_stages=None,        # None -> deepest len(scale_tokens) stages
+        # all 5 PTv3 encoder stages (finer -> coarser); the finest stages get
+        # the most tokens so fine detail survives into the latent.
+        scale_tokens=[192, 128, 96, 64, 32],
+        scale_stages=[0, 1, 2, 3, 4],
         latent_dim=256,
-        compressor_heads=8,
+        # must divide every used stage's enc_channels (54/108/216/432/576): 6.
+        compressor_heads=6,
         compressor_layers=1,
     )
 
 
 def _default_quantizer() -> dict[str, Any]:
     # (scale_tokens / dim are taken from the encoder; budget is the *index*
-    # count sum_s N_s*n_q, e.g. (256+128+64)*8 = 3584 <= 4096.)
+    # count sum_s N_s*n_q = (192+128+96+64+32)*8 = 512*8 = 4096 <= 4096.)
+    # Per-scale codebook sizes shrink towards the coarse end (few tokens there
+    # never fill a big codebook -> collapse); raised dead-code revival + faster
+    # EMA decay keep the coarse codebooks alive.
     return dict(
         n_q=8,
-        codebook_size=8192,
+        codebook_size=[8192, 4096, 2048, 1024, 512],
         kmeans_init=True,
         kmeans_iters=10,
-        threshold_ema_dead_code=2,
-        decay=0.99,
+        threshold_ema_dead_code=4,
+        decay=0.95,
         commitment_weight=0.25,
     )
 
@@ -159,13 +164,18 @@ class WireframeAEModule(_BaseModule):
         w_exist: float = 2.0,
         w_points: float = 5.0,
         w_endpoint: float = 8.0,
-        w_smooth: float = 0.5,
-        w_seglen: float = 0.1,
-        w_consistency: float = 1.0,
+        w_smooth: float = 0.05,
+        w_seglen: float = 0.0,
+        w_sagitta: float = 2.0,
+        w_consistency: float = 2.0,
         w_commit: float = 0.25,
-        # existence focal-loss params.
-        focal_gamma: float = 2.0,
+        # existence loss: focal (focal_gamma>0) else calibrated BCE.
+        focal_gamma: float = 0.0,
         focal_alpha: float = 0.5,
+        exist_label_smoothing: float = 0.02,
+        exist_pos_weight_max: float = 20.0,
+        # curvature-aware per-point L1 up-weighting (by GT sagitta).
+        curv_l1_scale: float = 4.0,
         # Hungarian matching cost = match_w_geo * endpoint_L1 - match_w_exist * p.
         match_w_geo: float = 1.0,
         match_w_exist: float = 0.5,
@@ -176,6 +186,7 @@ class WireframeAEModule(_BaseModule):
         edge_thresh: float = 0.5,
         tau_merge: float = 0.015,
         topk_edges: int = 0,
+        min_edges: int = 1,
         num_per_edge: int = 32,
         # ----- eval metric -----
         eval_w_ccd: float = 0.3,
@@ -183,13 +194,14 @@ class WireframeAEModule(_BaseModule):
         eval_w_vpe: float = 0.3,
         eval_match_thresh: float = 0.1,
         # ----- threshold-robust checkpoint selection -----
-        # At validation, score is recomputed over this grid of decode params and
-        # the MAX is logged as ``val/score_best`` (what ModelCheckpoint should
-        # monitor), so checkpoint selection does not hinge on a single,
-        # possibly-miscalibrated ``edge_thresh``. ``None`` -> just the baked-in
-        # (edge_thresh, tau_merge).
+        # At validation, score is recomputed over the (edge_thresh, tau_merge,
+        # topk_edges) product grid and the MAX is logged as ``val/score_best``
+        # (what ModelCheckpoint should monitor), so checkpoint selection does
+        # not hinge on a single, possibly-miscalibrated decode param. Each grid
+        # is ``None`` -> just the baked-in scalar.
         val_edge_thresh_grid: list[float] | None = None,
         val_tau_merge_grid: list[float] | None = None,
+        val_topk_edges_grid: list[int] | None = None,
         # ----- optimization -----
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
@@ -215,36 +227,48 @@ class WireframeAEModule(_BaseModule):
 
         self.criterion = EdgeSetCriterion(
             w_exist=w_exist, w_points=w_points, w_endpoint=w_endpoint,
-            w_smooth=w_smooth, w_seglen=w_seglen, w_consistency=w_consistency,
+            w_smooth=w_smooth, w_seglen=w_seglen, w_sagitta=w_sagitta,
+            w_consistency=w_consistency,
             focal_gamma=focal_gamma, focal_alpha=focal_alpha,
+            exist_label_smoothing=exist_label_smoothing,
+            exist_pos_weight_max=exist_pos_weight_max,
+            curv_l1_scale=curv_l1_scale,
             match_w_geo=match_w_geo, match_w_exist=match_w_exist,
         )
 
         # Threshold-robust validation: one WireframeScore per (edge_thresh,
-        # tau_merge) grid point. The baked-in pair is always included (primary).
+        # tau_merge, topk_edges) grid point. The baked-in triple is always
+        # included (primary).
         et_grid = list(val_edge_thresh_grid) if val_edge_thresh_grid \
             else [edge_thresh]
         tau_grid = list(val_tau_merge_grid) if val_tau_merge_grid \
             else [tau_merge]
-        grid = [(float(et), float(t)) for et in et_grid for t in tau_grid]
-        if (float(edge_thresh), float(tau_merge)) not in grid:
-            grid.append((float(edge_thresh), float(tau_merge)))
+        topk_grid = list(val_topk_edges_grid) if val_topk_edges_grid \
+            else [topk_edges]
+        grid = [
+            (float(et), float(t), int(tk))
+            for et in et_grid for t in tau_grid for tk in topk_grid
+        ]
+        primary = (float(edge_thresh), float(tau_merge), int(topk_edges))
+        if primary not in grid:
+            grid.append(primary)
         self._val_grid = grid
-        self._val_primary_key = self._grid_key(edge_thresh, tau_merge)
+        self._val_primary_key = self._grid_key(*primary)
         self.val_metrics = nn.ModuleDict({
-            self._grid_key(et, t): WireframeScore(
+            self._grid_key(et, t, tk): WireframeScore(
                 w_ccd=eval_w_ccd, w_ta=eval_w_ta, w_vpe=eval_w_vpe,
                 match_thresh=eval_match_thresh, num_per_edge=num_per_edge,
             )
-            for et, t in grid
+            for et, t, tk in grid
         })
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _grid_key(edge_thresh: float, tau_merge: float) -> str:
-        """Stable ModuleDict key for a (edge_thresh, tau_merge) grid point."""
+    def _grid_key(edge_thresh: float, tau_merge: float, topk_edges: int) -> str:
+        """Stable ModuleDict key for a (edge_thresh, tau_merge, topk) point."""
         return (f"et{int(round(float(edge_thresh) * 1000)):04d}"
-                f"_tau{int(round(float(tau_merge) * 10000)):05d}")
+                f"_tau{int(round(float(tau_merge) * 10000)):05d}"
+                f"_tk{int(topk_edges):04d}")
 
     # ------------------------------------------------------------------
     def _commit_weight(self) -> float:
@@ -314,6 +338,7 @@ class WireframeAEModule(_BaseModule):
         edge_threshold: float,
         tau_merge: float,
         topk_edges: int,
+        min_edges: int,
         num_per_edge: int,
     ) -> list[dict[str, np.ndarray]]:
         """Endpoint-aggregate a batch of edge sets at the given decode params."""
@@ -321,7 +346,8 @@ class WireframeAEModule(_BaseModule):
             aggregate_wireframe(
                 edge_points_np[i], exist_prob_np[i],
                 edge_threshold=edge_threshold, tau_merge=tau_merge,
-                topk_edges=topk_edges, num_per_edge=num_per_edge,
+                topk_edges=topk_edges, min_edges=min_edges,
+                num_per_edge=num_per_edge,
             )
             for i in range(exist_prob_np.shape[0])
         ]
@@ -333,7 +359,7 @@ class WireframeAEModule(_BaseModule):
         """Endpoint-aggregate each shape's edge set into a wireframe (numpy).
 
         Uses the baked-in decode params (``edge_thresh`` / ``tau_merge`` /
-        ``topk_edges``); used by ``predict_step`` / export.
+        ``topk_edges`` / ``min_edges``); used by ``predict_step`` / export.
         """
         return self._aggregate(
             torch.sigmoid(out["edge_exist_logit"]).detach().cpu().numpy(),
@@ -341,6 +367,7 @@ class WireframeAEModule(_BaseModule):
             edge_threshold=float(self.hparams.edge_thresh),
             tau_merge=float(self.hparams.tau_merge),
             topk_edges=int(self.hparams.topk_edges),
+            min_edges=int(self.hparams.min_edges),
             num_per_edge=int(self.hparams.num_per_edge),
         )
 
@@ -398,20 +425,20 @@ class WireframeAEModule(_BaseModule):
         self.log_dict(self._perplexity_logs(out), batch_size=bs,
                       on_step=False, on_epoch=True, sync_dist=True)
 
-        # Decode once to numpy, then score the whole (edge_thresh, tau_merge)
-        # grid so checkpoint selection is robust to a single threshold choice.
+        # Decode once to numpy, then score the whole (edge_thresh, tau_merge,
+        # topk_edges) grid so checkpoint selection is robust to a single choice.
         exist_np = torch.sigmoid(out["edge_exist_logit"]).detach().cpu().numpy()
         pts_np = out["edge_points"].detach().cpu().numpy()
-        topk = int(self.hparams.topk_edges)
+        min_e = int(self.hparams.min_edges)
         npe = int(self.hparams.num_per_edge)
         gts = self._gt_to_numpy(batch["gt_wireframes"])
 
-        for et, tau in self._val_grid:
+        for et, tau, topk in self._val_grid:
             preds = self._aggregate(
                 exist_np, pts_np, edge_threshold=et, tau_merge=tau,
-                topk_edges=topk, num_per_edge=npe,
+                topk_edges=topk, min_edges=min_e, num_per_edge=npe,
             )
-            key = self._grid_key(et, tau)
+            key = self._grid_key(et, tau, topk)
             self.val_metrics[key].update(preds, gts)
             if key == self._val_primary_key:
                 self.log_dict(
@@ -422,11 +449,11 @@ class WireframeAEModule(_BaseModule):
     def on_validation_epoch_end(self) -> None:
         best_score = float("-inf")
         best_res: dict[str, torch.Tensor] | None = None
-        best_et, best_tau = None, None
+        best_et, best_tau, best_topk = None, None, None
         primary_res: dict[str, torch.Tensor] | None = None
 
-        for et, tau in self._val_grid:
-            key = self._grid_key(et, tau)
+        for et, tau, topk in self._val_grid:
+            key = self._grid_key(et, tau, topk)
             res = self.val_metrics[key].compute()
             if key == self._val_primary_key:
                 primary_res = res
@@ -435,7 +462,7 @@ class WireframeAEModule(_BaseModule):
             score = float(res["score"])
             if score > best_score:
                 best_score, best_res = score, res
-                best_et, best_tau = et, tau
+                best_et, best_tau, best_topk = et, tau, topk
             self.val_metrics[key].reset()
 
         if best_res is None:  # no validation batches
@@ -455,6 +482,7 @@ class WireframeAEModule(_BaseModule):
         )
         self.log("val/best_edge_thresh", float(best_et), sync_dist=False)
         self.log("val/best_tau_merge", float(best_tau), sync_dist=False)
+        self.log("val/best_topk_edges", float(best_topk), sync_dist=False)
 
     def predict_step(self, batch, batch_idx, dataloader_idx: int = 0):
         """Per-shape flat indices (submission) + decoded wireframe.

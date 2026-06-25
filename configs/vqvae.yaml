@@ -18,22 +18,25 @@ model:
       utonia: logs/utonia/utonia.pth   # local Utonia checkpoint (download manually)
       grid_size: 0.01           # voxel dedup + PTv3 grid (raw ~unit frame)
       freeze: true              # backbone frozen (eval + no_grad), compressors train
-      # multi-scale token allocation (finer -> coarser).
-      scale_tokens: [256, 128, 64]
-      scale_stages: null        # null -> deepest len(scale_tokens) PTv3 enc stages
+      # all 5 PTv3 enc stages (finer -> coarser); finest stages get most tokens
+      # so fine detail reaches the latent (stage channels 54/108/216/432/576).
+      scale_tokens: [192, 128, 96, 64, 32]
+      scale_stages: [0, 1, 2, 3, 4]
       latent_dim: 256
-      compressor_heads: 8       # must divide each stage's enc_channels
+      compressor_heads: 6       # must divide every used stage's enc_channels
       compressor_layers: 1
 
     # ----- per-scale residual vector quantizer (the discrete latent) -----
     quantizer:
-      # budget = sum_s N_s * n_q = (256+128+64)*8 = 3584 <= 4096 (checked at build).
+      # budget = sum_s N_s * n_q = (192+128+96+64+32)*8 = 512*8 = 4096 (== cap).
       n_q: 8
-      codebook_size: 8192       # index *count* is the budget, so size is free
+      # per-scale codebook sizes (finer -> coarser): shrink the coarse scales
+      # (few tokens never fill a big book -> collapse) to match utilisation.
+      codebook_size: [8192, 4096, 2048, 1024, 512]
       kmeans_init: true
       kmeans_iters: 10
-      threshold_ema_dead_code: 2
-      decay: 0.99
+      threshold_ema_dead_code: 4   # revive dead codes more aggressively
+      decay: 0.95                  # faster EMA (was 0.99) -> coarse books adapt
       commitment_weight: 0.25
 
     # ----- edge-set decoder (512 edge queries: self-attn + cross-attn z_q) -----
@@ -50,15 +53,21 @@ model:
       chord_residual: true      # endpoints absolute + interior = chord + offset
 
     # ----- loss weights (edge-set criterion) -----
-    w_exist: 2.0                # edge existence focal loss (up: fix under-conf.)
+    w_exist: 2.0                # edge existence (calibrated BCE, see focal_gamma)
     w_points: 5.0               # ordered per-point L1 (matched edges, dir-min)
     w_endpoint: 8.0             # endpoint (pts[0]/pts[-1]) L1 (shared vertices)
-    w_smooth: 0.5               # 2nd-difference smoothness (small)
-    w_seglen: 0.1               # segment-length-variance (even spacing, small)
-    w_consistency: 1.0          # shared-GT-vertex endpoint variance (anti-float)
+    w_sagitta: 2.0              # chord-residual match (learn real curvature)
+    w_smooth: 0.05              # GT-relative 2nd-diff smoothness (only straightens
+                                # GT-straight edges; small)
+    w_seglen: 0.0               # segment-length-variance (off; penalised curvature)
+    w_consistency: 2.0          # shared-GT-vertex variance + abs anchor (anti-float)
     w_commit: 0.25              # VQ commitment loss (ramped in after warmup)
-    focal_gamma: 2.0            # edge existence focal-loss focusing
-    focal_alpha: 0.5            # edge existence focal-loss balance (up from 0.25)
+    focal_gamma: 0.0            # 0 -> calibrated BCE (pos_weight + label smooth);
+                                # >0 restores the old focal existence loss
+    focal_alpha: 0.5            # focal balance (only used when focal_gamma > 0)
+    exist_label_smoothing: 0.02 # existence BCE label smoothing (anti-saturation)
+    exist_pos_weight_max: 20.0  # cap on per-shape BCE pos_weight (#neg / #pos)
+    curv_l1_scale: 4.0          # up-weight per-point L1 of curved GT edges by sagitta
     match_w_geo: 1.0            # Hungarian cost: endpoint-L1 weight
     match_w_exist: 0.5          # Hungarian cost: existence reward
 
@@ -70,6 +79,8 @@ model:
     edge_thresh: 0.5            # edge existence sigmoid threshold
     tau_merge: 0.015            # union-find endpoint merge radius (shared vertex)
     topk_edges: 0               # keep top-k most-confident kept edges (0 = all)
+    min_edges: 1                # floor: fall back to top-k if too few clear the
+                                # threshold (never emit an empty wireframe)
     num_per_edge: 32            # points per reconstructed edge curve
 
     # ----- eval metric: CCD / TA / VPE -> weighted final score -----
@@ -84,6 +95,7 @@ model:
     # tau_merge above.
     val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
     val_tau_merge_grid: null
+    val_topk_edges_grid: [0, 64, 128]   # also sweep the top-k edge cap
 
     # ----- optimization -----
     lr: 3.0e-4

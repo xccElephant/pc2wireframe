@@ -14,20 +14,21 @@ model:
       utonia: logs/utonia/utonia.pth
       grid_size: 0.01
       freeze: true
-      scale_tokens: [256, 128, 64]
-      scale_stages: null
+      # all 5 PTv3 enc stages (finer -> coarser); finest get the most tokens.
+      scale_tokens: [192, 128, 96, 64, 32]
+      scale_stages: [0, 1, 2, 3, 4]
       latent_dim: 256
-      compressor_heads: 8
+      compressor_heads: 6        # must divide every used stage's enc_channels
       compressor_layers: 1
 
     # ----- per-scale residual vector quantizer -----
     quantizer:
-      n_q: 8                     # budget (256+128+64)*8 = 3584 <= 4096
-      codebook_size: 8192
+      n_q: 8                     # budget (192+128+96+64+32)*8 = 512*8 = 4096
+      codebook_size: [8192, 4096, 2048, 1024, 512]  # shrink coarse scales
       kmeans_init: true
       kmeans_iters: 10
-      threshold_ema_dead_code: 2
-      decay: 0.99
+      threshold_ema_dead_code: 4
+      decay: 0.95
       commitment_weight: 0.25
 
     # ----- edge-set decoder (512 edge queries: self-attn + cross-attn z_q) -----
@@ -47,12 +48,16 @@ model:
     w_exist: 2.0
     w_points: 5.0
     w_endpoint: 8.0
-    w_smooth: 0.5
-    w_seglen: 0.1
-    w_consistency: 1.0
+    w_sagitta: 2.0
+    w_smooth: 0.05
+    w_seglen: 0.0
+    w_consistency: 2.0
     w_commit: 0.25
-    focal_gamma: 2.0
+    focal_gamma: 0.0             # 0 -> calibrated BCE; >0 restores focal
     focal_alpha: 0.5
+    exist_label_smoothing: 0.02
+    exist_pos_weight_max: 20.0
+    curv_l1_scale: 4.0
     match_w_geo: 1.0
     match_w_exist: 0.5
 
@@ -64,6 +69,7 @@ model:
     edge_thresh: 0.5
     tau_merge: 0.015
     topk_edges: 0
+    min_edges: 1
     num_per_edge: 32
 
     # ----- eval metric -----
@@ -75,6 +81,7 @@ model:
     # ----- threshold-robust checkpoint selection -----
     val_edge_thresh_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
     val_tau_merge_grid: null
+    val_topk_edges_grid: [0, 64, 128]
 
     # ----- optimization -----
     # LR ~sqrt(8)x the single-GPU 3e-4 (global batch is 8x larger under DDP).

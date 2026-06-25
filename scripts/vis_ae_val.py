@@ -117,13 +117,16 @@ def decode_batch(
     edge_thresh: float | None = None,
     tau_merge: float | None = None,
     max_edges: int = 0,
+    min_edges: int | None = None,
 ) -> list[dict[str, np.ndarray]]:
     """Decode a batch of edge-set decoder outputs into wireframes (numpy).
 
     ``edge_thresh`` / ``tau_merge`` override the values baked into the
     checkpoint hyper-parameters when provided. ``max_edges`` caps the number of
     edges per shape: among the edges that clear ``edge_thresh`` only the
-    top-``max_edges`` by existence probability are kept (0 = no cap). Mirrors
+    top-``max_edges`` by existence probability are kept (0 = no cap).
+    ``min_edges`` is the floor (fall back to the top-k queries if too few clear
+    the threshold, so the wireframe is never empty). Mirrors
     ``export_submission.decode_batch`` so visualizations match the submission.
     """
     exist_prob = torch.sigmoid(out["edge_exist_logit"])     # (B, Q)
@@ -135,6 +138,8 @@ def decode_batch(
                 else hp.get("tau_merge", 0.015))
     npe = int(hp.get("num_per_edge", 32))
     me = max(0, int(max_edges))
+    mn = int(min_edges if min_edges is not None
+             else hp.get("min_edges", 1))
 
     wfs: list[dict[str, np.ndarray]] = []
     for i in range(b):
@@ -142,7 +147,7 @@ def decode_batch(
             edge_points[i].cpu().numpy(),
             exist_prob[i].cpu().numpy(),
             edge_threshold=et, tau_merge=tau, topk_edges=me,
-            num_per_edge=npe,
+            min_edges=mn, num_per_edge=npe,
         ))
     return wfs
 
@@ -593,6 +598,10 @@ def parse_args() -> argparse.Namespace:
                    help="hard cap on edges per shape: among edges passing "
                         "--edge-thresh, keep the top-k by probability "
                         "(0 = no cap). Mirrors the official top-k strategy.")
+    p.add_argument("--min-edges", type=int, default=1,
+                   help="floor on edges per shape: fall back to the top-k by "
+                        "probability if too few clear --edge-thresh (never "
+                        "empty). Mirrors the training / export default.")
     p.add_argument("--match-thresh", type=float, default=0.1)
     p.add_argument("--w-ccd", type=float, default=0.3)
     p.add_argument("--w-ta", type=float, default=0.4)
@@ -634,7 +643,7 @@ def main() -> None:
     tau = args.tau_merge if args.tau_merge is not None \
         else hp.get("tau_merge", 0.015)
     print(f"decode: edge_thresh={et} tau_merge={tau} "
-          f"max_edges={args.max_edges or 'inf'}")
+          f"max_edges={args.max_edges or 'inf'} min_edges={args.min_edges}")
 
     has_baseline = (args.split == "test" and not args.no_baseline)
     baseline_stems: set[str] = set()
@@ -695,7 +704,8 @@ def main() -> None:
                 decoder, out, hp,
                 edge_thresh=args.edge_thresh,
                 tau_merge=args.tau_merge,
-                max_edges=args.max_edges)
+                max_edges=args.max_edges,
+                min_edges=args.min_edges)
 
             if diag:
                 # Decode the SAME shapes from the continuous z (bypassing the

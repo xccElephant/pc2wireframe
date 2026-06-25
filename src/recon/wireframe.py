@@ -7,7 +7,10 @@ a connected wireframe ``{vertices, edge_index, edge_points}`` by **aggregating
 endpoints into shared vertices**:
 
 1. keep the edges whose existence probability clears ``edge_threshold`` (and,
-   optionally, only the ``topk_edges`` most-confident);
+   optionally, only the ``topk_edges`` most-confident); if fewer than
+   ``min_edges`` clear it, fall back to the ``min_edges`` most-confident edges
+   so the result is never empty (a miscalibrated threshold can no longer zero a
+   shape's score);
 2. collect the ``2E`` endpoints (``pts[0]`` / ``pts[-1]`` per kept edge) and
    **union-find merge** any two endpoints closer than ``tau_merge``; each
    cluster's (existence-weighted) mean is a shared vertex;
@@ -62,6 +65,7 @@ def aggregate_wireframe(
     edge_threshold: float = 0.5,
     tau_merge: float = 0.015,
     topk_edges: int = 0,
+    min_edges: int = 1,
     num_per_edge: int = 32,
 ) -> dict[str, np.ndarray]:
     """Aggregate per-edge curves into a connected wireframe.
@@ -73,6 +77,10 @@ def aggregate_wireframe(
         tau_merge: union-find endpoint merge radius (shared-vertex tolerance).
         topk_edges: among the kept edges, retain only the ``topk_edges`` most
             confident (``0`` = no cap).
+        min_edges: guarantee at least this many edges -- if fewer clear
+            ``edge_threshold`` fall back to the ``min_edges`` most-confident
+            queries, so a miscalibrated threshold can never emit an empty
+            (zero-scoring) wireframe (``0`` = allow empty, the old behaviour).
         num_per_edge: ``P`` (used only to shape an empty result).
     """
     edge_points = np.asarray(edge_points, dtype=np.float32)
@@ -81,10 +89,15 @@ def aggregate_wireframe(
         return _empty_wireframe(num_per_edge)
     p = edge_points.shape[1]
 
-    keep = edge_prob >= float(edge_threshold)
-    if not np.any(keep):
+    n_q = edge_prob.shape[0]
+    floor = max(0, int(min_edges))
+    kept = np.nonzero(edge_prob >= float(edge_threshold))[0]
+    if kept.shape[0] < floor:
+        # Threshold kept too few -> fall back to the top-`floor` queries so the
+        # shape is never empty (non-empty fraction stays ~1.0).
+        kept = np.argsort(edge_prob)[::-1][: min(floor, n_q)]
+    if kept.shape[0] == 0:
         return _empty_wireframe(p)
-    kept = np.nonzero(keep)[0]
     if topk_edges and kept.shape[0] > int(topk_edges):
         order = np.argsort(edge_prob[kept])[::-1][: int(topk_edges)]
         kept = kept[order]
