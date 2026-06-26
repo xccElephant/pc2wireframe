@@ -2,6 +2,9 @@ __pycache__/
 data/test/
 data/train/
 data/train_clean/
+data_old/
 artifacts/
+artifacts_old/
 pc2wireframe_baseline/
+pc2wireframe_baseline_old/
 logs/
