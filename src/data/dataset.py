@@ -129,6 +129,80 @@ def _split_loop(
     return far, arc1, arc2
 
 
+def _max_deviation_index(pts: np.ndarray) -> int:
+    """Index of the polyline point farthest from its chord (start -> end).
+
+    Used by the recursive complex-edge splitter to pick a split point. Returns
+    an interior index in ``[1, K-2]`` (or ``-1`` if the polyline is too short).
+    """
+    k = pts.shape[0]
+    if k < 3:
+        return -1
+    a = pts[0]
+    b = pts[-1]
+    ab = b - a
+    ab_len = float(np.linalg.norm(ab))
+    if ab_len < 1e-12:
+        # Degenerate chord: deviate by raw distance from the start instead.
+        dev = np.linalg.norm(pts - a, axis=1)
+    else:
+        u = ab / ab_len
+        rel = pts - a[None, :]
+        proj = rel @ u
+        perp = rel - proj[:, None] * u[None, :]
+        dev = np.linalg.norm(perp, axis=1)
+    m = int(np.argmax(dev))
+    if m <= 0 or m >= k - 1:
+        m = k // 2
+    if m <= 0 or m >= k - 1:
+        return -1
+    return m
+
+
+def _split_complex_polyline(
+    pts: np.ndarray,
+    *,
+    complex_ratio: float,
+    complex_min_arc: float,
+    max_depth: int,
+    _depth: int = 0,
+) -> list[np.ndarray]:
+    """Recursively split a "complex" open polyline into simpler sub-polylines.
+
+    An edge is *complex* (hard for a single 12-d curve latent to express) when
+    its arc length greatly exceeds its endpoint chord (large bend, big arc,
+    spiral / multiple windings). Such a polyline is split at its point of maximum
+    deviation from the chord, inserting a new vertex, and each half is processed
+    recursively until every segment is simple enough (``arclen/chord <=
+    complex_ratio``) or ``max_depth`` is reached. Consecutive returned segments
+    share endpoints, so the open edge becomes a chain of simple edges.
+
+    Returns a list of raw sub-polylines (not resampled); a simple edge yields a
+    single-element list ``[pts]``.
+    """
+    p = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    if _depth >= int(max_depth) or p.shape[0] < 3:
+        return [p]
+    chord = float(np.linalg.norm(p[-1] - p[0]))
+    arclen = _polyline_length(p)
+    if arclen <= float(complex_min_arc):
+        return [p]
+    # Treat a near-closed sub-arc (tiny chord but real arc) as complex too.
+    ratio = arclen / chord if chord > 1e-9 else float("inf")
+    if ratio <= float(complex_ratio):
+        return [p]
+    m = _max_deviation_index(p)
+    if m < 0:
+        return [p]
+    left = _split_complex_polyline(
+        p[: m + 1], complex_ratio=complex_ratio,
+        complex_min_arc=complex_min_arc, max_depth=max_depth, _depth=_depth + 1)
+    right = _split_complex_polyline(
+        p[m:], complex_ratio=complex_ratio,
+        complex_min_arc=complex_min_arc, max_depth=max_depth, _depth=_depth + 1)
+    return left + right
+
+
 def _clean_point_cloud(points: np.ndarray, max_points: int = 0) -> np.ndarray:
     """Clean a *variable-size* point cloud (no resampling to a fixed count).
 
@@ -325,6 +399,11 @@ class WireframeGraphDataset(Dataset):
         split_loops: bool = True,
         loop_close_tol: float = 1e-2,
         loop_min_arc: float = 5e-2,
+        # ----- complex (high arc/chord) edge splitting -----
+        split_complex: bool = True,
+        complex_ratio: float = 1.6,
+        complex_max_depth: int = 4,
+        complex_min_arc: float = 5e-2,
     ) -> None:
         super().__init__()
         self.format = GraphFormat(
@@ -338,6 +417,10 @@ class WireframeGraphDataset(Dataset):
         self.split_loops = bool(split_loops)
         self.loop_close_tol = float(loop_close_tol)
         self.loop_min_arc = float(loop_min_arc)
+        self.split_complex = bool(split_complex)
+        self.complex_ratio = float(complex_ratio)
+        self.complex_max_depth = int(complex_max_depth)
+        self.complex_min_arc = float(complex_min_arc)
         self.pointcloud_dirs = [
             os.path.expandvars(os.path.expanduser(d))
             for d in (pointcloud_dirs or [])
@@ -401,6 +484,39 @@ class WireframeGraphDataset(Dataset):
             vertices.append(v.astype(np.float32))
             return vertex_ids[key]
 
+        def add_open_polyline(poly: np.ndarray) -> None:
+            """Add one open polyline as one (or several, if complex) edges.
+
+            A "complex" edge (arc length >> endpoint chord: big arc / spiral /
+            multi-winding spline) is recursively split into simpler sub-edges
+            with inserted vertices, since a single 12-d curve latent cannot
+            faithfully represent it. Each resulting segment is resampled to
+            ``num_edge_points`` and added between its (deduplicated) endpoints.
+            """
+            poly = np.asarray(poly, dtype=np.float64).reshape(-1, 3)
+            if poly.shape[0] < 2:
+                return
+            if self.split_complex:
+                segments = _split_complex_polyline(
+                    poly,
+                    complex_ratio=self.complex_ratio,
+                    complex_min_arc=self.complex_min_arc,
+                    max_depth=self.complex_max_depth,
+                )
+            else:
+                segments = [poly]
+            for seg in segments:
+                seg = np.asarray(seg, dtype=np.float64).reshape(-1, 3)
+                if seg.shape[0] < 2:
+                    continue
+                a = get_vertex_id(seg[0].astype(np.float32))
+                b = get_vertex_id(seg[-1].astype(np.float32))
+                if a is None or b is None or a == b:
+                    continue
+                edge_index.append((a, b))
+                edge_points.append(
+                    _resample_polyline(seg, fmt.num_edge_points))
+
         for i in range(n_raw):
             if not (np.isfinite(start[i]).all() and np.isfinite(end[i]).all()):
                 continue
@@ -410,33 +526,21 @@ class WireframeGraphDataset(Dataset):
 
             # Closed-loop edge: endpoints (near-)coincident but the polyline
             # traverses a real arc (length >> chord). The endpoint-anchored curve
-            # frame is undefined for these (and used to be dropped by the u == v
-            # guard / blow up the curve VAE), so split the loop into two open
-            # arcs at the far point -- inserting a midpoint vertex turns it into
-            # a faithful 2-cycle between the junction and that far vertex.
+            # frame is undefined for these, so split the loop into two open arcs
+            # at the far point -- inserting a midpoint vertex turns it into a
+            # faithful 2-cycle. Each arc then goes through the generic complex
+            # splitter (a big arc may still need further subdivision).
             chord = float(np.linalg.norm(end[i] - start[i]))
             if self.split_loops and chord < self.loop_close_tol:
                 arclen = _polyline_length(pts_full)
                 if arclen > self.loop_min_arc and arclen > 4.0 * chord:
-                    split = _split_loop(pts_full, fmt.num_edge_points)
-                    if split is not None:
-                        far, arc1, arc2 = split
-                        u = get_vertex_id(start[i])
-                        w = get_vertex_id(far)
-                        if u is not None and w is not None and u != w:
-                            edge_index.append((u, w))
-                            edge_points.append(arc1)
-                            edge_index.append((w, u))
-                            edge_points.append(arc2)
-                            continue
+                    m = _max_deviation_index(pts_full)
+                    if m > 0:
+                        add_open_polyline(pts_full[: m + 1])
+                        add_open_polyline(pts_full[m:])
+                        continue
 
-            u = get_vertex_id(start[i])
-            v = get_vertex_id(end[i])
-            if u is None or v is None or u == v:
-                continue
-            edge_index.append((u, v))
-            edge_points.append(
-                _resample_polyline(pts_full, fmt.num_edge_points))
+            add_open_polyline(pts_full)
 
         nv = len(vertices)
         ne = len(edge_index)
@@ -618,11 +722,45 @@ def collate_ae_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return batch
 
 
+def unbatch_wireframe_graphs(batch: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split a collated batch back into per-shape GT wireframe dicts.
+
+    Slices the packed ``point_cloud`` by ``pc_offset`` and pairs each shape's
+    points with its ``gt_wireframes`` entry. Returns a list of length ``B`` with
+    ``{shape_id, point_cloud, vertices, edge_index, edge_points}`` tensors (the
+    point cloud is empty for prediction batches that carry no GT). Used by the
+    evaluation / visualisation scripts.
+    """
+    b = int(batch.get("num_graphs", len(batch.get("shape_id", []))))
+    shape_ids = batch.get("shape_id", [None] * b)
+    pc = batch.get("point_cloud")
+    offset = batch.get("pc_offset")
+    graphs = batch.get("gt_wireframes")
+    out: list[dict[str, Any]] = []
+    for s in range(b):
+        if pc is not None and offset is not None:
+            lo = int(offset[s - 1]) if s > 0 else 0
+            hi = int(offset[s])
+            pts = pc[lo:hi]
+        else:
+            pts = pc.new_zeros((0, 3)) if pc is not None else None
+        entry: dict[str, Any] = {"shape_id": shape_ids[s], "point_cloud": pts}
+        if graphs is not None:
+            entry.update(
+                vertices=graphs[s]["vertices"],
+                edge_index=graphs[s]["edge_index"],
+                edge_points=graphs[s]["edge_points"],
+            )
+        out.append(entry)
+    return out
+
+
 __all__ = [
     "GraphFormat",
     "WireframeGraphDataset",
     "PointCloudDataset",
     "collate_ae_batch",
+    "unbatch_wireframe_graphs",
     "list_npz",
     "make_split",
     "save_split",

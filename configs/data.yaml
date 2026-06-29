@@ -37,6 +37,14 @@ data:
     split_loops: true
     loop_close_tol: 0.01
     loop_min_arc: 0.05
+    # Complex edges (big arcs / spirals / multi-winding splines whose arc length
+    # >> endpoint chord) cannot be expressed by a single 12-d curve latent, so
+    # split them recursively at the max-deviation point into simpler sub-edges
+    # (inserting vertices) until arclen/chord <= complex_ratio or max_depth.
+    split_complex: true
+    complex_ratio: 1.6
+    complex_max_depth: 4
+    complex_min_arc: 0.05
     # Input point cloud kept at NATIVE size and packed for PTv3 (coord+offset);
     # 0 = keep all points. Set positive only as a memory safety cap.
     max_pc_points: 0

@@ -73,6 +73,14 @@ class WireframeDataModule(pl.LightningDataModule):
         split_loops: bool = True,
         loop_close_tol: float = 1e-2,
         loop_min_arc: float = 5e-2,
+        # ----- complex (high arc/chord) edge splitting -----
+        # A "complex" edge (arc length >> endpoint chord: big arc / spiral /
+        # multi-winding spline) is recursively split at its max-deviation point
+        # into simpler sub-edges so a single 12-d curve latent can express each.
+        split_complex: bool = True,
+        complex_ratio: float = 1.6,
+        complex_max_depth: int = 4,
+        complex_min_arc: float = 5e-2,
         # ----- data loader -----
         shuffle: bool = True,
         num_workers: int = 8,
@@ -118,6 +126,10 @@ class WireframeDataModule(pl.LightningDataModule):
             split_loops=self.hparams.split_loops,
             loop_close_tol=self.hparams.loop_close_tol,
             loop_min_arc=self.hparams.loop_min_arc,
+            split_complex=self.hparams.split_complex,
+            complex_ratio=self.hparams.complex_ratio,
+            complex_max_depth=self.hparams.complex_max_depth,
+            complex_min_arc=self.hparams.complex_min_arc,
         )
 
     # ------------------------------------------------------------------

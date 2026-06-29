@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Export a competition submission zip from the VQVAE WireframeAE model.
+"""Export a competition submission zip from the PC2Wireframe model.
 
-Serialises every test shape into the layout the official evaluator (and the
-``pc2wireframe_baseline`` submission) expect::
+Serialises every test shape into the layout the official evaluator expects::
 
     submission/
         latent_pack.npz                 # stems (N,)  + latents (N, K)
         sample_edge/<stem>.npz
-            latent       : (K,) float32, K <= 4096   (flat RVQ indices)
+            latent       : (K,) float32, K <= 4096   (flat 16x256 PC latent)
             vertices     : (V, 3) float32
             edge_index   : (E, 2) int32   (indexes into vertices)
             edge_points  : (E, 32, 3) float32
@@ -19,24 +18,20 @@ and finally zips ``submission/`` into ``submission.zip``.
 Pipeline per shape::
 
     raw test point cloud
-        --[UtoniaEncoder -> multi-scale z_s]-->
-        --[MultiScaleResidualVQ -> flat indices (K,)]-->     # the submission
-    flat indices
-        --[decode_indices -> z_q -> JointSetDecoder -> assemble_wireframe]-->
+        --[PTv3 encoder + latent compressor -> Z (16, 256)]-->   # the submission
+    latent Z
+        --[EdgeSetDecoder -> per-edge (confidence, endpoints, curve latent)]-->
+        --[frozen curve VAE decode + assemble_wireframe]-->
     wireframe {vertices, edge_index, edge_points}
 
-The wireframe is reconstructed from the **submitted indices** alone
-(indices -> codebooks -> z_q -> decoder), so the export is a guaranteed
-round-trip with the evaluator's view of the latent.
+The per-sample ``latent`` is the **flat 16 x 256 = 4096 float32** point-cloud
+latent (no RVQ indices). The wireframe is decoded from the same latent the
+evaluator stores, so the export is a faithful round-trip.
 
 Coordinate frame
 ----------------
-The model works directly in the **raw** point-cloud frame (no per-shape
-normalization), so vertices / curves are written as decoded.
-
-The per-sample ``latent`` is the flat RVQ index vector
-``(K,) = sum_s N_s * n_q`` floats (<= 4096, guaranteed by the
-``MultiScaleResidualVQ`` budget check at construction).
+The model works directly in the **normalized** point-cloud frame (the dataset is
+already unit-normalized), so vertices / curves are written as decoded.
 
 Usage (from the project root)::
 
@@ -51,12 +46,6 @@ Usage (from the project root)::
 
 Resume an interrupted run with ``--resume`` (skips shapes that already have an
 output npz and does NOT wipe the out-dir).
-
-Manual launch (instead of ``--spawn``)::
-
-    CUDA_VISIBLE_DEVICES=r python scripts/export_submission.py \
-        --world-size 8 --rank r --out-dir logs/submission   # for r in 0..7
-    python scripts/export_submission.py --merge-only --out-dir logs/submission
 """
 from __future__ import annotations
 
@@ -77,19 +66,14 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.data.dataset import PointCloudDataset, collate_ae_batch  # noqa: E402
-from src.models.joint_set_decoder import JointSetDecoder  # noqa: E402
-from src.models.quantizer import MultiScaleResidualVQ  # noqa: E402
-from src.models.utonia_encoder import UtoniaEncoder  # noqa: E402
-from src.models.vae import AutoencoderKL1D  # noqa: E402
-from src.models.vae.curve_packing import decode_curve_latent  # noqa: E402
-from src.recon import assemble_wireframe  # noqa: E402
+from src.module import PC2WireframeModule  # noqa: E402
 
 NUM_EDGE_POINTS = 32
 LATENT_BUDGET = 4096
 
 
 # ----------------------------------------------------------------------
-# Checkpoint loading (build encoder + decoder directly; no pytorch3d import)
+# Checkpoint loading
 # ----------------------------------------------------------------------
 def _resolve_ckpt(path: str, metric: str = "val_score", best: str = "max") -> str:
     """Resolve a checkpoint file or pick the best one in a directory."""
@@ -113,113 +97,17 @@ def _resolve_ckpt(path: str, metric: str = "val_score", best: str = "max") -> st
     raise FileNotFoundError(f"Checkpoint path not found: {path!r}")
 
 
-def _strip_prefix(state: dict[str, torch.Tensor], prefix: str
-                  ) -> dict[str, torch.Tensor]:
-    return {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+def load_model(ckpt_path: str, device: str) -> PC2WireframeModule:
+    """Load a ``PC2WireframeModule`` from a Lightning checkpoint.
 
-
-def load_model(ckpt_path: str, device: str
-               ) -> tuple[UtoniaEncoder, MultiScaleResidualVQ,
-                          JointSetDecoder, AutoencoderKL1D, dict[str, Any]]:
-    """Build the encoder + RVQ + joint decoder + curve VAE from a checkpoint."""
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    hp = ck.get("hyper_parameters", {}) or {}
-    state = ck["state_dict"] if "state_dict" in ck else ck
-
-    encoder = UtoniaEncoder(**(hp.get("pc_encoder") or {}))
-    quantizer = MultiScaleResidualVQ(
-        scale_tokens=encoder.scale_tokens,
-        dim=encoder.latent_dim,
-        **(hp.get("quantizer") or {}),
-    )
-    curve_vae = AutoencoderKL1D(**(hp.get("curve_vae") or {}))
-    dec_cfg = dict(hp.get("decoder") or {})
-    dec_cfg.setdefault("num_scales", len(encoder.scale_tokens))
-    dec_cfg.setdefault("latent_dim", encoder.latent_dim)
-    dec_cfg["curve_latent_dim"] = int(
-        curve_vae.config.latent_channels * curve_vae.latent_len)
-    decoder = JointSetDecoder(**dec_cfg)
-
-    miss_e, unexp_e = encoder.load_state_dict(
-        _strip_prefix(state, "encoder."), strict=False)
-    miss_q, unexp_q = quantizer.load_state_dict(
-        _strip_prefix(state, "quantizer."), strict=False)
-    miss_d, unexp_d = decoder.load_state_dict(
-        _strip_prefix(state, "decoder."), strict=False)
-    miss_c, unexp_c = curve_vae.load_state_dict(
-        _strip_prefix(state, "curve_vae."), strict=False)
-
-    comp_missing = [k for k in miss_e if not k.startswith("backbone.")]
-    if comp_missing:
-        print(f"[warn] missing encoder (compressor) keys: {comp_missing}")
-    if unexp_e:
-        print(f"[warn] unexpected encoder keys: {unexp_e[:8]}"
-              f"{' ...' if len(unexp_e) > 8 else ''}")
-    if miss_q:
-        print(f"[warn] missing quantizer keys: {miss_q[:8]}"
-              f"{' ...' if len(miss_q) > 8 else ''}")
-    if miss_d:
-        print(f"[warn] missing decoder keys: {miss_d}")
-    if unexp_d:
-        print(f"[warn] unexpected decoder keys: {unexp_d}")
-    if miss_c:
-        print(f"[warn] missing curve_vae keys: {miss_c[:8]}"
-              f"{' ...' if len(miss_c) > 8 else ''}")
-    if unexp_c:
-        print(f"[warn] unexpected curve_vae keys: {unexp_c[:8]}"
-              f"{' ...' if len(unexp_c) > 8 else ''}")
-
-    encoder.eval().to(device)
-    quantizer.eval().to(device)
-    decoder.eval().to(device)
-    curve_vae.eval().to(device)
-    return encoder, quantizer, decoder, curve_vae, hp
-
-
-# ----------------------------------------------------------------------
-# Decode: encoder latent + decoder fields -> wireframe (mirrors module.decode)
-# ----------------------------------------------------------------------
-@torch.no_grad()
-def decode_batch(
-    out: dict[str, torch.Tensor],
-    curve_vae: AutoencoderKL1D,
-    hp: dict[str, Any],
-    *,
-    vthr: float | None = None,
-    ethr: float | None = None,
-    min_edges: int | None = None,
-) -> list[dict[str, np.ndarray]]:
-    """Assemble joint vertex+edge decoder outputs into wireframes (numpy).
-
-    ``vthr`` / ``ethr`` (vertex / edge existence thresholds) override the values
-    baked into the checkpoint when provided. Each edge's endpoints are the top-2
-    vertices under the association matrix; the decoded canonical curve is then
-    denormalised onto them. ``min_edges`` is the floor so the wireframe is never
-    empty.
+    ``curve_vae_ckpt`` is overridden to ``None`` so loading does not depend on a
+    (possibly stale) stage-1 path -- the frozen curve VAE weights live in the
+    stage-2 state_dict.
     """
-    npe = int(hp.get("num_per_edge", NUM_EDGE_POINTS))
-    vt = float(vthr if vthr is not None else hp.get("vthr", 0.5))
-    et = float(ethr if ethr is not None else hp.get("ethr", 0.5))
-    mn = int(min_edges if min_edges is not None else hp.get("min_edges", 1))
-    mv = int(hp.get("min_vertices", 2))
-
-    vprob = torch.sigmoid(out["vertex_exist_logit"]).cpu().numpy()
-    vcoord = out["vertex_coord"].cpu().numpy()
-    eprob = torch.sigmoid(out["edge_exist_logit"]).cpu().numpy()
-    assoc = torch.sigmoid(out["assoc_logit"]).cpu().numpy()
-    b, ne, _ = out["curve_latent"].shape
-    flat = out["curve_latent"].reshape(b * ne, -1)
-    curves = decode_curve_latent(
-        curve_vae, flat, num_points=npe, pin_endpoints=True)
-    curves = curves.reshape(b, ne, npe, 3).cpu().numpy()
-    return [
-        assemble_wireframe(
-            vprob[i], vcoord[i], eprob[i], assoc[i], curves[i],
-            vthr=vt, ethr=et, num_per_edge=npe,
-            min_vertices=mv, min_edges=mn,
-        )
-        for i in range(b)
-    ]
+    model = PC2WireframeModule.load_from_checkpoint(
+        ckpt_path, map_location="cpu", curve_vae_ckpt=None)
+    model.eval().to(device)
+    return model
 
 
 # ----------------------------------------------------------------------
@@ -264,8 +152,6 @@ def _build_sample_npz(
         for e in range(n_edges):
             ep[e] = _resample_curve(raw_ep[e], num_per_edge)
     else:
-        # No usable curves: synthesise straight 32-point polylines from the
-        # endpoint vertices so the field stays consistent with edge_index.
         ep = np.zeros((n_edges, num_per_edge, 3), dtype=np.float32)
         if n_edges and vertices.shape[0]:
             t = np.linspace(0.0, 1.0, num_per_edge)[None, :, None]
@@ -301,7 +187,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ckpt",
         default="logs/pc2wireframe/checkpoints",
-        help="WireframeAE ckpt file or dir (best val_score auto-picked)")
+        help="PC2WireframeModule ckpt file or dir (best val_score auto-picked)")
     p.add_argument("--device",
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--test-pc-dir", default="data/test/sample_pointcloud",
@@ -312,17 +198,14 @@ def parse_args() -> argparse.Namespace:
                    help="shapes encoded/decoded per forward pass")
     p.add_argument("--max-pc-points", type=int, default=0,
                    help="cap input cloud size (0 = native); memory knob only")
-    # decode post-processing (override the thresholds baked into the ckpt)
-    p.add_argument("--vthr", type=float, default=None,
-                   help="keep a vertex iff sigmoid(exist) >= this "
-                        "(default: the value baked into the checkpoint)")
+    # decode post-processing (override the values baked into the ckpt)
     p.add_argument("--ethr", type=float, default=None,
-                   help="keep an edge iff sigmoid(exist) >= this "
+                   help="keep an edge iff sigmoid(confidence) >= this "
                         "(default: the value baked into the checkpoint)")
+    p.add_argument("--merge-tol", type=float, default=None,
+                   help="endpoint merge tolerance (default: from the checkpoint)")
     p.add_argument("--min-edges", type=int, default=1,
-                   help="floor on edges per shape: if fewer pass --ethr, fall "
-                        "back to the top-k by probability so the wireframe is "
-                        "never empty (0 = allow empty).")
+                   help="floor on edges per shape (top-k fallback; 0 = allow empty)")
     p.add_argument("--limit", type=int, default=0,
                    help="only export the first N shapes (0 = all; debugging)")
     p.add_argument("--no-progress", action="store_true")
@@ -331,19 +214,15 @@ def parse_args() -> argparse.Namespace:
                    help="launch N worker processes (one per GPU) then merge; "
                         "0 = run in this single process")
     p.add_argument("--gpus", default=None,
-                   help="comma-separated GPU ids for --spawn "
-                        "(default 0..spawn-1)")
+                   help="comma-separated GPU ids for --spawn (default 0..spawn-1)")
     p.add_argument("--world-size", type=int, default=1,
                    help="[worker] total number of shards")
     p.add_argument("--rank", type=int, default=0,
                    help="[worker] this shard id in [0, world-size)")
     p.add_argument("--merge-only", action="store_true",
-                   help="skip inference; just build latent_pack + zip from "
-                        "an already-populated --out-dir")
+                   help="skip inference; just build latent_pack + zip")
     p.add_argument("--resume", action="store_true",
-                   help="skip shapes that already have "
-                        "submission/sample_edge/<stem>.npz (do NOT wipe the "
-                        "out-dir); continue an interrupted export")
+                   help="skip shapes that already have an output npz")
     return p.parse_args()
 
 
@@ -356,11 +235,16 @@ def run_worker(args: argparse.Namespace) -> None:
 
     ckpt = _resolve_ckpt(args.ckpt, "val_score", "max")
     print(f"[rank {rank}] ckpt: {ckpt}")
-    print(f"[rank {rank}] decode: vthr={args.vthr} ethr={args.ethr} "
+    print(f"[rank {rank}] decode: ethr={args.ethr} merge_tol={args.merge_tol} "
           f"min_edges={args.min_edges}")
-    encoder, quantizer, decoder, curve_vae, hp = load_model(ckpt, args.device)
-
-    k_latent = int(quantizer.total_indices)
+    model = load_model(ckpt, args.device)
+    num_per_edge = int(model.hparams.num_per_edge)
+    ethr = (args.ethr if args.ethr is not None else float(model.hparams.ethr))
+    merge_tol = (args.merge_tol if args.merge_tol is not None
+                 else float(model.hparams.merge_tol))
+    # min_edges override applied through the module's hparam.
+    model.hparams.min_edges = int(args.min_edges)
+    k_latent = int(model.pc_encoder.compressor.latent_budget)
 
     dataset = PointCloudDataset(
         pointcloud_dir=args.test_pc_dir, max_pc_points=args.max_pc_points)
@@ -396,7 +280,7 @@ def run_worker(args: argparse.Namespace) -> None:
         try:
             from tqdm import tqdm
             pbar = tqdm(total=len(shard), unit="shape", desc="export")
-        except Exception:  # noqa: BLE001 - tqdm is optional
+        except Exception:  # noqa: BLE001
             pbar = None
     heartbeat = max(1, len(shard) // 20)
     done = 0
@@ -458,22 +342,15 @@ def run_worker(args: argparse.Namespace) -> None:
         offset = batch["pc_offset"].to(args.device)
 
         with torch.no_grad():
-            z_list = encoder(pc, offset)                  # list[(b, N_s, D)]
-            indices = quantizer(z_list)["indices"]        # (b, T) submission
-            # Decode from the *submitted* indices (round-trip): indices ->
-            # codebooks -> z_q -> graph decoder.
-            z_q = quantizer.decode_indices(indices)
-            out = decoder(z_q)
-            preds = decode_batch(
-                out, curve_vae, hp,
-                vthr=args.vthr, ethr=args.ethr, min_edges=args.min_edges)
+            out = model.forward(pc, offset, sample=False)
+            preds = model._assemble(out["preds"], ethr=ethr, merge_tol=merge_tol)
+            z = out["z"].reshape(out["z"].shape[0], -1).detach().cpu().numpy()
 
         for j, s in enumerate(samples):
             stem = str(s["shape_id"])
-            latent = indices[j].detach().cpu().numpy().reshape(-1)
+            latent = z[j].reshape(-1)
             try:
-                sample_npz = _build_sample_npz(
-                    preds[j], latent, NUM_EDGE_POINTS)
+                sample_npz = _build_sample_npz(preds[j], latent, num_per_edge)
             except Exception as exc:  # noqa: BLE001
                 n_failed += 1
                 print(f"[rank {rank}] decode failed {stem}: {exc}; "
@@ -504,9 +381,9 @@ def run_merge(args: argparse.Namespace) -> None:
     all_stems: list[str] = []
     all_latents: list[np.ndarray] = []
     widths: set[int] = set()
-    n_no_edges = 0          # empty wireframes (no edges => zero score)
-    n_no_verts = 0          # empty wireframes (no vertices at all)
-    n_zero_latent = 0       # latent is all-zeros (decode/load fallback)
+    n_no_edges = 0
+    n_no_verts = 0
+    n_zero_latent = 0
     empty_stems: list[str] = []
     for f in files:
         stem = os.path.splitext(os.path.basename(f))[0]
@@ -536,9 +413,6 @@ def run_merge(args: argparse.Namespace) -> None:
     if not all_stems:
         raise RuntimeError("No latents found in sample npz; nothing to merge.")
 
-    # Surface empty / fallback wireframes loudly: they serialise fine and never
-    # abort the export, but score ~0, so a silent pile of them quietly tanks the
-    # submission.
     n = len(all_stems)
     if n_no_edges or n_no_verts or n_zero_latent:
         pct = 100.0 * n_no_edges / max(1, n)
@@ -621,10 +495,10 @@ def orchestrate(args: argparse.Namespace) -> None:
         "--max-pc-points", str(args.max_pc_points),
         "--min-edges", str(args.min_edges),
     ]
-    if args.vthr is not None:
-        base += ["--vthr", str(args.vthr)]
     if args.ethr is not None:
         base += ["--ethr", str(args.ethr)]
+    if args.merge_tol is not None:
+        base += ["--merge-tol", str(args.merge_tol)]
     if args.limit and args.limit > 0:
         base += ["--limit", str(args.limit)]
     if args.resume:

@@ -1,0 +1,136 @@
+# Stage 2/2 (8x A800 DDP) -- train the end-to-end point-cloud -> wireframe model.
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe_ddp.yaml \
+#       --model.curve_vae_ckpt <stage1.ckpt>
+#
+# Multi-GPU twin of pc2wireframe.yaml: identical model, DDP trainer + an LR
+# scaled for the larger global batch (data.batch_size * 8). The curve VAE
+# (stage 1) is frozen -- set its ckpt path below. Keep in sync with
+# pc2wireframe.yaml.
+seed_everything: 3407
+
+model:
+  class_path: src.module.PC2WireframeModule
+  init_args:
+    # ----- point-cloud encoder: PTv3 backbone + latent-compressor head -----
+    pc_encoder:
+      in_channels: 3
+      grid_size: 0.01
+      cls_mode: false
+      enc_depths:    [2, 2, 2, 6, 2]
+      enc_channels:  [32, 64, 128, 256, 512]
+      enc_num_head:  [2, 4, 8, 16, 32]
+      enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+      dec_depths:    [2, 2, 2, 2]
+      dec_channels:  [64, 64, 128, 256]
+      dec_num_head:  [4, 4, 8, 16]
+      dec_patch_size: [1024, 1024, 1024, 1024]
+      stride:        [2, 2, 2, 2]
+      enable_flash: true
+      latent_num: 16
+      latent_dim: 256
+      compressor_heads: 8
+      compressor_layers: 2
+      variational: true
+
+    # ----- edge-set DETR decoder -----
+    decoder:
+      num_edge_queries: 512
+      d_model: 512
+      nhead: 8
+      dim_ff: 2048
+      num_layers: 6
+      dropout: 0.1
+      deep_supervision: true
+
+    # ----- frozen curve VAE -- MUST match the stage-1 architecture -----
+    curve_vae:
+      latent_channels: 3
+      sample_points_num: 32
+      down_block_types: ["DownBlock1D", "DownBlock1D", "DownBlock1D"]
+      block_out_channels: [128, 256, 256]
+      layers_per_block: 2
+
+    # ----- frozen curve VAE warm-start (set to your stage-1 best ckpt) -----
+    curve_vae_ckpt: null
+
+    # ----- loss weights -----
+    kl_weight: 1.0e-4
+    edge_exist_weight: 2.0
+    endpoint_weight: 5.0
+    curve_weight: 5.0
+    curve_endpoint_weight: 2.0
+    lat_reg_weight: 0.1
+    aux_weight: 1.0
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    exist_pos_weight_max: 40.0
+
+    # ----- Hungarian matching costs -----
+    match_endpoint: 5.0
+    match_exist: 1.0
+    match_lat: 1.0
+
+    # ----- decode (validation / predict) -----
+    ethr: 0.5
+    merge_tol: 0.04
+    min_edges: 1
+    num_per_edge: 32
+    enms_tol: 0.05
+    prune_dangling: false
+
+    # ----- eval metric -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_match_thresh: 0.1
+
+    # ----- threshold-robust checkpoint selection ((ethr, merge_tol) grid) -----
+    val_ethr_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
+    val_merge_tol_grid: [0.02, 0.04, 0.06]
+
+    # ----- optimization -----
+    # LR ~sqrt(8)x the single-GPU 1.5e-4 (global batch is 8x larger under DDP).
+    lr: 4.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    max_steps: 300000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 300
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 8                    # 8x A800; for single GPU use configs/pc2wireframe.yaml
+  num_nodes: 1
+  # All trainable params (PTv3 enc+dec, compressor, every edge-decoder head incl.
+  # the deep-supervision aux layers) contribute to the loss on each step, and the
+  # frozen curve VAE has requires_grad=False (DDP ignores it), so plain DDP is
+  # safe -- no need for the slower find_unused_parameters pass.
+  strategy: ddp
+  sync_batchnorm: false         # models use Layer/GroupNorm, not BatchNorm
+  use_distributed_sampler: true # shard the dataset across ranks
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: stage2_pc2wireframe_ddp
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score_best:.4f}
+        monitor: val/score_best
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

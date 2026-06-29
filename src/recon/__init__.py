@@ -1,12 +1,13 @@
-"""Wireframe reconstruction from the joint decoder fields.
+"""Wireframe reconstruction from the edge-set decoder predictions.
 
-:func:`assemble_wireframe` turns the joint vertex+edge decoder's predictions into
-the GT schema ``{vertices, edge_index, edge_points}`` consumed by
-:mod:`src.metrics` and the submission export: it thresholds the predicted
-vertices/edges, picks each edge's endpoints from the edge->vertex association
-matrix (top-2 per edge) and denormalises the decoded canonical curves onto them
-(see :mod:`src.recon.joint_wireframe`).
+:func:`assemble_wireframe` turns the edge-set decoder's predictions (per-edge
+existence + endpoints + decoded canonical curve) into the GT schema
+``{vertices, edge_index, edge_points}`` consumed by :mod:`src.metrics` and the
+submission export: it thresholds the edges, merges the free endpoints into a
+shared vertex set (confidence-weighted), suppresses near-duplicate edges with an
+E-NMS and denormalises the decoded canonical curves onto the merged endpoints
+(see :mod:`src.recon.edge_wireframe`).
 """
-from .joint_wireframe import assemble_wireframe
+from .edge_wireframe import assemble_wireframe
 
 __all__ = ["assemble_wireframe"]

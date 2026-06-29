@@ -1,4 +1,4 @@
-"""VAE stack for the joint vertex+edge branch: per-curve VAE + curve helpers.
+"""VAE stack for the wireframe pipeline: per-curve VAE + curve helpers.
 
 The per-curve VAE is a custom **pure-PyTorch** attention/token model with no
 ``diffusers`` / ``x_transformers`` dependency:
@@ -7,12 +7,11 @@ The per-curve VAE is a custom **pure-PyTorch** attention/token model with no
     small token latent and decodes it at arbitrary parametric ``t`` (see
     ``vae_curve.py``).
 
-Unlike the original two-stage pipeline, the joint branch trains this VAE
-**jointly** with the decoder (no freezing): the edge head learns to emit latents
-the shared, trainable decoder recognises, while an autoencoding anchor path
-keeps the latent space meaningful (see ``src/models/joint_set_criterion.py``).
-``curve_packing`` holds the canonicalisation / latent (de)coding helpers shared
-by the criterion and the reconstruction.
+It is trained **alone** in stage 1 (``CurveVAEModule``) and then loaded
+**frozen** in stage 2 (``PC2WireframeModule``), where the edge-set decoder emits
+a per-edge curve latent that this VAE decodes into a polyline. ``curve_packing``
+holds the canonicalisation / latent (de)coding helpers shared by the criterion
+and the reconstruction.
 """
 from __future__ import annotations
 

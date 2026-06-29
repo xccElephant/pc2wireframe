@@ -1,0 +1,137 @@
+# Stage 2/2 -- train the end-to-end point-cloud -> wireframe model (edge-set DETR).
+# Run with:
+#   python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe.yaml \
+#       --model.curve_vae_ckpt <stage1.ckpt>
+#
+# point cloud -> PTv3 encoder + latent compressor -> 16x256 latent Z
+# -> EdgeSetDecoder (512 edge queries cross-attend Z) -> per edge:
+#    existence confidence + two endpoints (tanh) + 12-d curve VAE latent
+# -> frozen curve VAE decodes the latent -> denormalise onto merged endpoints
+# -> wireframe {vertices, edge_index, edge_points}. The curve VAE (stage 1) is
+# loaded frozen via `curve_vae_ckpt` -- point at your best stage-1 checkpoint.
+# For 8x A800 DDP use configs/pc2wireframe_ddp.yaml.
+seed_everything: 3407
+
+model:
+  class_path: src.module.PC2WireframeModule
+  init_args:
+    # ----- point-cloud encoder: PTv3 backbone + latent-compressor head -----
+    pc_encoder:
+      in_channels: 3          # 3 = xyz, 6 = xyz + normals
+      grid_size: 0.01         # PTv3 voxel size (data is normalized to ~[-1,1])
+      cls_mode: false         # false = dense decoder features (better localized)
+      enc_depths:    [2, 2, 2, 6, 2]
+      enc_channels:  [32, 64, 128, 256, 512]
+      enc_num_head:  [2, 4, 8, 16, 32]
+      enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+      dec_depths:    [2, 2, 2, 2]
+      dec_channels:  [64, 64, 128, 256]
+      dec_num_head:  [4, 4, 8, 16]
+      dec_patch_size: [1024, 1024, 1024, 1024]
+      stride:        [2, 2, 2, 2]
+      enable_flash: true
+      # 16 * 256 = 4096 floats (competition latent budget).
+      latent_num: 16
+      latent_dim: 256
+      compressor_heads: 8
+      compressor_layers: 2     # post-pooling Transformer decoder layers on the 16 latent tokens
+      variational: true
+
+    # ----- edge-set DETR decoder (512 edge queries cross-attend the latent) -----
+    decoder:
+      num_edge_queries: 512    # >= data.yaml max_edges (one query per candidate edge)
+      d_model: 512
+      nhead: 8
+      dim_ff: 2048
+      num_layers: 6
+      dropout: 0.1
+      deep_supervision: true   # supervise every intermediate decoder layer
+
+    # ----- frozen curve VAE -- MUST match the stage-1 architecture -----
+    curve_vae:
+      latent_channels: 3
+      sample_points_num: 32
+      down_block_types: ["DownBlock1D", "DownBlock1D", "DownBlock1D"]
+      block_out_channels: [128, 256, 256]
+      layers_per_block: 2
+
+    # ----- frozen curve VAE warm-start (set to your stage-1 best ckpt) -----
+    curve_vae_ckpt: null
+
+    # ----- loss weights -----
+    kl_weight: 1.0e-4          # KL on the PC-encoder latent
+    edge_exist_weight: 2.0     # edge existence focal/BCE
+    endpoint_weight: 5.0       # matched-edge endpoint L1 (orientation-free)
+    curve_weight: 5.0          # curve L1 (decode(curve_latent) vs GT canonical)
+    curve_endpoint_weight: 2.0 # curve endpoint L1 (canonical [-1,0,0]/[1,0,0])
+    lat_reg_weight: 0.1        # small L2(curve_latent, sg(mu)) manifold regulariser
+    aux_weight: 1.0            # deep-supervision weight on intermediate layers
+    focal_alpha: 0.25
+    focal_gamma: 2.0           # >0 -> focal existence; 0 -> calibrated BCE
+    exist_pos_weight_max: 40.0
+
+    # ----- Hungarian matching costs -----
+    match_endpoint: 5.0        # endpoint L1 (orientation-free) weight
+    match_exist: 1.0           # existence reward
+    match_lat: 1.0             # curve-latent L1 (vs GT posterior mean) weight
+
+    # ----- decode (validation / predict): assemble the predicted edge set -----
+    ethr: 0.5                  # keep an edge iff sigmoid(confidence) >= ethr
+    merge_tol: 0.04            # endpoints within this distance merge into a vertex
+    min_edges: 1               # floor: top-k fallback so a shape is never empty
+    num_per_edge: 32           # points per reconstructed edge curve
+    enms_tol: 0.05             # edge E-NMS midpoint tolerance (dedup parallel arcs)
+    prune_dangling: false      # prune degree-1 dangling edges (off by default)
+
+    # ----- eval metric: CCD / TA / VPE -> weighted final score -----
+    eval_w_ccd: 0.3
+    eval_w_ta: 0.4
+    eval_w_vpe: 0.3
+    eval_match_thresh: 0.1
+
+    # ----- threshold-robust checkpoint selection ((ethr, merge_tol) grid) -----
+    # val/score is recomputed over this grid each epoch; the max is logged as
+    # val/score_best (monitored by ModelCheckpoint).
+    val_ethr_grid: [0.3, 0.4, 0.5, 0.6, 0.7]
+    val_merge_tol_grid: [0.02, 0.04, 0.06]
+
+    # ----- optimization -----
+    lr: 1.5e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+    # LR cosine horizon: a fallback -- the scheduler primarily uses
+    # trainer.estimated_stepping_batches (tracks max_epochs/devices).
+    max_steps: 300000
+    grad_clip: 1.0
+
+trainer:
+  max_epochs: 300
+  check_val_every_n_epoch: 5
+  accelerator: gpu
+  devices: 1                    # single GPU; use configs/pc2wireframe_ddp.yaml for 8x A800
+  num_nodes: 1
+  strategy: auto
+  precision: 32-true
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  logger:
+    class_path: WandbLogger
+    init_args:
+      save_dir: logs
+      project: pc2wireframe
+      name: stage2_pc2wireframe
+      log_model: false
+  callbacks:
+    - class_path: ModelCheckpoint
+      init_args:
+        filename: epoch={epoch:03d}-val_score={val/score_best:.4f}
+        monitor: val/score_best
+        verbose: false
+        save_last: true
+        save_top_k: 3
+        mode: max
+        auto_insert_metric_name: false
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: step

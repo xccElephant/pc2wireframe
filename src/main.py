@@ -1,28 +1,29 @@
-"""LightningCLI entry point for the VQVAE WireframeAE PC2Wireframe branch.
+"""LightningCLI entry point for the staged PC2Wireframe pipeline.
 
-A single trainable end-to-end discrete autoencoder (frozen PTv3 encoder +
-multi-scale compressors + per-scale ResidualVQ + graph decoder) and datamodule
-are resolved from ``class_path`` in the configs::
+The model (``CurveVAEModule`` for stage 1 / ``PC2WireframeModule`` for stage 2)
+and datamodule are resolved from ``class_path`` in the configs::
 
-    # train (single GPU)
+    # stage 1: curve VAE
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/vqvae.yaml
+        --config configs/curve_vae.yaml
 
-    # train (8x A800 DDP)
+    # stage 2: point cloud -> wireframe (curve VAE frozen)
     python -m src.main fit \
         --config configs/data.yaml \
-        --config configs/vqvae_ddp.yaml
+        --config configs/pc2wireframe.yaml \
+        --model.curve_vae_ckpt <stage1.ckpt>
 
     # validate a checkpoint
     python -m src.main validate \
         --config configs/data.yaml \
-        --config configs/vqvae.yaml \
-        --ckpt_path <vqvae.ckpt>
+        --config configs/pc2wireframe.yaml \
+        --ckpt_path <pc2wireframe.ckpt>
 
 Submission export uses ``scripts/export_submission.py`` (single forward:
-encode -> RVQ indices -> decode). ``--ckpt_path`` is Lightning's own arg to
-resume a run / load weights for ``predict`` / ``validate``.
+encode -> 16x256 latent -> edge-set decode -> merge). ``--ckpt_path`` is
+Lightning's own arg to resume a run / load weights for ``predict`` /
+``validate``.
 """
 import pyrootutils
 import torch

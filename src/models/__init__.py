@@ -1,22 +1,18 @@
-"""PC2Wireframe (VQVAE branch) model package.
+"""PC2Wireframe model package (PTv3 encoder + edge-query DETR decoder).
 
-Lightweight modules (``LatentCompressor``, ``UtoniaEncoder``,
-``MultiScaleResidualVQ``, ``JointSetDecoder``, ``JointSetCriterion``) are
-exported eagerly; the heavy backbone (the frozen Utonia PTv3) is imported lazily
-inside ``UtoniaEncoder`` and ``vector-quantize-pytorch`` lazily inside the
-quantizer, so this package can be imported without the full dependency set
-installed.
+Lightweight modules (``LatentCompressor``, ``PCEncoder``, ``EdgeSetDecoder``,
+``EdgeSetCriterion``) are exported eagerly; the heavy vendored stacks (PTv3, the
+curve VAE) are imported lazily inside those classes so this package can be
+imported without the full dependency set installed.
 """
+from .edge_set_criterion import EdgeSetCriterion
+from .edge_set_decoder import EdgeSetDecoder
 from .latent_compressor import LatentCompressor
-from .utonia_encoder import UtoniaEncoder
-from .joint_set_decoder import JointSetDecoder
-from .joint_set_criterion import JointSetCriterion
-from .quantizer import MultiScaleResidualVQ
+from .pc_encoder import PCEncoder
 
 __all__ = [
     "LatentCompressor",
-    "UtoniaEncoder",
-    "JointSetDecoder",
-    "JointSetCriterion",
-    "MultiScaleResidualVQ",
+    "PCEncoder",
+    "EdgeSetDecoder",
+    "EdgeSetCriterion",
 ]

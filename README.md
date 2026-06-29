@@ -1,6 +1,6 @@
 <div align="center">
 
-# CAD Wireframe 神经压缩挑战赛 — VQVAE 分支
+# CAD Wireframe 神经压缩挑战赛 — PTv3 + Edge-Query DETR 分支
 
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
 <a href="https://pytorchlightning.ai/"><img alt="Lightning" src="https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white"></a>
@@ -14,105 +14,118 @@
 
 ## 框架概览
 
-`点云 -> 冻结 Utonia PTv3(多尺度)-> 每尺度 compressor -> 每尺度 ResidualVQ -> 拼接索引(≤4096,提交)-> 联合顶点+边解码器 -> wireframe`。
+`点云 -> PTv3 编码器+解码器 -> LatentCompressor(16×256) -> latent Z -> EdgeSetDecoder(512 条 edge query) -> 每条边(置信度 + 两端点 + 12 维曲线 latent) -> 冻结曲线 VAE 解码 -> 顶点 merge 重建 -> wireframe`。
 
-整条流水线是一个**端到端单阶段离散自编码器(VQVAE)**:编码器把原始点云压成**多尺度**的连续 token,每个尺度用独立的残差向量量化器(ResidualVQ)离散成码本索引;**拼接后的扁平索引**(`Σ_s N_s·n_q ≤ 4096`)即比赛提交内容。解码器**仅凭这些索引**(索引 → 码本 → `z_q` → 解码器)用一个**联合顶点+边集合解码器**重建 wireframe:几何与拓扑被解耦到专门的 head ——
+整条流水线是 **WireframeDETR / PBWR 风格的 edge-set 回归**(直接预测一组边并做匈牙利匹配),分**两个独立阶段**训练:
 
-- **顶点 query** → 顶点 head:存在性 + 坐标(几何干净,不靠端点合并);
-- **边 query** → 边 head:存在性 + **12 维曲线 VAE latent**(`latent_channels 3 × latent_len 4`);
-- **边↔顶点关联矩阵 `A`**:显式拓扑(不用 union-find,也不用 V×V 两两分类)。
+1. **阶段 1 — 曲线 VAE**(`CurveVAEModule`):在规范化后的 GT 曲线上单独训练逐曲线 VAE(`AutoencoderKL1D`,端点钉在 `[-1,0,0]`/`[1,0,0]`,`3 通道 × 4 latent_len = 12 维` latent)。
+2. **阶段 2 — 点云 → wireframe**(`PC2WireframeModule`):PTv3 编码器 + LatentCompressor + EdgeSetDecoder **联合训练**,曲线 VAE 从阶段 1 **冻结**加载,只负责把每条边的 12 维 latent 解成曲线。
 
-一个**逐曲线 VAE**(`AutoencoderKL1D`)作为可训练子模块与解码器**联合训练**(不分阶段、不冻结),把每条边的 latent 解出精确曲线;推理时按 `A` 给每条边取 top-2 顶点为端点,再把解出的规范曲线 denorm 锚到端点。VQ commitment loss(连续 `z` 预热后 ramp)训练码本,曲线 VAE 额外带一个 KL 项。
+提交内容是 PTv3 latent 的 **16×256 = 4096 个 float32**(不再是 RVQ 索引)。
 
 ```mermaid
 flowchart LR
-  PC["原始点云 (coord ΣN×3, offset B)"] --> ENC["冻结 Utonia PTv3 (enc_mode, no_grad)"]
-  ENC --> MS["取若干 enc stage 的逐体素特征(不上采样)"]
-  MS --> COMP["每尺度 compressor:N_s 个 query cross-attn"]
-  COMP --> Z["多尺度连续 token z_s (B,N_s,256)"]
-  Z --> RVQ["每尺度 ResidualVQ(n_q 级)"]
-  RVQ --> IDX["拼接扁平索引 (B, ΣN_s·n_q ≤4096) = 提交"]
-  IDX --> ZQ["decode_indices:索引 -> 码本 -> z_q"]
-  ZQ --> DEC["联合解码器:512 顶点 query + 512 边 query(各自 self-attn + 对 z_q cross-attn + 顶点↔边相互 cross-attn)"]
-  DEC --> VH["顶点 head:存在性 + xyz"]
-  DEC --> EH["边 head:存在性 + 12 维曲线 latent"]
-  DEC --> INC["关联:sigmoid(edge_proj·vertex_proj^T)=A (Ne×Nv)"]
-  EH --> CVAE["曲线 VAE 解码(联合训练)-> 规范曲线"]
-  VH --> RECON
-  INC --> RECON["recon:每条边按 A 取 top-2 顶点为端点,曲线 denorm 锚到两端"]
-  CVAE --> RECON
-  RECON --> WF["vertices, edge_index, edge_points"]
+  PC["点云 (coord ΣN×3, offset B)"] --> PTV3["PTv3 编码器+解码器(逐点特征)"]
+  PTV3 --> LC["LatentCompressor:16 个 query cross-attn pooling"]
+  LC --> Z["latent Z (B,16,256) = 提交"]
+  Z --> ESD["EdgeSetDecoder:512 条 edge query 对 Z cross-attn(N 层)"]
+  ESD --> CONF["边置信度 (B,512)"]
+  ESD --> VV["两个端点 (B,512,2,3) tanh"]
+  ESD --> CL["曲线 latent (B,512,12)"]
+  CL --> CVAE["冻结曲线 VAE 解码 -> 规范曲线"]
+  CONF --> MERGE
+  VV --> MERGE["组装:阈值+top-K 兜底 / 置信度加权顶点 merge / edge E-NMS / denorm"]
+  CVAE --> MERGE
+  MERGE --> WF["vertices, edge_index, edge_points"]
   WF --> MET["CCD / TA / VPE"]
 ```
 
 | 模块 | 作用 |
 | --- | --- |
-| **UtoniaEncoder**(冻结 `Utonia PTv3` + 每尺度可训练 `LatentCompressor`) | **原始变长点云**(打包成 `coord (ΣN,3)` + `offset (B,)`)→ 体素去重 → 冻结的 [Utonia](https://huggingface.co/Pointcept/Utonia) 预训练 PTv3 编码器(`enc_mode`、`eval`+`no_grad`,确定性)→ 沿 `GridPooling` 的 `pooling_parent` 链取**若干 enc stage 的逐体素特征**(**不上采样**,每尺度保持其原生分辨率;通道 `enc_channels[stage]` 从 ckpt 配置读取)→ 每尺度一个 compressor 池化成 `z_s (B,N_s,256)`,输出多尺度 token 列表(细→粗)。默认用**全部 5 个 enc stage**(`scale_stages=[0..4]`),token 分配 `scale_tokens=[192,128,96,64,32]`(细尺度给更多 token 保细节);`compressor_heads=6` 须整除每个被用 stage 的通道(`54/108/216/432/576`)。backbone 冻结、只训 compressor。详见 `src/models/utonia_encoder.py`。 |
-| **MultiScaleResidualVQ**(每尺度独立 `ResidualVQ`) | 每尺度用各自的残差 VQ(`n_q` 级)把连续 token 量化成索引;**拼接成扁平索引**(固定 layout:尺度→token→量化级),`总索引 = Σ_s N_s·n_q`,**构造时**校验 `≤4096`(默认 `5` 尺度 `512×8 = 4096` 顶满)。`codebook_size` 支持**逐尺度** list(粗尺度 token 少,缩小码本以匹配利用率、抗坍塌)。`forward` 返回直通 `z_q`、扁平索引与 commitment loss;`decode_indices` 仅凭扁平索引重建出 `z_q`(保证 索引→wireframe 的 round-trip)。`eval` 模式自动冻结码本(EMA 关闭)。依赖 `vector-quantize-pytorch`(自行安装)。详见 `src/models/quantizer.py`。 |
-| **JointSetDecoder**(联合顶点+边集合解码器) | 仅从多尺度 `z_q` 重建 wireframe。各尺度 `z_q` 投影到 `d_model` 并加上**尺度 embedding** 后 concat 成 memory;`512` 个**顶点 query** 与 `512` 个**边 query** 经 `N` 个 `JointDecoderLayer`,每层(`norm_first`)= 各集合内 **self-attn** + 对 `z_q` 的 **cross-attn** + **顶点↔边相互 cross-attn**(取快照避免先后偏置)+ 各自 FFN。Head:顶点 head(存在性 + `(Nv,3)` 坐标,`coord_tanh` 压进 `[-1,1]`)、边 head(存在性 + `12` 维曲线 latent)、低秩**关联 head** `A=sigmoid((He·W_e)(Hv·W_v)^T/√k)`(`Ne×Nv`)。详见 `src/models/joint_set_decoder.py`。 |
-| **曲线 VAE**(`AutoencoderKL1D`,联合训练) | 纯 PyTorch 的注意力/token 逐曲线 VAE:`encode` 把规范化曲线压成小 token latent,`decode(z,t)` 在任意参数 `t` 处解码出曲线(端点钉在 `[-1,0,0]`/`[1,0,0]`)。作为解码器的**可训练子模块**与主任务**联合更新**(不分阶段、不冻结),避免把分阶段 VAE 的重建误差烤进精度天花板。详见 `src/models/vae/`。 |
-| **关联重建**(`assemble_wireframe`) | 保留 `sigmoid(vexist)>vthr` 的顶点、`sigmoid(eexist)>ethr` 的边(各带兜底 `min_vertices`/`min_edges`,永不输出退化结果);每条留下的边按 `A[e,:]` 在留下的顶点里取 **top-2**(强制两端不同、去**重复边**)为端点;`decode(lat)` 出规范曲线,按确定性**字典序端点规则**定向后用 `denorm_curves` 锚到两端点;最后去掉未被引用的顶点并重编号。详见 `src/recon/joint_wireframe.py`。 |
+| **PCEncoder**(`PointTransformerV3` + `LatentCompressor`) | **原始变长点云**(打包成 `coord (ΣN,3)` + `offset (B,)`)→ PTv3 编码器+解码器(`cls_mode=false`,得到逐点/逐体素特征)→ 按 batch 分组补齐 → `LatentCompressor` 用 `16` 个可学习 query 做 cross-attn pooling + 若干层 refine → 输出固定长度 latent 分布 `(mu, logvar)`,形状 `(B,16,256)`(`16×256=4096` 顶满比赛预算)。`variational=true` 时走 VAE(reparam + KL)。详见 `src/models/pc_encoder.py`、`src/models/latent_compressor.py`、`src/models/ptv3/`。 |
+| **EdgeSetDecoder**(edge-query DETR 解码器) | 仅从 `16×256` latent 重建一组边。latent 投影到 `d_model` 并加可学习位置编码作为 cross-attn **memory**;`512` 条**边 query** 经 `N` 个 pre-norm 解码层(self-attn + 对 memory 的 cross-attn + FFN)。三个 head:**置信度** `(Ne,)`、**两个端点** `(Ne,2,3)`(`tanh` 压进 `[-1,1]`)、**12 维曲线 latent** `(Ne,12)`。可选**深监督**:每个中间层都出一套预测。详见 `src/models/edge_set_decoder.py`。 |
+| **曲线 VAE**(`AutoencoderKL1D`,冻结) | 纯 PyTorch 的注意力/token 逐曲线 VAE:`encode` 把规范曲线压成小 token latent,`decode(z,t)` 在任意参数 `t` 处解码(端点钉在 `[-1,0,0]`/`[1,0,0]`)。阶段 1 单独训练,阶段 2 经 `curve_vae_ckpt` **冻结**加载。详见 `src/models/vae/`。 |
+| **EdgeSetCriterion**(匈牙利 edge-set 匹配) | 每 shape 把 512 条 query 与 GT 边匈牙利匹配:代价 = 端点 L1(两种端点定向取小)+ 存在性 + 曲线 latent L1(对 GT 规范曲线的 stop-grad 后验均值)。损失 = 存在性 focal/BCE(匹配=正,其余=背景)+ 匹配边端点 L1 + 经冻结曲线 VAE 的曲线损失(L1 + 端点)+ 小的 latent 正则。深监督复用末层匹配。详见 `src/models/edge_set_criterion.py`。 |
+| **顶点 merge 重建**(`assemble_wireframe`) | 保留 `sigmoid(置信度)≥ethr` 的边(不足时 top-K 兜底 `min_edges`);按字典序给每条边定向;收集端点做 **置信度加权的迭代 merge**(`merge_tol` 内最近端点对合并、合并点取加权质心,**绝不**合并同一条边的两端);去自环;用 **edge E-NMS**(端点共享后按中点距离 + 长度比抑制近重复)合并平行弧(每对顶点至多保留 2 条);可选**悬浮边清理** `prune_dangling`;最后 `denorm_curves` 把规范曲线锚到 merge 后的端点并重编号。详见 `src/recon/edge_wireframe.py`。 |
 
 ## 目标 / 监督 (target)
 
-每个样本保留**原生 GT wireframe 图**:顶点 + `edge_index` + 每条边的有序采样点 `edge_points (E,P,3)`(其首/尾点即两端顶点)。顶点几何由顶点 head 直接回归,边形状由曲线 VAE latent 表达,拓扑由关联矩阵 `A` 承载。
+每个样本保留**原生 GT wireframe 图**:顶点 + `edge_index` + 每条边的有序采样点 `edge_points (E,P,3)`(其首/尾点即两端顶点)。阶段 2 的监督是 edge-set:每条 GT 边提供**两端点**(按字典序定向)与**规范曲线**。
 
-坐标**全程保持原始**(数据集已归一化到 `[-1, 1]`,无需额外归一化)。点云若少于 `min_pc_points=100` 个点,或顶点数 `> max_vertices=512` 该样本会被**跳过**。曲线在喂给 VAE 前会按确定性的**字典序端点规则**定向再 `normalize_curves` 规范化,训练与推理一致,保证规范曲线起点/终点定义良好。
+坐标**全程保持原始**(数据集已归一化到 `[-1, 1]`)。点云若少于 `min_pc_points=100` 个点,或边数 `> max_edges=512`(loop / complex 拆分后)该样本会被**跳过**。
 
-## 损失(联合集合预测 + VQ)
+**数据清洗与拆分**(`src/data/dataset.py`):
 
-逐 shape、顺序无关的匈牙利匹配(`scipy.optimize.linear_sum_assignment`):
+- **闭合环拆分**:端点近重合但弧长 ≫ 弦长的闭合边在最远点拆成两条开弧(插入一个中点顶点),否则端点锚定的曲线坐标系无定义。
+- **复杂边递归拆分**(需求 1):弧长/弦长 `> complex_ratio` 的边(大圆弧 / 螺旋 / 多缠绕样条)单个 12 维 latent 难以表达,在折线相对弦的最大偏离点处**递归拆分**并插入新顶点,直到每段足够简单或达到 `complex_max_depth`;每段重采样到 `num_edge_points`。配置见 `configs/data.yaml` 的 `split_complex` / `complex_ratio` / `complex_max_depth` / `complex_min_arc`。
 
-- **顶点匹配 / 损失**:在 `coord_L1 − w·sigmoid(vexist)` 上匹配顶点 query 与 GT 顶点,得到 GT 顶点→顶点 query 的映射 `qv_of_gt`;`loss_vexist` 标定存在性 BCE(匹配上的为正)、`loss_vcoord` 匹配顶点坐标 L1;
-- **曲线 VAE 自编码锚定**:对 GT 规范曲线 `encode→sample→decode`,长度加权重建 L1(`loss_anchor`)+ 端点 L1(`loss_anchor_endpoint`)+ `kl_weight·KL`(`loss_kl`)——这条干净监督让 latent 空间始终有意义、防坍塌;
-- **基于 `A` 的边匹配**:代价 `w_inc·(−logA[e,qa]−logA[e,qb]) + w_lat·‖lat[e]−sg(μ_k)‖₁ − w·sigmoid(eexist[e])`,`qa/qb` 是 GT 边两端点映射到的顶点 query,`μ_k` 是 GT 规范曲线经当前 encoder 的均值并 **stop-grad**(只当匹配用);`w_inc` 经 `match_warmup_steps`(`A` 早期随机)后再 ramp,先用 latent+存在性驱动匹配;
-- **边损失**:`loss_eexist` 标定存在性 BCE;`loss_curve` 在**曲线空间**监督 `L1(decode(lat_pred[e]), GT 规范曲线)`(目标固定不漂移,经共享可训练 decoder)+ 端点项 `loss_curve_endpoint`;`loss_lat_reg` 很小权重的 on-manifold `L2(lat_pred, sg(μ_k))`;
-- **关联损失** `loss_assoc`:在 `A` 上做 BCE,限制在**匹配边的行 / 匹配顶点的列**,并用 `pos_weight` 应对 2-of-Nv 的极稀疏;
-- `loss_commit`:VQ commitment loss,经 `quant_warmup_steps`(先用连续 `z` 预热)后,权重 `0 → w_commit` 线性 ramp。
+## 损失(edge-set 匈牙利匹配)
 
-并按尺度记录码本 `perplexity`(`vq/perplexity_s*`)监控利用率/坍塌;验证时额外记录可观测性指标(`recon/nonempty_frac`、`recon/pred_vertices`、`recon/pred_edges` vs `recon/gt_*`)。验证时从 `z_q` 解码并在 `(vthr, ethr)` 网格上重算分数,checkpoint 按其中最优的 `val/score_best` 选优(越大越好),并记录最优阈值 `val/best_{vthr,ethr}`。
+逐 shape、顺序无关的匈牙利匹配(`scipy.optimize.linear_sum_assignment`),细节见 `EdgeSetCriterion`:
+
+- **匹配代价**:`match_endpoint·端点L1(定向取小) + match_lat·‖curve_latent − sg(μ)‖₁ − match_exist·sigmoid(置信度)`;`μ` 是 GT 规范曲线经冻结曲线 VAE 的后验均值(stop-grad,只当匹配/正则用)。
+- **存在性损失**:对**全部** 512 条 query 的 focal(`focal_gamma>0`)或标定 BCE(匹配=1,其余=背景)——这是抑制"过预测"、让多余 query 留空的关键(见下文)。
+- **端点 L1**:匹配边上,两种端点定向取小。
+- **曲线损失**:匹配边的 `curve_latent` 经**冻结**曲线 VAE 解码,与固定 GT 规范曲线在规范坐标系比较(L1 + 端点 L1)。
+- **latent 正则**:很小权重的 `L2(curve_latent, sg(μ))` 保持预测 latent 在曲线 VAE 流形上。
+- **深监督**:每个中间解码层复用末层匹配再算一遍上述损失,按 `aux_weight` 累加。
+
+阶段 2 还在 PTv3 latent 上加一个小 KL(`kl_weight`,仅 `variational` 时)。验证时在 `(ethr, merge_tol)` 网格上重算分数,checkpoint 按其中最优的 `val/score_best`(越大越好)选优,并记录最优阈值 `val/best_{ethr,merge_tol}`,另记可观测性指标(`recon/nonempty_frac`、`recon/pred_edges` vs `recon/gt_edges` 等)。
+
+### 为什么保留置信度头(需求 8)
+
+512 条 query 远多于真实边,匈牙利匹配会把大部分 query 分给"背景"。若没有置信度/存在性目标,未匹配的 query 没有梯度把它们推离真实几何,会漂到真实边附近输出看似合理的端点;顶点 merge 只能合并**端点重合**的边,无法删除整条幻觉边。因此保留置信度头 + 验证时扫阈值 + 空输出 top-K 兜底,是控制 precision/recall 的唯一手段。
 
 ## 训练
 
-依赖:点云栈(Utonia PTv3 需 `spconv` / `flash-attn` / `torch_scatter` / `timm`)、`pytorch_lightning` / `torchmetrics`、`pytorch3d`(KNN chamfer)、`scipy`(匈牙利匹配)、`einops` / `torchtyping`(曲线 VAE),以及 **`vector-quantize-pytorch`**(VQVAE 量化器,**自行安装**:`pip install vector-quantize-pytorch`)。Utonia 权重默认从本地 `logs/utonia/utonia.pth` 加载(在 `configs/vqvae*.yaml` 的 `pc_encoder.utonia` 配置)。
+依赖见 `requirements.txt`:点云栈(PTv3 需 `spconv` / `flash-attn` / `torch_scatter` / `timm`)、`pytorch_lightning` / `torchmetrics`、`pytorch3d`(KNN chamfer)、`scipy`(匈牙利匹配)、`einops`(曲线 VAE)。**不再依赖 `vector-quantize-pytorch` 或 Utonia 预训练权重**。
 
 ```bash
-# 单 GPU
-python -m src.main fit --config configs/data.yaml --config configs/vqvae.yaml
-# 也可以： bash scripts/run.sh train
+# 阶段 1:曲线 VAE(100 epoch)
+python -m src.main fit --config configs/data.yaml --config configs/curve_vae.yaml
+# 也可以： bash scripts/run.sh stage1   # DDP: bash scripts/run.sh stage1_ddp
 
-# 8x A800 DDP
-python -m src.main fit --config configs/data.yaml --config configs/vqvae_ddp.yaml
-# 也可以： bash scripts/run.sh train_ddp
+# 阶段 2:点云 -> wireframe(300 epoch,冻结曲线 VAE)
+python -m src.main fit --config configs/data.yaml --config configs/pc2wireframe.yaml \
+    --model.curve_vae_ckpt <阶段1 最优 ckpt>
+# 也可以： CURVE_VAE_CKPT=<阶段1 ckpt> bash scripts/run.sh stage2   # DDP: stage2_ddp
 ```
 
-`vqvae.yaml`(单 GPU)与 `vqvae_ddp.yaml`(8x A800 DDP)是**同一个模型**的单/多卡孪生配置,只有 `trainer.devices`/`strategy` 与 `lr`(多卡全局 batch 大 8 倍,LR ~√8 放大)不同,保持同步。
+`curve_vae.yaml` / `pc2wireframe.yaml`(单 GPU)与其 `_ddp` 孪生(8x A800)是**同一个模型**,只有 `trainer.devices`/`strategy` 与 `lr`(多卡全局 batch 大 8 倍,LR ~√8 放大)不同。**阶段 2 的 `curve_vae` 配置必须与阶段 1 完全一致**。
 
-显存/速度杠杆:`pc_encoder.scale_tokens`(多尺度 token 分配)、`quantizer.{n_q,codebook_size}`、`decoder.{num_vertex_queries,num_edge_queries,num_layers,d_model,assoc_dim}`、`curve_vae.*`、`data.batch_size`。
+显存/速度杠杆:`pc_encoder.{enc,dec}_*`、`decoder.{num_edge_queries,num_layers,d_model}`、`curve_vae.*`、`data.batch_size`。
+
+评测/调试脚本:
+
+```bash
+python scripts/eval_curve_vae.py --ckpt <阶段1 ckpt>             # 阶段 1 重建可视化
+python scripts/eval_pc2wireframe.py --ckpt <阶段2 ckpt>          # 阶段 2 val 指标 + 图
+python scripts/clean_wireframe.py test --num 6 --pick worst     # GT 清洗预览
+```
 
 ## 推理 / 提交
 
-提交导出是**单次前向**(encode → 多尺度 `z` → 每尺度 RVQ → 拼接索引),并在写出前用 `decode_indices` 从**提交的索引**还原 `z_q` 再解码(代码层面保证 round-trip 与 `budget ≤ 4096`)。每个样本的 `latent` 字段即扁平索引向量(float32)。`--vthr` / `--ethr` 可覆盖 ckpt 内置的顶点/边阈值。
+提交导出是**单次前向**(encode → `16×256` latent Z → EdgeSetDecoder → 冻结曲线 VAE 解码 → 顶点 merge 重建)。每个样本的 `latent` 字段即**扁平 4096 个 float32**(`Z.reshape(-1)`)。`--ethr` / `--merge-tol` 可覆盖 ckpt 内置阈值。
 
 ```bash
 # 单 GPU
-python scripts/export_submission.py --ckpt <vqvae.ckpt 目录或文件> --out-dir logs/submission
-# 也可以： CKPT=<vqvae.ckpt> bash scripts/run.sh export_submission
+python scripts/export_submission.py --ckpt <pc2wireframe.ckpt 目录或文件> --out-dir logs/submission
+# 也可以： CKPT=<pc2wireframe.ckpt> bash scripts/run.sh export_submission
 
 # 8-GPU 数据并行(每 GPU 一个 worker,自动合并 + 打包 submission.zip)
-python scripts/export_submission.py --spawn 8 --ckpt <vqvae.ckpt> --out-dir logs/submission
+python scripts/export_submission.py --spawn 8 --ckpt <pc2wireframe.ckpt> --out-dir logs/submission
 
 # 断点续跑
-python scripts/export_submission.py --spawn 8 --ckpt <vqvae.ckpt> --out-dir logs/submission --resume
+python scripts/export_submission.py --spawn 8 --ckpt <pc2wireframe.ckpt> --out-dir logs/submission --resume
 ```
 
 提交布局:
 
 ```text
 submission/
-    latent_pack.npz                 # stems (N,) + latents (N, K<=4096) 扁平索引
+    latent_pack.npz                 # stems (N,) + latents (N, 4096) float
     sample_edge/<stem>.npz
-        latent       : (K,) float32   # 拼接的 RVQ 索引(固定 layout)
+        latent       : (4096,) float32   # 扁平 16x256 PTv3 latent
         vertices     : (V, 3) float32
         edge_index   : (E, 2) int32
         edge_points  : (E, 32, 3) float32
@@ -130,3 +143,7 @@ python scripts/visualize_submission.py \
 ```
 
 `scripts/make_split.py` 生成 `data/split.json`;`scripts/render_wireframe.py` 用于把单个 wireframe npz 渲染成图。
+
+## 后续工作(merge / 拓扑,需求 9)
+
+当前 `assemble_wireframe` 实现了:置信度加权的迭代顶点 merge、edge E-NMS 去重、可选悬浮边清理。更强的**全局拓扑优化(ComplexGen 式 ILP**,在流形性/环闭合等结构约束下最大化置信度)价值高但较重,列为未来工作。
